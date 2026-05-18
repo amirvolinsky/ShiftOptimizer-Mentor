@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <base target="_top">
+  <meta charset="utf-8"/>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      direction: rtl;
+      text-align: right;
+      font-family: Arial, "Segoe UI", Helvetica, sans-serif;
+      font-size: 14px;
+      line-height: 1.55;
+      color: #202124;
+      background: #fff;
+    }
+    body { padding: 18px 22px 16px; }
+    h1 {
+      font-size: 17px;
+      font-weight: 600;
+      margin: 0 0 12px;
+      text-align: right;
+    }
+    .body-text {
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      unicode-bidi: plaintext;
+      text-align: right;
+      direction: rtl;
+    }
+    .actions {
+      margin-top: 20px;
+      padding-top: 14px;
+      border-top: 1px solid #e8eaed;
+      text-align: center;
+    }
+    button.primary {
+      margin: 4px 6px;
+      padding: 9px 22px;
+      font-size: 14px;
+      cursor: pointer;
+      border-radius: 6px;
+      border: 1px solid #1a73e8;
+      background: #1a73e8;
+      color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <h1><?= title ?></h1>
+  <div class="body-text"><?= message ?></div>
+  <div class="actions">
+    <button type="button" class="primary" onclick="google.script.host.close()">סגור</button>
+  </div>
+</body>
+</html>

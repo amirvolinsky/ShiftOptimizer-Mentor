@@ -1,0 +1,1785 @@
+/**
+ * @OnlyCurrentDoc
+ * Writes the optimized schedule to a single sheet.
+ *
+ * Layout per location (horizontal):
+ *   [time] ראשון..חמישי | [gap] | [time] שישי | [gap] | [time] שבת
+ *   shift rows ...
+ *   summary row (shift counts)
+ *
+ * Then fairness table + legend at the bottom.
+ */
+
+var DAY_GROUPS_ = [
+  ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי'],
+  ['שישי'],
+  ['שבת']
+];
+
+function writeSchedule(result, slots, masterMap, availability, notes) {
+  HISTORY_SCORES_CACHE_ = null;
+  notes = notes || {};
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(CONFIG.sheets.schedule);
+  if (!sheet) {
+    sheet = ss.insertSheet(CONFIG.sheets.schedule);
+  }
+  sheet.clear();
+  sheet.clearFormats();
+  sheet.clearNotes();
+
+  var currentRow = 1;
+  var slotMap = buildSlotMap_(slots);
+
+  var locations = CONFIG.locations;
+  for (var loc = 0; loc < locations.length; loc++) {
+    var location = locations[loc];
+    var locationSlots = slots.filter(function(s) { return s.location === location; });
+    if (locationSlots.length === 0) continue;
+
+    var locResult = writeLocationRow_(
+      sheet, location, locationSlots, result.assignments, masterMap, availability, currentRow, slotMap
+    );
+    currentRow = locResult.nextRow + 2;
+  }
+
+  // Fairness table
+  currentRow++;
+  writeFairnessTable_(sheet, result.employeeStats, masterMap, availability, slots, currentRow, notes);
+
+  // Sheet formatting
+  sheet.setRightToLeft(true);
+  var lastCol = sheet.getLastColumn();
+  for (var c = 1; c <= lastCol; c++) {
+    sheet.autoResizeColumn(c);
+    if (sheet.getColumnWidth(c) < 70) sheet.setColumnWidth(c, 70);
+  }
+  if (lastCol >= 2) sheet.setColumnWidth(2, 70);
+  if (sheet.getLastRow() > 0 && lastCol > 0) {
+    sheet.getRange(1, 1, sheet.getLastRow(), lastCol)
+      .setHorizontalAlignment('center')
+      .setVerticalAlignment('middle');
+  }
+
+}
+
+// ============================================================
+//  Write one location as a single horizontal row of day-groups
+// ============================================================
+
+function writeLocationRow_(sheet, location, locationSlots, assignments, masterMap, availability, startRow, slotMap) {
+  var locationLabel = CONFIG.locationNames[location] || location;
+  var startCol = 1;
+  var locationShiftCount = 0;
+  var maxBlockHeight = 0;
+
+  // First pass: compute height of each group to know the maximum
+  var groupInfos = [];
+  for (var g = 0; g < DAY_GROUPS_.length; g++) {
+    var days = DAY_GROUPS_[g];
+    var groupSlots = locationSlots.filter(function(s) {
+      return days.indexOf(s.day) >= 0;
+    });
+    if (groupSlots.length === 0) {
+      groupInfos.push(null);
+      continue;
+    }
+
+    var dayRows = buildDayRows_(groupSlots, days);
+    var height = dayRows.maxRows;
+    if (height > maxBlockHeight) maxBlockHeight = height;
+    groupInfos.push({ days: days, slots: groupSlots, dayRows: dayRows });
+  }
+
+  // header row + data rows + summary row
+  var totalHeight = 1 + maxBlockHeight + 1;
+
+  // Second pass: write each group side by side
+  var col = 1;
+  for (var g = 0; g < groupInfos.length; g++) {
+    var info = groupInfos[g];
+    if (!info) continue;
+
+    var groupCost = writeDayGroupAt_(
+      sheet, location, locationLabel, info, assignments, masterMap, availability, startRow, col, maxBlockHeight, slotMap
+    );
+    locationShiftCount += groupCost;
+
+    // columns used: 1 (time label) + numDays
+    col += 1 + info.days.length + 1; // +1 gap column
+  }
+
+  var totalRow = startRow + 1 + maxBlockHeight;
+  sheet.getRange(totalRow, 1).setValue('סה"כ משמרות ' + locationLabel)
+    .setFontWeight('bold').setBackground(CONFIG.colors.summaryRow);
+  sheet.getRange(totalRow, 2).setValue(locationShiftCount)
+    .setFontWeight('bold').setBackground(CONFIG.colors.summaryRow);
+
+  return { shiftCount: locationShiftCount, nextRow: totalRow + 1 };
+}
+
+/**
+ * Build per-day sorted slot arrays and compute max row count.
+ */
+function buildDayRows_(groupSlots, days) {
+  var dayRows = {};
+  var maxRows = 0;
+  for (var d = 0; d < days.length; d++) {
+    var day = days[d];
+    var arr = [];
+    for (var s = 0; s < groupSlots.length; s++) {
+      if (groupSlots[s].day !== day) continue;
+      arr.push(groupSlots[s]);
+    }
+    arr.sort(function(a, b) {
+      var aStart = a.startTime || 0;
+      var bStart = b.startTime || 0;
+      if (aStart !== bStart) return aStart - bStart;
+      var aEnd = a.endTime || 0;
+      var bEnd = b.endTime || 0;
+      return aEnd - bEnd;
+    });
+    dayRows[day] = arr;
+    if (arr.length > maxRows) maxRows = arr.length;
+  }
+  return { dayRows: dayRows, maxRows: maxRows };
+}
+
+/**
+ * Write one day-group block at a specific (startRow, startCol).
+ * Returns the cost for this group.
+ */
+function writeDayGroupAt_(sheet, location, locationLabel, info, assignments, masterMap, availability, startRow, startCol, maxBlockHeight, slotMap) {
+  var days = info.days;
+  var numDays = days.length;
+  var dayRows = info.dayRows.dayRows;
+  var myMaxRows = info.dayRows.maxRows;
+
+  // --- Header row ---
+  var headerRow = startRow;
+  var timeCol = startCol;
+
+  sheet.getRange(headerRow, timeCol).setValue(locationLabel);
+  for (var d = 0; d < numDays; d++) {
+    sheet.getRange(headerRow, timeCol + 1 + d).setValue(days[d]);
+  }
+  sheet.getRange(headerRow, timeCol, 1, numDays + 1)
+    .setFontWeight('bold')
+    .setBackground(CONFIG.colors.headerBg)
+    .setFontColor(CONFIG.colors.headerFont)
+    .setHorizontalAlignment('center');
+
+  // --- Time labels ---
+  var rowTimeLabels = [];
+  for (var r = 0; r < myMaxRows; r++) {
+    var st = null, et = null;
+    for (var d = 0; d < numDays; d++) {
+      var arr = dayRows[days[d]];
+      if (r < arr.length) { st = arr[r].startTime; et = arr[r].endTime; break; }
+    }
+    rowTimeLabels.push({ startTime: st, endTime: et });
+  }
+
+  // --- Data rows ---
+  var dataStartRow = headerRow + 1;
+  var groupShiftCount = 0;
+
+  for (var r = 0; r < maxBlockHeight; r++) {
+    var row = dataStartRow + r;
+
+    // Time label
+    var timeLabelText = '';
+    if (r < myMaxRows) {
+      var cur = rowTimeLabels[r];
+      var prev = r > 0 ? rowTimeLabels[r - 1] : null;
+      var show = true;
+      if (prev && prev.startTime === cur.startTime && prev.endTime === cur.endTime) show = false;
+      if (show && cur.startTime !== null && cur.endTime !== null) {
+        timeLabelText = formatTime_(cur.startTime) + '-' + formatTime_(cur.endTime);
+      }
+    }
+    sheet.getRange(row, timeCol).setValue(timeLabelText)
+      .setFontWeight('bold')
+      .setBackground(CONFIG.colors.summaryRow)
+      .setHorizontalAlignment('center');
+
+    // Day columns
+    for (var d = 0; d < numDays; d++) {
+      var day = days[d];
+      var arr = dayRows[day];
+      var cell = sheet.getRange(row, timeCol + 1 + d);
+
+      if (r >= arr.length) {
+        cell.setValue('');
+        continue;
+      }
+
+      var slot = arr[r];
+      var asgn = assignments[slot.slotId];
+
+      if (!asgn) {
+        cell.setValue('');
+      } else if (asgn.managerSlot) {
+        cell.setValue('מנהל')
+            .setBackground('#D9E2F3')
+            .setFontWeight('bold')
+            .setHorizontalAlignment('center')
+            .setVerticalAlignment('middle');
+        cell.setNote('יובל / דורי / גלו — מחליטים ביניהם מי עולה.');
+      } else if (asgn.unfilled) {
+        cell.setValue('⚠');
+        cell.setBackground(CONFIG.colors.unfilled)
+            .setFontColor('#9C0006')
+            .setHorizontalAlignment('center');
+
+        var noteText = buildOverrideNote_(slot, null, masterMap, availability, assignments);
+        cell.setNote(noteText);
+
+        var dropdownNames = getOverrideCandidates_(slot, masterMap);
+        if (dropdownNames.length > 0) {
+          var rule = SpreadsheetApp.newDataValidation()
+            .requireValueInList(dropdownNames, true)
+            .setAllowInvalid(true)
+            .build();
+          cell.setDataValidation(rule);
+        }
+      } else {
+        cell.setValue(asgn.name);
+        groupShiftCount++;
+
+        var bgColor = CONFIG.colors.ok;
+        if (asgn.suggested) {
+          bgColor = CONFIG.colors.suggested;
+        } else if (isJuniorAloneForSlot_(slot, assignments, slotMap)) {
+          bgColor = CONFIG.colors.noSenior;
+        }
+        cell.setBackground(bgColor)
+            .setHorizontalAlignment('center')
+            .setVerticalAlignment('middle');
+
+        var noteText = buildOverrideNote_(slot, asgn, masterMap, availability, assignments);
+        cell.setNote(noteText);
+
+        var dropdownNames = getOverrideCandidates_(slot, masterMap);
+        if (dropdownNames.length > 0) {
+          var rule = SpreadsheetApp.newDataValidation()
+            .requireValueInList(dropdownNames, true)
+            .setAllowInvalid(true)
+            .build();
+          cell.setDataValidation(rule);
+        }
+      }
+    }
+  }
+
+  return groupShiftCount;
+}
+
+// ============================================================
+//  Fairness table
+// ============================================================
+
+function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slots, startRow, notes) {
+  notes = notes || {};
+  var headers = ['שם', 'דרגה', 'יעד', 'ימים זמין', 'זמין השבוע', 'קיבל', 'בוקר/ערב', 'הערות', 'סטטוס'];
+  for (var h = 0; h < headers.length; h++) {
+    sheet.getRange(startRow, h + 1).setValue(headers[h]);
+  }
+  sheet.getRange(startRow, 1, 1, headers.length)
+    .setFontWeight('bold')
+    .setBackground(CONFIG.colors.headerBg)
+    .setFontColor(CONFIG.colors.headerFont)
+    .setHorizontalAlignment('center');
+
+  var names = Object.keys(employeeStats);
+  names.sort();
+
+  var row = startRow + 1;
+  for (var i = 0; i < names.length; i++) {
+    var stat = employeeStats[names[i]];
+    var emp = masterMap[names[i]];
+    if (!emp) continue;
+
+    var target = stat.shiftTarget || getShiftTarget(names[i], masterMap, availability);
+    var received = stat.shiftsCount || 0;
+    var availableCount = countAvailableSlots_(names[i], availability, slots, emp);
+    var availableDays = countAvailableDays_(names[i], availability);
+
+    var satisfaction = '';
+    if (availableDays === 0) {
+      satisfaction = 'לא הגיש זמינות';
+    } else if (received === target && target > 0) {
+      satisfaction = 'בול =)';
+    } else if (received > target && target > 0) {
+      satisfaction = 'מעל היעד';
+    } else if (received >= availableDays) {
+      satisfaction = 'קיבל מקסימום אפשרי';
+    } else if (target > 0 && received >= target - 1) {
+      satisfaction = 'כמעט מלא';
+    } else {
+      satisfaction = 'קיבל פחות =(';
+    }
+
+    var dist = getBlockDistribution_(names[i], employeeStats);
+
+    sheet.getRange(row, 1).setValue(stat.name);
+    sheet.getRange(row, 2).setValue(rankToHebrew(stat.rank));
+    sheet.getRange(row, 3).setValue(target > 0 ? target : '');
+    sheet.getRange(row, 4).setValue(availableDays);
+    sheet.getRange(row, 5).setValue(availableCount);
+    sheet.getRange(row, 6).setValue(received);
+    sheet.getRange(row, 7).setValue(dist);
+    sheet.getRange(row, 8).setValue(notes[stat.name] || '');
+    sheet.getRange(row, 9).setValue(satisfaction);
+
+    var satCell = sheet.getRange(row, 9);
+    if (satisfaction === 'בול =)' || satisfaction === 'קיבל מקסימום אפשרי') {
+      satCell.setBackground('#C6EFCE').setFontColor('#006100');
+    } else if (satisfaction === 'מעל היעד') {
+      satCell.setBackground('#FFEB9C').setFontColor('#9C6500');
+    } else if (satisfaction === 'כמעט מלא') {
+      satCell.setBackground('#FFEB9C').setFontColor('#9C6500');
+    } else if (satisfaction === 'קיבל פחות =(') {
+      satCell.setBackground('#FFC7CE').setFontColor('#9C0006');
+    } else if (satisfaction === 'לא הגיש זמינות') {
+      satCell.setBackground('#E8E8E8').setFontColor('#666666');
+    }
+
+    sheet.getRange(row, 1, 1, headers.length).setHorizontalAlignment('center');
+    row++;
+  }
+
+  // Legend
+  row += 1;
+  sheet.getRange(row, 1).setValue('מקרא צבעים בלו"ז:').setFontWeight('bold');
+  row++;
+  sheet.getRange(row, 1).setValue('🟢');
+  sheet.getRange(row, 2).setValue('עובד שובץ — הכל תקין');
+  sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.ok);
+  row++;
+  sheet.getRange(row, 1).setValue('🔵');
+  sheet.getRange(row, 2).setValue('הצעת המערכת — העובד לא סימן זמינות, אבל מתאים. צריך אישור.');
+  sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.suggested);
+  row++;
+  sheet.getRange(row, 1).setValue('🟡');
+  sheet.getRange(row, 2).setValue('עובד חדש (ג\') בלי עובד מנוסה במשמרת');
+  sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.noSenior);
+  row++;
+  sheet.getRange(row, 1).setValue('🔴');
+  sheet.getRange(row, 2).setValue('משמרת לא מולאה — צריך שיבוץ ידני');
+  sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.unfilled);
+}
+
+// ============================================================
+//  Manual override helpers
+// ============================================================
+
+/**
+ * Get sorted list of ALL employee names for the override dropdown.
+ * No filtering — Gal is the owner and can override any rule.
+ */
+function getOverrideCandidates_(slot, masterMap) {
+  var names = Object.keys(masterMap);
+  names.sort();
+  return names;
+}
+
+/**
+ * Build a smart hover-note for a shift cell.
+ * Shows: current assignment info, and a ranked list of alternatives with
+ * cost, rank, availability, conflict detection, and warnings.
+ */
+var HISTORY_SCORES_CACHE_ = null;
+
+/**
+ * Load cumulative satisfaction scores from ShiftHistory (cached per run).
+ * Returns { name: overallScore% } for all employees.
+ */
+function getHistoryScores_() {
+  if (HISTORY_SCORES_CACHE_) return HISTORY_SCORES_CACHE_;
+  HISTORY_SCORES_CACHE_ = {};
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(CONFIG.sheets.shiftHistory);
+  if (!sh || sh.getLastRow() < 2) return HISTORY_SCORES_CACHE_;
+
+  var data = sh.getDataRange().getValues();
+  var empTotals = {};
+  for (var r = 1; r < data.length; r++) {
+    var week = String(data[r][0]).trim();
+    if (!week || week === '📊 סיכום מצטבר') continue;
+    var name = String(data[r][1]).trim();
+    if (!name) continue;
+    if (!empTotals[name]) empTotals[name] = { received: 0, target: 0 };
+    empTotals[name].received += (parseInt(data[r][5]) || 0);
+    empTotals[name].target += (parseInt(data[r][3]) || 0);
+  }
+  var names = Object.keys(empTotals);
+  for (var i = 0; i < names.length; i++) {
+    var t = empTotals[names[i]];
+    HISTORY_SCORES_CACHE_[names[i]] = t.target > 0 ? Math.round((t.received / t.target) * 100) : 100;
+  }
+  return HISTORY_SCORES_CACHE_;
+}
+
+function buildOverrideNote_(slot, currentAsgn, masterMap, availability, assignments) {
+  var hours = slot.durationHours || 0;
+  var isSaturday = slot.day === 'שבת';
+  var historyScores = getHistoryScores_();
+  var lines = [];
+
+  if (currentAsgn && currentAsgn.name) {
+    var curEmp = masterMap[currentAsgn.name];
+    var curRank = curEmp ? rankToHebrew(curEmp.rank) : '?';
+    var curHistory = historyScores[currentAsgn.name];
+    var curScoreStr = curHistory ? ' | ציון היסטורי: ' + curHistory + '%' : '';
+    lines.push('✅ משובץ: ' + currentAsgn.name + ' (דרגה ' + curRank + ')' + curScoreStr);
+    if (currentAsgn.suggested) lines.push('💙 הצעת מערכת — צריך אישור');
+  } else {
+    lines.push('⚠ משמרת ריקה — צריך שיבוץ ידני');
+  }
+
+  lines.push('');
+  lines.push('🔄 חלופות:');
+
+  var slotMap = buildSlotMap_(loadShiftTemplates());
+
+  // Build who's already assigned this day (any location)
+  var assignedToday = {};
+  var allSlotIds = Object.keys(assignments);
+  for (var i = 0; i < allSlotIds.length; i++) {
+    var a = assignments[allSlotIds[i]];
+    if (!a || a.unfilled || !a.name || a.managerSlot) continue;
+
+    var parts = allSlotIds[i].split('_');
+    if (parts[1] === slot.day) {
+      if (!(currentAsgn && a.name === currentAsgn.name && allSlotIds[i] === slot.slotId)) {
+        assignedToday[a.name] = (assignedToday[a.name] || []);
+        var loc = CONFIG.locationNames[parts[0]] || parts[0];
+        var peerSlot = slotMap[allSlotIds[i]];
+        var t = peerSlot && peerSlot.startTime != null
+          ? formatTime_(peerSlot.startTime) + '-' + formatTime_(peerSlot.endTime) : (parts[2] || '');
+        assignedToday[a.name].push(loc + ' ' + t);
+      }
+    }
+  }
+
+  var names = Object.keys(masterMap);
+  names.sort();
+
+  var alts = [];
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    if (currentAsgn && name === currentAsgn.name) continue;
+    var emp = masterMap[name];
+
+    var flags = [];
+    var hasConflict = false;
+
+    // Already working this day?
+    if (assignedToday[name]) {
+      flags.push('🚫 כבר משובץ היום (' + assignedToday[name].join(', ') + ')');
+      hasConflict = true;
+    }
+
+    if (emp.isGlobal || emp.isPriority) flags.push('עדיפות');
+
+    var isAvail = false;
+    if (availability && availability[name]) {
+      var dayAvail = availability[name][slot.day];
+      if (dayAvail) {
+        for (var b = 0; b < dayAvail.length; b++) {
+          if (dayAvail[b] === slot.block) { isAvail = true; break; }
+        }
+      }
+    }
+    if (!isAvail && !hasConflict) flags.push('❌ לא סימן זמינות');
+
+    // How far from target?
+    var target = getShiftTarget(name, masterMap, availability);
+    var currentShifts = 0;
+    for (var si = 0; si < allSlotIds.length; si++) {
+      var sa = assignments[allSlotIds[si]];
+      if (sa && sa.name === name && !sa.unfilled && !sa.managerSlot) currentShifts++;
+    }
+    var underTarget = target > 0 && currentShifts < target;
+    if (underTarget && !hasConflict) {
+      flags.push('📊 ' + currentShifts + '/' + target + ' מהיעד');
+    }
+
+    if (wouldJuniorBeAloneAtSlot_(slot, emp.rank, assignments, slotMap)) {
+      flags.push('⚠ יהיה א\'/ב\' לבד (ללא חפיפה עם ג\'/ד\')');
+    }
+
+    var rankLabel = rankToHebrew(emp.rank);
+    var histLabel = historyScores[name] ? ' | 📜' + historyScores[name] + '%' : '';
+    var line = '• ' + name + ' | ' + rankLabel + histLabel;
+    if (flags.length > 0) line += '\n   ' + flags.join(' | ');
+
+    alts.push({ line: line, isAvail: isAvail, rank: emp.rank, hasConflict: hasConflict, underTarget: underTarget });
+  }
+
+  // Sort priority:
+  // 1. Available + no conflict (best)
+  // 2. Not available + no conflict + under target (worth asking)
+  // 3. Not available + no conflict (rest)
+  // 4. Already assigned today (impossible — info only)
+  alts.sort(function(a, b) {
+    var aScore = a.hasConflict ? 3 : (a.isAvail ? 0 : (a.underTarget ? 1 : 2));
+    var bScore = b.hasConflict ? 3 : (b.isAvail ? 0 : (b.underTarget ? 1 : 2));
+    if (aScore !== bScore) return aScore - bScore;
+    if (a.underTarget !== b.underTarget) return b.underTarget ? 1 : -1;
+    return b.rank - a.rank;
+  });
+
+  var shown = Math.min(alts.length, 12);
+  for (var i = 0; i < shown; i++) {
+    lines.push(alts[i].line);
+  }
+  if (alts.length > shown) {
+    lines.push('... ועוד ' + (alts.length - shown));
+  }
+
+  return lines.join('\n');
+}
+
+// ============================================================
+//  Shared helpers
+// ============================================================
+
+/**
+ * Format morning/evening distribution as "Xב / Yע" (X morning / Y evening).
+ */
+function getBlockDistribution_(name, employeeStats) {
+  var stat = employeeStats[name];
+  if (!stat) return '';
+  var m = stat.morningCount || 0;
+  var e = stat.eveningCount || 0;
+  var other = stat.shiftsCount - m - e;
+  var parts = [];
+  if (m > 0) parts.push(m + ' בוקר');
+  if (e > 0) parts.push(e + ' ערב');
+  if (other > 0) parts.push(other + ' אמצע');
+  return parts.join(' / ') || '0';
+}
+
+/**
+ * Count how many distinct DAYS this employee marked any availability.
+ */
+function countAvailableDays_(name, availability) {
+  if (!availability || !availability[name]) return 0;
+  var avail = availability[name];
+  var count = 0;
+  var days = Object.keys(avail);
+  for (var d = 0; d < days.length; d++) {
+    var dayBlocks = avail[days[d]];
+    if (dayBlocks && dayBlocks.length > 0) count++;
+  }
+  return count;
+}
+
+function countAvailableSlots_(name, availability, slots, emp) {
+  if (!availability || !availability[name]) return 0;
+  var avail = availability[name];
+  var count = 0;
+  var seen = {};
+
+  for (var s = 0; s < slots.length; s++) {
+    var slot = slots[s];
+    if (slot.block === 'מנהל') continue;
+    if (emp.locationRestriction && emp.locationRestriction !== slot.location) continue;
+    var dayAvail = avail[slot.day];
+    if (!dayAvail || dayAvail.length === 0) continue;
+
+    var hasBlock = false;
+    for (var b = 0; b < dayAvail.length; b++) {
+      if (dayAvail[b] === slot.block) { hasBlock = true; break; }
+    }
+    if (!hasBlock) continue;
+
+    var key = slot.day + '_' + slot.block;
+    if (!seen[key]) { seen[key] = true; count++; }
+  }
+  return count;
+}
+
+/** @deprecated — use isJuniorAloneForSlot_ / hasSeniorTimeCoverageForSlot_ */
+function hasSeniorInAssignedBlock_(location, day, block, assignments, masterMap) {
+  var slotMap = buildSlotMap_(loadShiftTemplates());
+  var keys = Object.keys(assignments);
+  for (var i = 0; i < keys.length; i++) {
+    if (keys[i].indexOf(location + '_' + day + '_' + block + '_') !== 0) continue;
+    var slot = slotMap[keys[i]];
+    if (slot && isJuniorAloneForSlot_(slot, assignments, slotMap)) return false;
+  }
+  return true;
+}
+
+function rankToHebrew(rank) {
+  if (rank === 4) return 'ד';
+  if (rank === 3) return 'ג';
+  if (rank === 2) return 'ב';
+  if (rank === 1) return 'א';
+  return String(rank);
+}
+
+function formatTime_(decimalHours) {
+  if (decimalHours === null || decimalHours === undefined) return '';
+  var h = Math.floor(decimalHours);
+  var m = Math.round((decimalHours - h) * 60);
+  return h + ':' + (m < 10 ? '0' : '') + m;
+}
+
+// ============================================================
+//  Share schedule: clean view for WhatsApp (no costs / colors)
+// ============================================================
+
+/**
+ * Menu: "הפץ משמרות" — writes Share_Export, syncs names to the distribution sheet, logs ShiftHistory.
+ */
+function shareSchedule() {
+  showRtlConfirmDialog_(
+    'shareSchedule',
+    '📤 הפץ משמרות',
+    'מה זה עושה: בונה גיליון נקי להפצה ומעדכן את היסטוריית השיבוצים לפי הלו"ז הנוכחי בגיליון.\n\n'
+      + 'טבלאות:\n'
+      + '• קורא: בעיקר "' + CONFIG.sheets.schedule + '".\n'
+      + '• כותב: "' + CONFIG.sheets.shareExport + '" (נבנה מחדש), מעדכן "' + CONFIG.sheets.shiftHistory + '".\n\n'
+      + 'להמשיך?'
+  );
+}
+
+function shareScheduleRun_() {
+  var ui = SpreadsheetApp.getUi();
+  try {
+    var data = buildShareableScheduleData_();
+    if (!data) {
+      ui.alert(
+        rtlUiText_('אין לו"ז'),
+        rtlUiText_('לא נמצא גיליון Schedule, או שלא מולאו במשבצות.'),
+        ui.ButtonSet.OK
+      );
+      return;
+    }
+
+    exportShareableScheduleToSheet_(data);
+
+    logHistoryFromSheet_();
+
+    // Archive raw form responses + clear for next week (best-effort, does not block sharing).
+    archiveAndClearFormResponsesLikeShare_();
+
+    SpreadsheetApp.getActive()
+      .toast('הלו"ז מוכן בטאב "' + CONFIG.sheets.shareExport + '" — צלמו מסך ושלחו לעובדים!\nההיסטוריה עודכנה ב-ShiftHistory.', '📤 הפצת משמרות', 8);
+  } catch (e) {
+    Logger.log('shareSchedule: ' + e + (e && e.stack ? '\n' + e.stack : ''));
+    ui.alert(rtlUiText_('שגיאה'), rtlUiText_(String(e.message || e)), ui.ButtonSet.OK);
+  }
+}
+
+// ============================================================
+//  טבלה להפצה — Share_Export → ערכים בלבד
+// ============================================================
+
+/** @type {Array<Array<string>>} [fromA1, toA1] Share_Export → גיליון הפצה (עמודה אחת בכל צד) */
+var SHARE_EXPORT_TO_DISTRIBUTION_PAIRS_ = [
+  ['B6:B10', 'P5:P9'],
+  ['C6:C10', 'N5:N9'],
+  ['D6:D10', 'L5:L9'],
+  ['E6:E10', 'J5:J9'],
+  ['F6:F10', 'H5:H9'],
+  ['G12:G17', 'F5:F10'],
+  ['H19:H27', 'D5:D13'],
+  ['K6:K10', 'P13:P17'],
+  ['L6:L10', 'N13:N17'],
+  ['M6:M10', 'L13:L17'],
+  ['N6:N10', 'J13:J17'],
+  ['O6:O10', 'H13:H17'],
+  ['P12:P16', 'F13:F17']
+];
+
+function colLettersToNumber_(letters) {
+  letters = String(letters).toUpperCase();
+  var n = 0;
+  for (var i = 0; i < letters.length; i++) {
+    var ch = letters.charCodeAt(i);
+    if (ch < 65 || ch > 90) throw new Error('עמודה לא חוקית: ' + letters);
+    n = n * 26 + (ch - 64);
+  }
+  return n;
+}
+
+/** @returns {{ col: number, r1: number, r2: number }} */
+function parseA1SingleColumnRect_(a1) {
+  var s = String(a1).replace(/\s/g, '');
+  var m = s.match(/^([A-Za-z]+)(\d+):([A-Za-z]+)(\d+)$/);
+  if (!m) throw new Error('טווח A1 לא חוקי (נדרש עמודה:שורה): ' + a1);
+  var c1 = colLettersToNumber_(m[1]);
+  var r1 = parseInt(m[2], 10);
+  var c2 = colLettersToNumber_(m[3]);
+  var r2 = parseInt(m[4], 10);
+  if (c1 !== c2) throw new Error('רק עמודה אחת בכל טווח: ' + a1);
+  if (r1 > r2) {
+    var t = r1;
+    r1 = r2;
+    r2 = t;
+  }
+  return { col: c1, r1: r1, r2: r2 };
+}
+
+function getDistributionSyncMaxSpillRows_() {
+  var n = CONFIG.distributionSyncMaxSpillRows;
+  return typeof n === 'number' && n > 0 ? Math.floor(n) : 40;
+}
+
+function getDistributionTableSheet_(ss) {
+  var name = CONFIG.sheets.distributionTable;
+  if (!name || !String(name).trim()) return null;
+  return ss.getSheetByName(String(name).trim()) || null;
+}
+
+function distributionSheetNamesForError_() {
+  return String(CONFIG.sheets.distributionTable || '').trim() || '(לא הוגדר)';
+}
+
+function normalizeShareNameCell_(s) {
+  var t = String(s == null ? '' : s).trim();
+  if (t === '—' || t === '–' || t === '-') return '';
+  return t;
+}
+
+/**
+ * Reads one column from Share_Export starting at r1, up to maxRows, then drops trailing blanks.
+ */
+function readShareColumnSpill_(sheet, col, r1, maxRows) {
+  var vals = [];
+  for (var i = 0; i < maxRows; i++) {
+    var raw = sheet.getRange(r1 + i, col).getDisplayValue();
+    vals.push([normalizeShareNameCell_(raw)]);
+  }
+  while (vals.length > 0 && !vals[vals.length - 1][0]) vals.pop();
+  return vals;
+}
+
+function getDistributionProtectedColumns_() {
+  var p = CONFIG.distributionProtectedSheetColumns;
+  if (p && p.length) return p;
+  return [5, 7, 9, 11, 13, 15, 17];
+}
+
+function isDistributionColumnProtected_(col) {
+  return getDistributionProtectedColumns_().indexOf(col) >= 0;
+}
+
+/** True if normalized text is an exact employee name key from MasterData. */
+function isKnownMasterEmployeeName_(normalizedName, masterMap) {
+  if (!normalizedName || !masterMap) return false;
+  return Object.prototype.hasOwnProperty.call(masterMap, normalizedName) && !!masterMap[normalizedName];
+}
+
+/**
+ * Value in Share_Export peek cell (row peekR, col) only if it normalizes to a known MasterData employee name.
+ */
+function peekEmployeeNameFromShareCell_(src, peekR, col, masterMap) {
+  var raw = normalizeShareNameCell_(src.getRange(peekR, col).getDisplayValue());
+  if (!raw || !isKnownMasterEmployeeName_(raw, masterMap)) return '';
+  return raw;
+}
+
+/**
+ * Clears only mapped **name** columns on the distribution sheet (never protected columns, e.g. Q).
+ * Uses one cell at a time to reduce clearing merged regions that include location/hours.
+ * Extent is based on Share_Export spill length + small pad (not a blind 40-row block unless needed).
+ */
+function clearDistributionTableNameTargets_(src, dst, masterMap) {
+  var maxRead = getDistributionSyncMaxSpillRows_();
+  var pad = 6;
+  var i;
+  for (i = 0; i < SHARE_EXPORT_TO_DISTRIBUTION_PAIRS_.length; i++) {
+    var fp = parseA1SingleColumnRect_(SHARE_EXPORT_TO_DISTRIBUTION_PAIRS_[i][0]);
+    var tp = parseA1SingleColumnRect_(SHARE_EXPORT_TO_DISTRIBUTION_PAIRS_[i][1]);
+    if (isDistributionColumnProtected_(tp.col)) continue;
+
+    var vals = readShareColumnSpill_(src, fp.col, fp.r1, maxRead);
+    var peekR = fp.r2 + 1;
+    var peekExtra = peekEmployeeNameFromShareCell_(src, peekR, fp.col, masterMap);
+    var idx = peekR - fp.r1;
+    var n = vals.length;
+    if (peekExtra && (vals.length <= idx || !vals[idx] || !vals[idx][0])) {
+      n = Math.max(n, idx + 1);
+    }
+    n = Math.max(n, tp.r2 - tp.r1 + 1);
+    n = Math.min(n + pad, maxRead);
+    var endR = tp.r1 + n - 1;
+    var r;
+    for (r = tp.r1; r <= endR; r++) {
+      try { dst.getRange(r, tp.col).clearContent(); } catch (ce) { try { dst.getRange(r, tp.col).setValue(''); } catch (se) { /* skip protected/table cells */ } }
+    }
+  }
+}
+
+/**
+ * Copies mapped Share_Export columns into the distribution sheet. Uses setValue per cell so merged
+ * template cells do not cause setValues row-count errors; extra names below the original block spill down.
+ *
+ * Edge (once per mapping): row **fp.r2+1** in Share_Export is copied only if it matches an **employee name**
+ * in MasterData (same normalized string as the Name column); random text in that cell is ignored.
+ */
+function copyShareExportSpillToDistribution_(src, dst, masterMap) {
+  var maxRead = getDistributionSyncMaxSpillRows_();
+  for (var i = 0; i < SHARE_EXPORT_TO_DISTRIBUTION_PAIRS_.length; i++) {
+    var fp = parseA1SingleColumnRect_(SHARE_EXPORT_TO_DISTRIBUTION_PAIRS_[i][0]);
+    var tp = parseA1SingleColumnRect_(SHARE_EXPORT_TO_DISTRIBUTION_PAIRS_[i][1]);
+    if (isDistributionColumnProtected_(tp.col)) continue;
+    var vals = readShareColumnSpill_(src, fp.col, fp.r1, maxRead);
+    var peekR = fp.r2 + 1;
+    var peekExtra = peekEmployeeNameFromShareCell_(src, peekR, fp.col, masterMap);
+    var idx = peekR - fp.r1;
+    if (!vals.length && !peekExtra) continue;
+    var j;
+    for (j = 0; j < vals.length; j++) {
+      dst.getRange(tp.r1 + j, tp.col).setValue(vals[j][0]);
+    }
+    if (peekExtra && (vals.length <= idx || !vals[idx] || !vals[idx][0])) {
+      dst.getRange(tp.r1 + idx, tp.col).setValue(peekExtra);
+    }
+  }
+}
+
+/**
+ * Clears mapped strips on the distribution sheet, then copies from Share_Export (values only).
+ */
+function syncShareExportToDistributionTable_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var src = ss.getSheetByName(CONFIG.sheets.shareExport);
+  var dst = getDistributionTableSheet_(ss);
+  if (!src) throw new Error('לא נמצא גיליון "' + CONFIG.sheets.shareExport + '".');
+  if (!dst) throw new Error('לא נמצא גיליון הפצה (' + distributionSheetNamesForError_() + ').');
+
+  // Remove filter/table that can block cell writes
+  var filter = dst.getFilter();
+  if (filter) filter.remove();
+  var bandings = dst.getBandings();
+  for (var b = 0; b < bandings.length; b++) { try { bandings[b].remove(); } catch (x) {} }
+
+  var masterMap = loadMasterData();
+  clearDistributionTableNameTargets_(src, dst, masterMap);
+  copyShareExportSpillToDistribution_(src, dst, masterMap);
+}
+
+/**
+ * Read the FINAL schedule from the sheet (after manual edits) and log to ShiftHistory.
+ * Called only when sharing — this is the "approved" schedule.
+ */
+function logHistoryFromSheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(CONFIG.sheets.schedule);
+  if (!sheet) return;
+
+  var masterMap = loadMasterData();
+  var responseData = loadAvailability();
+  var availability = responseData.availability;
+  var slots = loadShiftTemplates();
+  var sheetData = sheet.getDataRange().getValues();
+
+  var empStats = {};
+  var names = Object.keys(masterMap);
+  for (var i = 0; i < names.length; i++) {
+    empStats[names[i]] = {
+      name: names[i],
+      rank: masterMap[names[i]].rank,
+      shiftsCount: 0, morningCount: 0, eveningCount: 0,
+      isGlobal: masterMap[names[i]].isGlobal,
+      isPriority: masterMap[names[i]].isPriority,
+      shiftTarget: getShiftTarget(names[i], masterMap, availability)
+    };
+  }
+
+  var locations = CONFIG.locations;
+  for (var loc = 0; loc < locations.length; loc++) {
+    var location = locations[loc];
+    var locationLabel = CONFIG.locationNames[location] || location;
+    var locationSlots = slots.filter(function(s) { return s.location === location; });
+
+    var headerRow = -1;
+    for (var r = 0; r < sheetData.length; r++) {
+      for (var c = 0; c < sheetData[r].length; c++) {
+        if (String(sheetData[r][c]).trim() === locationLabel) { headerRow = r; break; }
+      }
+      if (headerRow >= 0) break;
+    }
+    if (headerRow < 0) continue;
+
+    for (var g = 0; g < DAY_GROUPS_.length; g++) {
+      var days = DAY_GROUPS_[g];
+      var groupStartCol = -1;
+      for (var c = 0; c < sheetData[headerRow].length; c++) {
+        if (String(sheetData[headerRow][c]).trim() === days[0]) { groupStartCol = c; break; }
+      }
+      if (groupStartCol < 0) continue;
+
+      var dayRows = {};
+      for (var d = 0; d < days.length; d++) {
+        var day = days[d];
+        var arr = locationSlots.filter(function(s) { return s.day === day; });
+        arr.sort(function(a, b) {
+          return (a.startTime || 0) - (b.startTime || 0) || (a.endTime || 0) - (b.endTime || 0);
+        });
+        dayRows[day] = arr;
+      }
+
+      for (var d = 0; d < days.length; d++) {
+        var day = days[d];
+        var arr = dayRows[day];
+        for (var r = 0; r < arr.length; r++) {
+          var slot = arr[r];
+          var cellRow = headerRow + 1 + r;
+          var cellCol = groupStartCol + d;
+          var val = String(sheetData[cellRow] ? sheetData[cellRow][cellCol] || '' : '').trim();
+          if (!val || val === '⚠' || val === 'מנהל') continue;
+
+          var emp = masterMap[val];
+          if (!emp || !empStats[val]) continue;
+
+          empStats[val].shiftsCount++;
+          if (slot.block === 'בוקר') empStats[val].morningCount++;
+          else if (slot.block === 'ערב') empStats[val].eveningCount++;
+        }
+      }
+    }
+  }
+
+  logShiftHistory(empStats, masterMap, availability, slots);
+}
+
+/**
+ * Pads a row to exactly len columns.
+ */
+function padShareRow_(cells, len) {
+  var out = [];
+  for (var i = 0; i < len; i++) {
+    out.push(i < cells.length && cells[i] != null && cells[i] !== undefined ? cells[i] : '');
+  }
+  return out;
+}
+
+/**
+ * Pads or trims array to exactly len.
+ */
+function padArr_(arr, len, fill) {
+  var out = arr.slice(0, len);
+  while (out.length < len) out.push(fill || '');
+  return out;
+}
+
+/**
+ * Build data rows for one block of one location.
+ * Returns [{ time, dayCells[7] }] — only the relevant day indices are filled.
+ */
+function buildBlockDataRows_(block) {
+  var allDays = CONFIG.days;
+  var dayIndices = [];
+  for (var d = 0; d < block.days.length; d++) {
+    for (var ai = 0; ai < allDays.length; ai++) {
+      if (allDays[ai] === block.days[d]) { dayIndices.push(ai); break; }
+    }
+  }
+
+  var rows = [];
+  for (var ri = 0; ri < block.body.length; ri++) {
+    var ro = block.body[ri];
+    var dayCells = ['', '', '', '', '', '', ''];
+    var hasContent = false;
+    for (var di = 0; di < dayIndices.length; di++) {
+      var name = sanitizeCellForShare_(ro.names[di] || '');
+      dayCells[dayIndices[di]] = name;
+      if (name && name !== '—') hasContent = true;
+    }
+    if (hasContent || ro.time) {
+      rows.push({ time: ro.time || '', dayCells: dayCells });
+    }
+  }
+  return rows;
+}
+
+/**
+ * Sheet export: unified table per location with sub-blocks for each day-group,
+ * both locations side by side, hours on the right, borderless poster look.
+ * Sub-blocks are aligned across locations (padded to same height).
+ */
+function exportShareableScheduleToSheet_(data) {
+  if (!data || !data.sections || !data.sections.length) return;
+
+  var ss = SpreadsheetApp.getActive();
+  var shName = CONFIG.sheets.shareExport;
+  var sh = ss.getSheetByName(shName);
+  if (!sh) {
+    sh = ss.insertSheet(shName);
+  } else {
+    sh.clear();
+    sh.clearFormats();
+    sh.clearNotes();
+    var mr = sh.getMaxRows(), mc = sh.getMaxColumns();
+    if (mr > 0 && mc > 0) sh.getRange(1, 1, mr, mc).breakApart();
+  }
+  sh.setRightToLeft(true);
+
+  var allDays = CONFIG.days;
+  var nDays = allDays.length;
+  var COLS_PER_LOC = nDays + 1; // time col + 7 day cols
+  var GAP = 1;
+  var numLocs = data.sections.length;
+  var totalW = numLocs * COLS_PER_LOC + (numLocs - 1) * GAP;
+
+  var HEADER_BG = '#2557a7';
+  var HEADER_FG = '#FFFFFF';
+  var LOC_BG = '#2557a7';
+  var LOC_FG = '#FFFFFF';
+  var TH_BG = '#e8edf4';
+  var TH_FG = '#334155';
+  var SUB_BG = '#dce6f1';
+  var SUB_FG = '#1e3a5f';
+  var TIME_FG = '#64748b';
+  var STRIPE_A = '#FFFFFF';
+  var STRIPE_B = '#f7f9fc';
+  var EMPTY_FG = '#cbd5e1';
+  var BG_FILL = '#f0f2f5';
+
+  var grid = [];
+  var meta = [];
+
+  function addRow(cells, type) {
+    grid.push(padShareRow_(cells, totalW));
+    meta.push(type);
+  }
+
+  // Build a combined row from location cells: [loc0_cells] [gap] [loc1_cells] ...
+  function combineLocCells(locCellArrays) {
+    var combined = [];
+    for (var si = 0; si < locCellArrays.length; si++) {
+      var cells = locCellArrays[si];
+      for (var c = 0; c < cells.length; c++) combined.push(cells[c]);
+      if (si < locCellArrays.length - 1) combined.push('');
+    }
+    return combined;
+  }
+
+  // Make a single location's cell array: [time, day0, day1, ..., day6]
+  function makeLocDataCells(dataRow) {
+    if (!dataRow) return padArr_([], COLS_PER_LOC, '');
+    var cells = [dataRow.time];
+    for (var d = 0; d < nDays; d++) cells.push(dataRow.dayCells[d]);
+    return cells;
+  }
+
+  function makeLocEmptyCells() {
+    return padArr_([], COLS_PER_LOC, '');
+  }
+
+  // Title row
+  addRow([data.title], 'title');
+  addRow([''], 'spacer');
+
+  // Location label row
+  var locLabels = [];
+  for (var si = 0; si < numLocs; si++) {
+    var lbl = [data.sections[si].location];
+    for (var x = 1; x < COLS_PER_LOC; x++) lbl.push('');
+    locLabels.push(lbl);
+  }
+  addRow(combineLocCells(locLabels), 'loc');
+
+  // Day header row
+  var dayHeaders = [];
+  for (var si = 0; si < numLocs; si++) {
+    var dh = ['שעות'];
+    for (var d = 0; d < nDays; d++) dh.push(allDays[d]);
+    dayHeaders.push(dh);
+  }
+  addRow(combineLocCells(dayHeaders), 'thead');
+
+  // Iterate block-by-block, aligned across locations
+  var maxBlocks = 0;
+  for (var si = 0; si < numLocs; si++) {
+    if (data.sections[si].blocks.length > maxBlocks) maxBlocks = data.sections[si].blocks.length;
+  }
+
+  for (var bi = 0; bi < maxBlocks; bi++) {
+    // Sub-header row — use the first location's subtitle
+    var subLabel = '';
+    for (var si = 0; si < numLocs; si++) {
+      if (bi < data.sections[si].blocks.length) {
+        subLabel = data.sections[si].blocks[bi].subtitle;
+        break;
+      }
+    }
+
+    // Check if any location has actual data for this block
+    var anyData = false;
+    var blockDataPerLoc = [];
+    for (var si = 0; si < numLocs; si++) {
+      if (bi < data.sections[si].blocks.length) {
+        var rows = buildBlockDataRows_(data.sections[si].blocks[bi]);
+        blockDataPerLoc.push(rows);
+        if (rows.length > 0) anyData = true;
+      } else {
+        blockDataPerLoc.push([]);
+      }
+    }
+    if (!anyData) continue;
+
+    // Sub-header
+    var subCells = [];
+    for (var si = 0; si < numLocs; si++) {
+      var sc = [subLabel];
+      for (var x = 1; x < COLS_PER_LOC; x++) sc.push('');
+      subCells.push(sc);
+      if (si < numLocs - 1) subCells.push(['']); // gap
+    }
+    // Flatten subCells
+    var subFlat = [];
+    for (var si = 0; si < subCells.length; si++) {
+      for (var c = 0; c < subCells[si].length; c++) subFlat.push(subCells[si][c]);
+    }
+    addRow(subFlat, 'subhead');
+
+    // Find max data rows across locations for this block
+    var maxDataRows = 0;
+    for (var si = 0; si < numLocs; si++) {
+      if (blockDataPerLoc[si].length > maxDataRows) maxDataRows = blockDataPerLoc[si].length;
+    }
+
+    // Data rows, padded to maxDataRows
+    for (var ri = 0; ri < maxDataRows; ri++) {
+      var rowCellArrays = [];
+      for (var si = 0; si < numLocs; si++) {
+        if (ri < blockDataPerLoc[si].length) {
+          rowCellArrays.push(makeLocDataCells(blockDataPerLoc[si][ri]));
+        } else {
+          rowCellArrays.push(makeLocEmptyCells());
+        }
+      }
+      addRow(combineLocCells(rowCellArrays), 'data');
+    }
+  }
+
+  // Write grid
+  var nRows = grid.length;
+  if (nRows < 1) return;
+  sh.getRange(1, 1, nRows, totalW).setValues(grid);
+  sh.getRange(1, 1, nRows, totalW)
+    .setFontFamily('Arial')
+    .setFontSize(11)
+    .setVerticalAlignment('middle')
+    .setHorizontalAlignment('center')
+    .setBackground('#FFFFFF')
+    .setBorder(false, false, false, false, false, false);
+
+  // Location column ranges
+  var locCols = [];
+  var col = 1;
+  for (var si = 0; si < numLocs; si++) {
+    locCols.push({ start: col, total: COLS_PER_LOC });
+    col += COLS_PER_LOC + GAP;
+  }
+
+  var dataRowCount = 0;
+  for (var ri = 0; ri < nRows; ri++) {
+    var r = ri + 1;
+    var ty = meta[ri];
+
+    if (ty === 'title') {
+      sh.getRange(r, 1, 1, totalW).merge()
+        .setFontSize(15).setFontWeight('bold')
+        .setBackground(HEADER_BG).setFontColor(HEADER_FG)
+        .setHorizontalAlignment('center');
+      sh.setRowHeight(r, 36);
+      continue;
+    }
+    if (ty === 'spacer') {
+      sh.getRange(r, 1, 1, totalW).setBackground(BG_FILL).setFontSize(4);
+      sh.setRowHeight(r, 6);
+      continue;
+    }
+    if (ty === 'loc') {
+      for (var ci = 0; ci < locCols.length; ci++) {
+        var lc = locCols[ci];
+        sh.getRange(r, lc.start, 1, lc.total).merge()
+          .setFontSize(13).setFontWeight('bold')
+          .setBackground(LOC_BG).setFontColor(LOC_FG)
+          .setHorizontalAlignment('center');
+      }
+      sh.setRowHeight(r, 30);
+      continue;
+    }
+    if (ty === 'thead') {
+      for (var ci = 0; ci < locCols.length; ci++) {
+        var lc = locCols[ci];
+        sh.getRange(r, lc.start, 1, lc.total)
+          .setFontSize(11).setFontWeight('bold')
+          .setBackground(TH_BG).setFontColor(TH_FG)
+          .setHorizontalAlignment('center');
+      }
+      sh.setRowHeight(r, 26);
+      continue;
+    }
+    if (ty === 'subhead') {
+      dataRowCount = 0;
+      for (var ci = 0; ci < locCols.length; ci++) {
+        var lc = locCols[ci];
+        sh.getRange(r, lc.start, 1, lc.total).merge()
+          .setFontSize(10).setFontWeight('bold')
+          .setBackground(SUB_BG).setFontColor(SUB_FG)
+          .setHorizontalAlignment('center');
+      }
+      sh.setRowHeight(r, 22);
+      continue;
+    }
+    if (ty === 'data') {
+      dataRowCount++;
+      var stripe = (dataRowCount % 2 === 1) ? STRIPE_A : STRIPE_B;
+      for (var ci = 0; ci < locCols.length; ci++) {
+        var lc = locCols[ci];
+        sh.getRange(r, lc.start, 1, lc.total).setBackground(stripe).setFontSize(11);
+        // Time column = first col in each loc block
+        sh.getRange(r, lc.start)
+          .setFontSize(9).setFontColor(TIME_FG).setFontWeight('bold');
+        // Empty cells styling
+        for (var cc = lc.start + 1; cc < lc.start + lc.total; cc++) {
+          var val = sh.getRange(r, cc).getValue();
+          if (val === '—' || val === '' || val === null) {
+            sh.getRange(r, cc).setFontColor(EMPTY_FG);
+          }
+        }
+      }
+      sh.setRowHeight(r, 26);
+      continue;
+    }
+  }
+
+  // Column widths
+  for (var ci = 0; ci < locCols.length; ci++) {
+    var lc = locCols[ci];
+    sh.setColumnWidth(lc.start, 76); // time col
+    for (var cc = lc.start + 1; cc < lc.start + lc.total; cc++) {
+      sh.setColumnWidth(cc, 64);
+    }
+  }
+  // Gap columns
+  for (var ci = 0; ci < locCols.length - 1; ci++) {
+    var gapCol = locCols[ci].start + locCols[ci].total;
+    sh.setColumnWidth(gapCol, 10);
+  }
+
+  ss.setActiveSheet(sh);
+}
+
+/**
+ * @returns {Object|null} { title, sections: [{ location, blocks: [{ subtitle, days, body: [{ time, names[] }] }] }] }
+ */
+function buildShareableScheduleData_() {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName(CONFIG.sheets.schedule);
+  if (!sheet) return null;
+  var data = sheet.getDataRange().getDisplayValues();
+  if (!data || data.length === 0) return null;
+
+  var title = 'לו"ז ' + formatWeekRangeHebrew_(new Date());
+  var sections = [];
+
+  var r = 0;
+  while (r < data.length) {
+    var row = data[r];
+    if (isFairnessTableStart_(row) || isLegendOrFooterForShare_(row)) break;
+    if (isEmptyRowForShare_(row)) { r++; continue; }
+    if (isTotalRowForShare_(row)) { r++; continue; }
+
+    var blocks = parseBlockHeaders_(row);
+    if (blocks.length === 0) { r++; continue; }
+
+    if (!isLocationNameForShare_(String(row[0]).trim()) || !isDayNameForShare_(String(row[1]).trim())) {
+      r++;
+      continue;
+    }
+
+    var firstLoc = blocks[0].location;
+    var blockList = [];
+    for (var bi = 0; bi < blocks.length; bi++) {
+      blockList.push({ meta: blocks[bi], rows: [] });
+    }
+
+    r++;
+    while (r < data.length) {
+      var drow = data[r];
+      if (isFairnessTableStart_(drow) || isLegendOrFooterForShare_(drow)) break;
+      if (isEmptyRowForShare_(drow)) { r++; continue; }
+      if (isCostRowForShare_(drow)) { r++; break; }
+      if (isTotalRowForShare_(drow)) { r++; break; }
+      if (isBlockHeaderRowForShare_(drow) && isLocationNameForShare_(String(drow[0]).trim()) && isDayNameForShare_(String(drow[1]).trim())) { break; }
+
+      if (isRowAllEmptyInBlocksForShare_(drow, blocks)) { r++; continue; }
+
+      for (var bj = 0; bj < blocks.length; bj++) {
+        var m = blocks[bj];
+        var t = m.colStart < drow.length ? drow[m.colStart] : '';
+        var names = [];
+        for (var jk = 0; jk < m.days.length; jk++) {
+          var cidx = m.dayColStart + jk;
+          var raw = cidx < drow.length ? drow[cidx] : '';
+          names.push(sanitizeCellForShare_(raw));
+        }
+        blockList[bj].rows.push({ time: String(t).trim(), names: names });
+      }
+      r++;
+    }
+
+    var outBlocks = [];
+    for (var bz = 0; bz < blockList.length; bz++) {
+      var m0 = blockList[bz].meta;
+      var sub = blockSubtitleForShare_(m0.days);
+      outBlocks.push({ subtitle: sub, days: m0.days, body: blockList[bz].rows });
+    }
+    sections.push({ location: firstLoc, blocks: outBlocks });
+  }
+
+  if (sections.length === 0) return null;
+  return { title: title, sections: sections };
+}
+
+function blockSubtitleForShare_(days) {
+  if (!days || !days.length) return '';
+  if (days.length === 5 && days[0] === 'ראשון' && days[4] === 'חמישי') {
+    return 'ראשון – חמישי';
+  }
+  if (days.length === 1) return days[0];
+  return days.join(' · ');
+}
+
+function parseBlockHeaders_(row) {
+  var blocks = [];
+  if (!row || !row.length) return blocks;
+  var c = 0;
+  var maxC = row.length;
+  while (c < maxC) {
+    while (c < maxC && (row[c] === '' || row[c] == null)) c++;
+    if (c >= maxC) break;
+    var a = String(row[c]).trim();
+    if (c + 1 >= maxC) break;
+    var b = String(row[c + 1]).trim();
+    if (!isLocationNameForShare_(a) || !isDayNameForShare_(b)) { c++; continue; }
+    var colStart = c;
+    c++;
+    var days = [];
+    while (c < maxC && isDayNameForShare_(String(row[c]).trim())) {
+      days.push(String(row[c]).trim());
+      c++;
+    }
+    if (days.length) {
+      blocks.push({ location: a, colStart: colStart, dayColStart: colStart + 1, days: days, width: 1 + days.length });
+    }
+  }
+  return blocks;
+}
+
+function isBlockHeaderRowForShare_(row) {
+  if (!row || !row[0] || !row[1]) return false;
+  return isLocationNameForShare_(String(row[0]).trim()) && isDayNameForShare_(String(row[1]).trim());
+}
+
+function isRowAllEmptyInBlocksForShare_(row, blocks) {
+  var has = false;
+  for (var b = 0; b < blocks.length; b++) {
+    var m = blocks[b];
+    var to = m.colStart + m.width;
+    for (var i = m.colStart; i < to && i < row.length; i++) {
+      if (row[i] != null && String(row[i]).trim() !== '') { has = true; break; }
+    }
+  }
+  return !has;
+}
+
+function isEmptyRowForShare_(row) {
+  for (var i = 0; i < row.length; i++) {
+    if (row[i] != null && String(row[i]).trim() !== '') return false;
+  }
+  return true;
+}
+
+function isDayNameForShare_(s) {
+  s = String(s).trim();
+  for (var i = 0; i < CONFIG.days.length; i++) {
+    if (CONFIG.days[i] === s) return true;
+  }
+  return false;
+}
+
+function isLocationNameForShare_(s) {
+  s = String(s).trim();
+  var locs = CONFIG.locationNames;
+  for (var k in locs) {
+    if (locs.hasOwnProperty(k) && locs[k] === s) return true;
+  }
+  return s === 'גאולה' || s === 'גורדון';
+}
+
+function isCostRowForShare_(row) {
+  for (var i = 0; i < row.length; i++) {
+    if (String(row[i]).trim() === 'עלות יומית') return true;
+  }
+  return false;
+}
+
+function isTotalRowForShare_(row) {
+  if (!row || row[0] == null) return false;
+  return String(row[0]).indexOf('סה"כ') === 0;
+}
+
+function isFairnessTableStart_(row) {
+  if (!row || !row[0] || !row[1]) return false;
+  return String(row[0]).trim() === 'שם' && String(row[1]).trim() === 'דרגה';
+}
+
+function isLegendOrFooterForShare_(row) {
+  if (!row[0]) return false;
+  var t = String(row[0]).trim();
+  return t.indexOf('מקרא') === 0;
+}
+
+function sanitizeCellForShare_(v) {
+  if (v == null) return '—';
+  var s = String(v).trim();
+  if (s === '' || s === '—') return '—';
+  if (s === '⚠' || s.indexOf('⚠') >= 0) return '—';
+  if (s.charCodeAt(0) === 9888) return '—';
+  s = s.replace(/^\s*💰/g, '');
+  return s;
+}
+
+function formatWeekRangeHebrew_(d) {
+  var tz = Session.getScriptTimeZone() || 'Asia/Jerusalem';
+  var now = d || new Date();
+  var start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
+  var end = new Date(start.getFullYear(), start.getMonth(), start.getDate() + 6);
+  return Utilities.formatDate(start, tz, 'dd/MM/yyyy') + ' – ' + Utilities.formatDate(end, tz, 'dd/MM/yyyy');
+}
+
+/**
+ * Build full HTML for the modal — beautiful poster-style schedule for screenshots.
+ * Locations side-by-side, days RTL, borderless clean look.
+ */
+function buildShareScheduleDialogHtml_(data) {
+  var bodyHtml = buildShareSchedulesTableHtml_(data);
+  var h = [
+    '<!DOCTYPE html><html lang="he" dir="rtl"><head><meta charset="UTF-8">',
+    '<base target="_top">',
+    '<style>',
+    '@import url("https://fonts.googleapis.com/css2?family=Heebo:wght@300;400;500;600;700;800;900&display=swap");',
+    '* { box-sizing: border-box; margin: 0; padding: 0; }',
+    'body { font-family: "Heebo", "Arial Hebrew", Tahoma, sans-serif; font-size: 14px; background: #eef1f5; direction: rtl; color: #1a1a2e; -webkit-font-smoothing: antialiased; }',
+    '',
+    '.toolbar { position: sticky; top: 0; z-index: 100; background: rgba(255,255,255,0.92); backdrop-filter: blur(8px); border-bottom: 1px solid #e0e0e0; padding: 8px 16px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }',
+    '.toolbar button { font-family: inherit; font-weight: 600; font-size: 13px; border: none; border-radius: 8px; padding: 8px 16px; cursor: pointer; transition: all 0.2s; }',
+    '.btn-copy { background: #2563eb; color: #fff; }',
+    '.btn-copy:hover { background: #1d4ed8; }',
+    '.toolbar .hint { font-size: 11px; color: #888; }',
+    '.toolbar .status { font-size: 12px; font-weight: 600; color: #16a34a; }',
+    '',
+    '#capture { max-width: 1100px; margin: 10px auto 16px; background: #fff; border-radius: 18px; overflow: hidden; box-shadow: 0 4px 30px rgba(0,0,0,0.07); }',
+    '',
+    '.hdr { background: linear-gradient(135deg, #1a2e4a 0%, #2557a7 60%, #3b82f6 100%); padding: 22px 24px 18px; text-align: center; position: relative; }',
+    '.hdr-name { font-size: 22px; font-weight: 800; color: #fff; letter-spacing: 0.3px; }',
+    '.hdr-week { font-size: 14px; font-weight: 400; color: rgba(255,255,255,0.8); margin-top: 2px; }',
+    '',
+    '.body { padding: 16px 18px 20px; }',
+    '',
+    '.day-group { margin-bottom: 18px; }',
+    '.day-group:last-child { margin-bottom: 0; }',
+    '.dg-title { font-size: 14px; font-weight: 700; color: #1e3a5f; margin-bottom: 8px; padding-right: 2px; }',
+    '',
+    '.pair { display: flex; gap: 14px; }',
+    '.loc-col { flex: 1; min-width: 0; }',
+    '.loc-label { font-size: 12px; font-weight: 700; color: #fff; background: #2557a7; display: inline-block; padding: 3px 14px; border-radius: 6px 6px 0 0; margin-bottom: 0; letter-spacing: 0.2px; }',
+    '',
+    '.grid { width: 100%; border-collapse: collapse; border-radius: 0 8px 8px 8px; overflow: hidden; background: #f7f9fc; }',
+    '.grid th { background: #e8edf4; color: #334155; font-weight: 600; font-size: 12px; padding: 7px 4px; text-align: center; }',
+    '.grid th.t-col { color: #64748b; font-size: 10px; font-weight: 600; }',
+    '.grid td { padding: 7px 4px; text-align: center; font-size: 12px; font-weight: 500; color: #1e293b; }',
+    '.grid td.t-cell { font-size: 10px; font-weight: 600; color: #94a3b8; white-space: nowrap; }',
+    '.grid tr:nth-child(odd) td { background: #fff; }',
+    '.grid tr:nth-child(even) td { background: #f7f9fc; }',
+    '.grid .empty { color: #cbd5e1; }',
+    '.grid .mgr { color: #7c3aed; font-weight: 600; }',
+    '',
+    '.ftr { padding: 10px 24px; background: #f8fafc; text-align: center; font-size: 10px; color: #a0aec0; }',
+    '.ftr b { color: #64748b; }',
+    '</style></head><body>',
+    '<div class="toolbar">',
+    '  <button class="btn-copy" type="button" onclick="copyTxt()">העתק טקסט ל-WhatsApp</button>',
+    '  <span class="status" id="st"></span>',
+    '  <span class="hint">צילום מסך: Cmd+Shift+4 (Mac) / Win+Shift+S</span>',
+    '</div>',
+    '<div id="capture">',
+    bodyHtml,
+    '</div>',
+    '<script>',
+    'function copyTxt(){',
+    '  var el=document.getElementById("capture"); if(!el) return;',
+    '  var txt=el.innerText;',
+    '  var st=document.getElementById("st");',
+    '  if(navigator.clipboard&&navigator.clipboard.writeText){',
+    '    navigator.clipboard.writeText(txt).then(function(){st.textContent="\\u2705 הועתק!";}).catch(function(){st.textContent="Ctrl/Cmd+C";});',
+    '  } else { st.textContent="בחרו והעתיקו ידנית"; }',
+    '}',
+    '</script>',
+    '</body></html>'
+  ];
+  return h.join('\n');
+}
+
+/**
+ * @param {Object} data from buildShareableScheduleData_()
+ * @returns {string} inner HTML — poster-style, screenshot-ready, locations side by side, days RTL
+ */
+function buildShareSchedulesTableHtml_(data) {
+  if (!data || !data.sections || !data.sections.length) return '<p style="padding:40px;text-align:center;color:#999;">אין נתונים</p>';
+  return buildShareSchedulesTableHtmlImpl_(data);
+}
+
+/**
+ * Merge sections (locations) into paired day-groups shown side by side.
+ * Each location has blocks with matching day-groups (Sun-Thu, Friday, Saturday).
+ * Days are reversed so Sunday is rightmost (RTL reading).
+ */
+function buildShareSchedulesTableHtmlImpl_(data) {
+  var p = [];
+  var brand = (CONFIG && CONFIG.brand) ? CONFIG.brand : {};
+  var cafeName = brand.nameHe || '';
+  // Header
+  p.push('<div class="hdr">');
+  if (cafeName) {
+    p.push('<div class="hdr-name">' + escapeHtmlForShare_(cafeName) + ' — לו"ז משמרות</div>');
+  }
+  p.push('<div class="hdr-week">' + escapeHtmlForShare_(data.title) + '</div>');
+  p.push('</div>');
+
+  p.push('<div class="body">');
+
+  // Build a map: blockIndex -> [{location, block}]
+  var maxBlocks = 0;
+  for (var s = 0; s < data.sections.length; s++) {
+    if (data.sections[s].blocks.length > maxBlocks) maxBlocks = data.sections[s].blocks.length;
+  }
+
+  for (var bi = 0; bi < maxBlocks; bi++) {
+    // Collect all locations that have this block index
+    var pairs = [];
+    for (var s = 0; s < data.sections.length; s++) {
+      if (bi < data.sections[s].blocks.length) {
+        pairs.push({ location: data.sections[s].location, block: data.sections[s].blocks[bi] });
+      }
+    }
+    if (pairs.length === 0) continue;
+
+    var groupTitle = pairs[0].block.subtitle;
+    p.push('<div class="day-group">');
+    p.push('<div class="dg-title">' + escapeHtmlForShare_(groupTitle) + '</div>');
+    p.push('<div class="pair">');
+
+    for (var pi = 0; pi < pairs.length; pi++) {
+      var loc = pairs[pi].location;
+      var bl = pairs[pi].block;
+      var days = bl.days.slice().reverse();
+
+      p.push('<div class="loc-col">');
+      p.push('<div class="loc-label">' + escapeHtmlForShare_(loc) + '</div>');
+      p.push('<table class="grid"><thead><tr>');
+      for (var d = 0; d < days.length; d++) {
+        p.push('<th>' + escapeHtmlForShare_(days[d]) + '</th>');
+      }
+      p.push('<th class="t-col">שעות</th>');
+      p.push('</tr></thead><tbody>');
+
+      for (var r = 0; r < bl.body.length; r++) {
+        var ro = bl.body[r];
+        var names = ro.names.slice().reverse();
+        p.push('<tr>');
+        for (var n = 0; n < names.length; n++) {
+          var v = names[n];
+          var cls = '';
+          if (!v || v === '—') cls = ' class="empty"';
+          else if (v === 'מנהל') cls = ' class="mgr"';
+          p.push('<td' + cls + '>' + escapeHtmlForShare_(v) + '</td>');
+        }
+        p.push('<td class="t-cell">' + escapeHtmlForShare_(ro.time || '') + '</td>');
+        p.push('</tr>');
+      }
+
+      p.push('</tbody></table>');
+      p.push('</div>');
+    }
+
+    p.push('</div>'); // .pair
+    p.push('</div>'); // .day-group
+  }
+
+  p.push('</div>'); // .body
+
+  p.push('<div class="ftr">');
+  if (cafeName) p.push('<b>' + escapeHtmlForShare_(cafeName) + '</b> · ');
+  p.push('נוצר אוטומטית ע"י מערכת שיבוץ חכמה');
+  p.push('</div>');
+
+  return p.join('');
+}
+
+function escapeHtmlForShare_(s) {
+  if (s == null) return '';
+  s = String(s);
+  s = s.replace(/&/g, '&amp;');
+  s = s.replace(/</g, '&lt;');
+  s = s.replace(/>/g, '&gt;');
+  s = s.replace(/"/g, '&quot;');
+  return s;
+}
+
+/**
+ * After manual schedule edits: refresh cell notes and fairness table (no costs).
+ * @returns {{ok:boolean, message:string, warnings:string[]}}
+ */
+function refreshScheduleFromSheet_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(CONFIG.sheets.schedule);
+  if (!sheet) {
+    return { ok: false, message: 'לא נמצא טאב "' + CONFIG.sheets.schedule + '".', warnings: [] };
+  }
+
+  var masterMap = loadMasterData();
+  var slots = loadShiftTemplates();
+  var responseData = loadAvailability();
+  var availability = responseData.availability;
+  var notes = responseData.notes || {};
+  var data = sheet.getDataRange().getValues();
+  var slotMap = buildSlotMap_(slots);
+  var currentAssignments = {};
+  var warnings = [];
+
+  var locations = CONFIG.locations;
+  for (var loc = 0; loc < locations.length; loc++) {
+    var location = locations[loc];
+    var locationLabel = CONFIG.locationNames[location] || location;
+    var locationSlots = slots.filter(function(s) { return s.location === location; });
+    if (locationSlots.length === 0) continue;
+
+    var headerRow = -1;
+    for (var r = 0; r < data.length; r++) {
+      for (var c = 0; c < data[r].length; c++) {
+        if (String(data[r][c]).trim() === locationLabel) {
+          headerRow = r;
+          break;
+        }
+      }
+      if (headerRow >= 0) break;
+    }
+    if (headerRow < 0) continue;
+
+    for (var g = 0; g < DAY_GROUPS_.length; g++) {
+      var days = DAY_GROUPS_[g];
+      var groupStartCol = -1;
+      for (var c = 0; c < data[headerRow].length; c++) {
+        if (String(data[headerRow][c]).trim() === days[0]) {
+          groupStartCol = c;
+          break;
+        }
+      }
+      if (groupStartCol < 0) continue;
+
+      var groupSlots = locationSlots.filter(function(s) {
+        return days.indexOf(s.day) >= 0;
+      });
+
+      var dayRows = {};
+      for (var d = 0; d < days.length; d++) {
+        var day = days[d];
+        var arr = [];
+        for (var s = 0; s < groupSlots.length; s++) {
+          if (groupSlots[s].day !== day) continue;
+          arr.push(groupSlots[s]);
+        }
+        arr.sort(function(a, b) {
+          return (a.startTime || 0) - (b.startTime || 0) || (a.endTime || 0) - (b.endTime || 0);
+        });
+        dayRows[day] = arr;
+      }
+
+      var dataStartRow = headerRow + 1;
+      for (var d = 0; d < days.length; d++) {
+        var day = days[d];
+        var arr = dayRows[day];
+        for (var r = 0; r < arr.length; r++) {
+          var slot = arr[r];
+          var cellRow = dataStartRow + r;
+          var cellCol = groupStartCol + d;
+          var cellValue = String(data[cellRow] ? data[cellRow][cellCol] || '' : '').trim();
+
+          if (!cellValue || cellValue === '⚠' || cellValue === 'מנהל') {
+            if (cellValue === '⚠') {
+              sheet.getRange(cellRow + 1, cellCol + 1).setNote(
+                buildOverrideNote_(slot, null, masterMap, availability, currentAssignments)
+              );
+            }
+            continue;
+          }
+
+          var emp = masterMap[cellValue];
+          if (!emp) {
+            warnings.push(cellValue + ' — לא נמצא ב-MasterData');
+            continue;
+          }
+
+          var asgn = { name: cellValue, rank: emp.rank, unfilled: false };
+          currentAssignments[slot.slotId] = asgn;
+          sheet.getRange(cellRow + 1, cellCol + 1).setNote(
+            buildOverrideNote_(slot, asgn, masterMap, availability, currentAssignments)
+          );
+        }
+      }
+    }
+  }
+
+  var empStats = {};
+  var allNames = Object.keys(masterMap);
+  for (var i = 0; i < allNames.length; i++) {
+    empStats[allNames[i]] = {
+      name: allNames[i],
+      rank: masterMap[allNames[i]].rank,
+      shiftsCount: 0,
+      morningCount: 0,
+      eveningCount: 0,
+      shiftTarget: getShiftTarget(allNames[i], masterMap, availability),
+      isGlobal: masterMap[allNames[i]].isGlobal,
+      isPriority: masterMap[allNames[i]].isPriority
+    };
+  }
+  var asgnKeys = Object.keys(currentAssignments);
+  for (var i = 0; i < asgnKeys.length; i++) {
+    var a = currentAssignments[asgnKeys[i]];
+    if (!a || !a.name || !empStats[a.name]) continue;
+    empStats[a.name].shiftsCount++;
+    var parts = asgnKeys[i].split('_');
+    var block = parts[2] || '';
+    if (block === 'בוקר') empStats[a.name].morningCount++;
+    else if (block === 'ערב') empStats[a.name].eveningCount++;
+  }
+
+  var fairnessHeaderRow = -1;
+  for (var r = 0; r < data.length; r++) {
+    if (String(data[r][0]).trim() === 'שם' && String(data[r][1]).trim() === 'דרגה') {
+      fairnessHeaderRow = r;
+      break;
+    }
+  }
+  if (fairnessHeaderRow >= 0) {
+    writeFairnessTable_(sheet, empStats, masterMap, availability, slots, fairnessHeaderRow + 1, notes);
+  }
+
+  return { ok: true, message: '', warnings: warnings };
+}

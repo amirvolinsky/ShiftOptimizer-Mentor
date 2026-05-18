@@ -1,0 +1,13 @@
+{
+  "name": "shift-optimizer-mentor",
+  "private": true,
+  "scripts": {
+    "clasp:push": "clasp push",
+    "clasp:pull": "clasp pull",
+    "clasp:open": "clasp open",
+    "clasp:status": "clasp status"
+  },
+  "devDependencies": {
+    "@google/clasp": "^3.0.3"
+  }
+}

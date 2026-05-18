@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <base target="_top">
+  <meta charset="utf-8"/>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      direction: rtl;
+      text-align: right;
+      font-family: Arial, "Segoe UI", Helvetica, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      color: #202124;
+      background: #fff;
+    }
+    body { padding: 18px 22px 16px; }
+    body.is-busy { cursor: wait; }
+    h1 {
+      font-size: 17px;
+      font-weight: 600;
+      margin: 0 0 14px;
+      text-align: right;
+    }
+    .body-text {
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      unicode-bidi: plaintext;
+      text-align: right;
+    }
+    .actions {
+      margin-top: 22px;
+      padding-top: 14px;
+      border-top: 1px solid #e8eaed;
+      text-align: center;
+    }
+    button {
+      margin: 4px 6px;
+      padding: 9px 20px;
+      font-size: 14px;
+      cursor: pointer;
+      border-radius: 6px;
+      border: 1px solid #dadce0;
+      background: #fff;
+      color: #1a73e8;
+    }
+    button.primary {
+      background: #1a73e8;
+      color: #fff;
+      border-color: #1a73e8;
+    }
+    button:disabled {
+      opacity: 0.85;
+      cursor: not-allowed;
+    }
+    button.primary.is-busy {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      justify-content: center;
+    }
+    .spinner {
+      width: 15px;
+      height: 15px;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.65s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    #err {
+      color: #c5221f;
+      margin-top: 12px;
+      white-space: pre-wrap;
+      text-align: right;
+      unicode-bidi: plaintext;
+    }
+  </style>
+</head>
+<body>
+  <h1><?= title ?></h1>
+  <div class="body-text"><?= message ?></div>
+  <div id="err"></div>
+  <div class="actions">
+    <button type="button" id="btnOk" class="primary" onclick="onConfirm()">אישור</button>
+    <button type="button" id="btnCancel" onclick="google.script.host.close()">ביטול</button>
+  </div>
+  <script>
+    var ACTION_ID = <?!= JSON.stringify(actionId) ?>;
+    var locked = false;
+
+    function setBusy(busy) {
+      var ok = document.getElementById('btnOk');
+      var cancel = document.getElementById('btnCancel');
+      document.body.classList.toggle('is-busy', busy);
+      ok.disabled = busy;
+      cancel.disabled = busy;
+      if (busy) {
+        ok.classList.add('is-busy');
+        ok.innerHTML = '<span class="spinner" aria-hidden="true"></span><span>מעבד…</span>';
+      } else {
+        ok.classList.remove('is-busy');
+        ok.textContent = 'אישור';
+      }
+    }
+
+    function onConfirm() {
+      if (locked) return;
+      locked = true;
+      document.getElementById('err').textContent = '';
+      setBusy(true);
+
+      google.script.run
+        .withSuccessHandler(function () {
+          google.script.host.close();
+        })
+        .withFailureHandler(function (err) {
+          locked = false;
+          setBusy(false);
+          var msg = (err && err.message) ? err.message : String(err);
+          document.getElementById('err').textContent = msg;
+        })
+        .runMenuConfirmed(ACTION_ID);
+    }
+  </script>
+</body>
+</html>
