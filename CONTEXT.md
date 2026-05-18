@@ -11,15 +11,18 @@ Code adapts to the sheet; do not rename form columns once employees use the form
 
 ---
 
-## Deployment IDs (fill in after setup)
+## Deployment IDs
 
 | Item | Value |
 |------|--------|
-| Google Sheet URL | _paste after creation_ |
-| Sheet ID | _from URL_ |
-| Apps Script ID | _script.google.com → Project settings_ |
+| Google Sheet URL | https://docs.google.com/spreadsheets/d/1Th-f8K71HWErAixuHOMmklychZLZOV6BMSzoJ2-VNVk/edit |
+| Sheet ID | `1Th-f8K71HWErAixuHOMmklychZLZOV6BMSzoJ2-VNVk` |
+| Apps Script ID | `1kFAUE_fUVUsEi223x5rKep-VA00wZJQV-GI0lWnJdSmxZ8i6Dvtpk0TU` |
+| Apps Script editor | https://script.google.com/d/1kFAUE_fUVUsEi223x5rKep-VA00wZJQV-GI0lWnJdSmxZ8i6Dvtpk0TU/edit |
 | GitHub | https://github.com/amirvolinsky/ShiftOptimizer-Mentor |
-| Form (employees) | _paste view URL_ |
+| Form (employees) | _paste view URL after linking form_ |
+
+**Note:** Apps Script must be container-bound to this spreadsheet (not a standalone clasp `create` copy). Use script ID above in `.clasp.json` for deploys.
 
 ---
 
