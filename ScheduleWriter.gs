@@ -267,13 +267,17 @@ function buildSlotIndexByDayLocationTime_(slots) {
 
 /**
  * Merge cells in each (day, net) column when the same coach is assigned to
- * adjacent rows within the same half-day block. Top-left cell value/color/
- * note/validation are kept; other cells in the run are absorbed by the merge.
+ * adjacent rows. Top-left cell value/color/note/validation are kept; other
+ * cells in the run are absorbed by the merge.
  *
- * The merge keys on (name, block) rather than strict time continuity, so the
- * 19:00→19:15 evening break does not split a coach's evening shift into two
- * blocks. Morning↔evening transitions still break the run because the slot
- * block string differs.
+ * Merge is purely name-based across the whole day-net column, so a coach who
+ * covers BOTH morning and evening of the same day shows up as one tall cell.
+ * Intra-shift gaps (e.g. 19:00→19:15) and the 12:00→16:00 gap between blocks
+ * are absorbed by the merge.
+ *
+ * When the run crosses the morning↔evening boundary, the merged cell is
+ * forced to the overlap (orange) color so the back-to-back signal is not
+ * lost when the top-left cell happened to be the green morning slot.
  */
 function mergeConsecutiveSameCoach_(sheet, firstDataRow, timeGrid, assignments, slotIndex, DAYS, locations) {
   for (var d = 0; d < DAYS.length; d++) {
@@ -288,7 +292,16 @@ function mergeConsecutiveSameCoach_(sheet, firstDataRow, timeGrid, assignments, 
       var runStart = 0;
       var runEnd = -1;
       var runName = null;
-      var runBlock = null;
+      var runBlocks = {};
+
+      var finalizeRun = function(startRow, endRow, blocks) {
+        if (endRow <= startRow) return;
+        var range = sheet.getRange(firstDataRow + startRow, col, endRow - startRow + 1, 1);
+        range.merge();
+        if (blocks['בוקר'] && blocks['ערב']) {
+          range.setBackground(CONFIG.colors.overlap);
+        }
+      };
 
       for (var t = 0; t < timeGrid.length; t++) {
         var slot = locMap[slotTimeKey_(timeGrid[t])];
@@ -297,29 +310,21 @@ function mergeConsecutiveSameCoach_(sheet, firstDataRow, timeGrid, assignments, 
           ? asgn.name : null;
         var block = slot ? slot.block : null;
 
-        var continuous = (
-          name !== null &&
-          name === runName &&
-          block !== null &&
-          block === runBlock &&
-          t > 0
-        );
+        var continuous = (name !== null && name === runName && t > 0);
 
         if (continuous) {
           runEnd = t;
+          if (block) runBlocks[block] = true;
         } else {
-          if (runName !== null && runEnd > runStart) {
-            sheet.getRange(firstDataRow + runStart, col, runEnd - runStart + 1, 1).merge();
-          }
+          if (runName !== null) finalizeRun(runStart, runEnd, runBlocks);
           runStart = t;
           runEnd = t;
           runName = name;
-          runBlock = block;
+          runBlocks = {};
+          if (block) runBlocks[block] = true;
         }
       }
-      if (runName !== null && runEnd > runStart) {
-        sheet.getRange(firstDataRow + runStart, col, runEnd - runStart + 1, 1).merge();
-      }
+      if (runName !== null) finalizeRun(runStart, runEnd, runBlocks);
     }
   }
 }
