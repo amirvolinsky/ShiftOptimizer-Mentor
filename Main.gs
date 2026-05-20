@@ -71,29 +71,43 @@ function showRtlConfirmDialog_(actionId, title, message) {
 }
 
 /**
+ * Ui.alert while ConfirmDialog is open deadlocks ("מעבד…" forever). Use return value + toast.
+ * @returns {{ok:boolean, title:string, message:string}}
+ */
+function menuActionSuccess_(title, message) {
+  var short = String(message || '').split('\n')[0];
+  if (short.length > 120) short = short.substring(0, 117) + '…';
+  SpreadsheetApp.getActive().toast(short, String(title || CONFIG.toastBrandName), 8);
+  return { ok: true, title: String(title || ''), message: String(message || '') };
+}
+
+/**
  * Dispatched from ConfirmDialog after אישור.
  * Name must NOT end with "_" — private functions are blocked from google.script.run.
+ * @returns {{ok:boolean, title:string, message:string}}
  */
 function runMenuConfirmed(actionId) {
   switch (actionId) {
     case 'optimizeShifts':
-      optimizeShiftsRun_();
-      break;
+      return optimizeShiftsRun_();
     case 'refreshSchedule':
-      refreshScheduleRun_();
-      break;
+      return refreshScheduleRun_();
     case 'shareSchedule':
-      shareScheduleRun_();
-      break;
+      return shareScheduleRun_();
     case 'clearSchedule':
-      clearScheduleRun_();
-      break;
+      return clearScheduleRun_();
     case 'setupTables':
-      setupTablesRun_();
-      break;
+      return setupTablesRun_();
     case 'loadTestResponses':
-      loadTestResponsesRun_();
-      break;
+      return loadTestResponsesRun_();
+    case 'loadFakeMentorResponses':
+      return loadFakeMentorResponsesRun_();
+    case 'setupDemoResponsesTab':
+      return setupDemoResponsesTabRun_();
+    case 'updateTrainingTemplate':
+      return updateTrainingTemplateRun_();
+    case 'syncMentorGoogleForm':
+      return syncMentorGoogleFormRun_();
     default:
       throw new Error('פעולה לא ידועה');
   }
@@ -102,15 +116,21 @@ function runMenuConfirmed(actionId) {
 function onOpen() {
   var ui = SpreadsheetApp.getUi();
   ui.createMenu(CONFIG.menuTitle)
-    .addItem('🚀 הרץ אופטימייזר', 'optimizeShifts')
-    .addItem('🔄 רענן שיבוץ', 'refreshSchedule')
-    .addItem('📤 הפץ משמרות', 'shareSchedule')
-    .addItem('❓ מי לא הגיש זמינות?', 'checkMissingResponses')
-    .addItem('🗑️ נקה שיבוץ', 'clearSchedule')
+    .addItem('🚀 הרץ שיבוץ שבועי', 'optimizeShifts')
+    .addItem('🔄 רענן לו"ז אחרי עריכה ידנית', 'refreshSchedule')
+    .addItem('📤 הפץ לו"ז וסגור שבוע', 'shareSchedule')
+    .addItem('❓ מי לא מילא טופס זמינות?', 'checkMissingResponses')
     .addSeparator()
-    .addItem('🏗️ הגדר טבלאות (MasterData, ShiftTemplate, Rules)', 'setupTables')
-    .addItem('🧪 טען תשובות בדיקה (Form Responses)', 'loadTestResponses')
+    .addItem('🗑️ נקה את גיליון הלו"ז', 'clearSchedule')
     .addItem('📖 מדריך שימוש', 'showGuide')
+    .addSubMenu(
+      ui.createMenu('⚙️ הגדרה ובדיקה')
+        .addItem('🏗️ אתחל טבלאות (MasterData / ShiftTemplate / Rules)', 'setupTables')
+        .addItem('📅 עדכן תבנית אימונים', 'updateTrainingTemplate')
+        .addItem('📝 בנה מחדש טופס Google', 'syncMentorGoogleForm')
+        .addItem('🔧 הכן טאב תשובות דמו', 'setupDemoResponsesTab')
+        .addItem('🧪 טען זמינות דמו לבדיקה', 'loadFakeMentorResponses')
+    )
     .addToUi();
 
   try {
@@ -141,30 +161,36 @@ function showGuideImpl_() {
     CONFIG.guideBannerHe,
     '━━━━━━━━━━━━━━━━━━━━━━━━━',
     '',
-    '🤖 מה האלגוריתם עושה?',
-    'קורא זמינות מהטופס ומשבץ עובדים לפי כללים והוגנות (ללא עלויות):',
-    '• אין א\'/ב\' לבד — חייב מנוסה במשמרת',
-    '• ניקוד בוקר מינימלי (לפי Rules)',
-    '• ד\' בשישי בוקר (הכי בכיר)',
-    '• שני עובדים בסגירה בשישי/שבת',
-    '• עובדי עדיפות (IsPriority) — מינימום משמרות לפי MasterData',
+    '🤖 איך השיבוץ עובד?',
+    'יש שתי שכבות:',
+    '• שכבת זמינות — המאמן מסמן בטופס את חלון המשמרת שהוא יכול (למשל 7:00–10:00).',
+    '• שכבת אימונים — בכל יום יש אימונים שעתיים על 3 רשתות (קיבולת מקבילה באותו מקום).',
+    'המערכת משבצת את המאמן לאימונים רצופים שנכנסים בתוך החלון שביקש.',
     '',
-    '📋 איך להשתמש',
-    'א. וודאו שכולם מילאו את טופס הזמינות.',
-    'ב. "🚀 הרץ אופטימייזר" — שיבוץ אוטומטי לגיליון הלו"ז.',
-    'ג. לעריכה ידנית: לחצו על תא ובחרו מהרשימה.',
-    '   💡 רחפו על תא כדי לראות חלופות — זמינות, כבר משובץ היום, א\'/ב\' לבד, מרחק מהיעד.',
-    'ד. אחרי שינויים בלו"ז — "🔄 רענן שיבוץ" (טבלת הוגנות והערות בתאים).',
-    'ה. "📤 הפץ משמרות" —',
-    '   • בונה גיליון "' + shareTab + '" (תצוגה נקייה להפצה)',
-    '   • שומר היסטוריית שיבוץ ב"' + histTab + '" ומארכיון תשובות הטופס',
+    'כללי שיבוץ:',
+    '• דרגה 1 — מקבלת עדיפות מלאה למה שסימנה.',
+    '• דרגה 2 — לפני דרגה 3, אחרי דרגה 1.',
+    '• דרגות 2–3 — המערכת משתדלת לא ליצור משמרות צמודות (בוקר→ערב באותו יום או ערב→בוקר למחרת).',
+    '• רשתות 1–3 אנונימיות — הצבת שם בעמודת רשת היא לקריאות בלבד, המאמנים מסתדרים ביניהם בפועל.',
+    '• אין חישוב עלויות. אין חוקים פעילים מגיליון Rules כרגע.',
+    '',
+    '📋 איך משתמשים?',
+    'א. ודאו שהמאמנים מילאו את טופס Google של מנטור.',
+    'ב. "🚀 הרץ שיבוץ שבועי" — בונה לו"ז לגיליון "' + CONFIG.sheets.schedule + '".',
+    'ג. לעריכה ידנית — לחצו על תא ובחרו שם מהרשימה.',
+    '   💡 רחפו על תא כדי לראות חלופות (זמינות / כבר משובץ היום / מרחק מהיעד).',
+    'ד. אחרי עריכה ידנית — "🔄 רענן לו"ז אחרי עריכה ידנית" (טבלת הוגנות + הערות).',
+    'ה. "📤 הפץ לו"ז וסגור שבוע" —',
+    '   • בונה את גיליון "' + shareTab + '" (תצוגה נקייה להפצה).',
+    '   • מעדכן את "' + histTab + '" עם נתוני השבוע.',
+    '   • מארכב את תשובות הטופס וממנקה את "' + CONFIG.sheets.responses + '" לקראת השבוע הבא.',
     '',
     '🔍 כלים נוספים',
-    '• "❓ מי לא הגיש זמינות?" — רשימת חסרים וטקסט תזכורת.',
-    '• "🗑️ נקה שיבוץ" — מוחק שיבוץ ומתחיל מחדש.',
+    '• "❓ מי לא מילא טופס זמינות?" — רשימת חסרים + טקסט תזכורת מוכן להעתקה.',
+    '• "🗑️ נקה את גיליון הלו"ז" — מוחק את "' + CONFIG.sheets.schedule + '" כדי להתחיל מחדש.',
     '',
     '━━━━━━━━━━━━━━━━━━━━━━━━━',
-    '📖 המדריך זמין תמיד מהתפריט. בהצלחה! 🙌'
+    '📖 המדריך תמיד זמין מהתפריט. בהצלחה! 🙌'
   ].join('\n');
 
   // Native Ui.alert does not honor RTL for Hebrew; use HtmlService like ConfirmDialog.
@@ -180,12 +206,13 @@ function showGuideImpl_() {
 function optimizeShifts() {
   showRtlConfirmDialog_(
     'optimizeShifts',
-    '🚀 הרץ אופטימייזר',
-    'מה זה עושה: קורא זמינות וכללים, ומשבץ עובדים אוטומטית לפי החוקים והוגנות.\n\n'
+    '🚀 הרץ שיבוץ שבועי',
+    'מה זה עושה: בונה לו"ז שבועי לפי זמינות המשמרת שהמאמנים סימנו בטופס, ושיבוץ לאימונים שעתיים בתוך החלון שביקשו.\n\n'
+      + 'סדר עדיפויות: דרגה 1 לפני 2 לפני 3. דרגות 2–3 מקבלות העדפה להימנע ממשמרות צמודות (בוקר→ערב באותו יום או ערב→בוקר למחרת).\n\n'
       + 'טבלאות:\n'
-      + '• קורא בלבד: "' + CONFIG.sheets.masterData + '", "' + CONFIG.sheets.responses + '", '
+      + '• קורא בלבד: "' + CONFIG.sheets.masterData + '", "' + getAvailabilitySheetName_() + '", '
       + '"' + CONFIG.sheets.shiftTemplate + '", "' + CONFIG.sheets.rules + '".\n'
-      + '• כותב מחדש: גיליון "' + CONFIG.sheets.schedule + '" (כל התוכן הקודם במערך נמחק).\n\n'
+      + '• כותב מחדש: גיליון "' + CONFIG.sheets.schedule + '" (כל התוכן הקודם נמחק).\n\n'
       + 'להמשיך?'
   );
 }
@@ -204,8 +231,18 @@ function optimizeShiftsRunCore_() {
   var notes = responseData.notes || {};
   var respondentCount = Object.keys(availability).length;
 
+  // Refresh the per-coach summary columns (hours / shifts) at the right edge
+  // of the responses sheet so the staff can see what each coach offered.
+  try {
+    var responsesSheet = SpreadsheetApp.getActiveSpreadsheet()
+      .getSheetByName(getAvailabilitySheetName_());
+    if (responsesSheet) updateAvailabilitySummary_(responsesSheet, availability);
+  } catch (e) {
+    Logger.log('updateAvailabilitySummary_ (live) failed: ' + e);
+  }
+
   var slots = loadShiftTemplates();
-  if (slots.length === 0) throw new Error('לא נמצאו משמרות בטבלת ShiftTemplate.');
+  if (slots.length === 0) throw new Error('לא נמצאו אימונים בטבלת ShiftTemplate.');
 
   var rules = loadRules();
   var result = optimizeWeek(slots, availability, masterMap, rules);
@@ -237,7 +274,7 @@ function buildOptimizerSummaryMessage_(d) {
   msg += '📊 סיכום כללי:\n';
   msg += '• עובדים במערכת: ' + employeeCount + '\n';
   msg += '• עובדים שמילאו טופס: ' + respondentCount + '\n';
-  msg += '• סה"כ משמרות לשיבוץ: ' + slots.length + '\n';
+  msg += '• סה"כ אימונים לשיבוץ: ' + slots.length + '\n';
 
   var unfilledCount = 0;
   var slotIds = Object.keys(result.assignments);
@@ -245,7 +282,7 @@ function buildOptimizerSummaryMessage_(d) {
     if (result.assignments[slotIds[i]].unfilled) unfilledCount++;
   }
   var filledCount = slots.length - unfilledCount;
-  msg += '• משמרות שמולאו: ' + filledCount + '/' + slots.length;
+  msg += '• אימונים שמולאו: ' + filledCount + '/' + slots.length;
   if (unfilledCount > 0) msg += ' (' + unfilledCount + ' לא מולאו ❌)';
   msg += '\n\n';
 
@@ -269,8 +306,7 @@ function buildOptimizerSummaryMessage_(d) {
     if (stat.shiftsCount > 0) {
       var target = stat.shiftTarget || 0;
       var label = stat.name + ': ' + stat.shiftsCount + '/' + target + ' משמרות';
-      if (stat.isGlobal || stat.isPriority) label += ' (עדיפות)';
-      else if (stat.shiftsCount > target) label += ' ⚠ מעל היעד';
+      if (stat.shiftsCount > target) label += ' ⚠ מעל היעד';
       else if (stat.shiftsCount === target) label += ' ✅';
       if (history && history[stat.name] && history[stat.name].weeks > 1) {
         label += ' (ממוצע ' + history[stat.name].avgShifts.toFixed(1) + ' ב-' + history[stat.name].weeks + ' שבועות)';
@@ -282,31 +318,33 @@ function buildOptimizerSummaryMessage_(d) {
 }
 
 function optimizeShiftsRun_() {
-  var ui = SpreadsheetApp.getUi();
   try {
     var d = optimizeShiftsRunCore_();
     try {
       ensureSpreadsheetOpenGuideTrigger_();
     } catch (ignore) {}
     var msg = buildOptimizerSummaryMessage_(d);
-    ui.alert(rtlUiText_(CONFIG.optimizerResultsTitleHe), rtlUiText_(msg), ui.ButtonSet.OK);
+    Logger.log(msg);
+    return menuActionSuccess_(CONFIG.optimizerResultsTitleHe, msg);
   } catch (e) {
-    ui.alert(rtlUiText_('❌ שגיאה'), rtlUiText_('השיבוץ נכשל:\n\n' + e.message), ui.ButtonSet.OK);
     Logger.log('Optimization error: ' + e.message + '\n' + (e.stack || ''));
+    throw new Error('השיבוץ נכשל:\n\n' + (e.message || e));
   }
 }
 
 /**
- * Menu: "רענן שיבוץ" — after manual edits, refresh fairness table and cell notes.
+ * Menu: "רענן לו"ז אחרי עריכה ידנית" — refresh fairness table and cell notes.
  */
 function refreshSchedule() {
   showRtlConfirmDialog_(
     'refreshSchedule',
-    '🔄 רענן שיבוץ',
-    'מה זה עושה: אחרי שינוי שמות בתאים בלו"ז — מעדכן טבלת הוגנות והערות בתאים.\n\n'
+    '🔄 רענן לו"ז אחרי עריכה ידנית',
+    'מה זה עושה: אחרי שערכת ידנית שמות בתאי הלו"ז — מחשב מחדש צבעי תאים (ירוק/כתום/כחול), ' +
+      'טבלת ההוגנות, ואת הערות העזר בתאים (זמינות / חלופות / מרחק מהיעד).\n\n' +
+      'לא מריץ שיבוץ אוטומטי — רק מסנכרן את הסטטיסטיקות אחרי שינויים ידניים.\n\n'
       + 'טבלאות:\n'
       + '• קורא: "' + CONFIG.sheets.schedule + '", "' + CONFIG.sheets.masterData + '", '
-      + '"' + CONFIG.sheets.shiftTemplate + '", "' + CONFIG.sheets.responses + '".\n'
+      + '"' + CONFIG.sheets.shiftTemplate + '", "' + getAvailabilitySheetName_() + '".\n'
       + '• מעדכן תוכן בגיליון "' + CONFIG.sheets.schedule + '" בלבד.\n\n'
       + 'להמשיך?'
   );
@@ -314,29 +352,27 @@ function refreshSchedule() {
 
 function refreshScheduleRun_() {
   HISTORY_SCORES_CACHE_ = null;
-  var ui = SpreadsheetApp.getUi();
   try {
     var out = refreshScheduleFromSheet_();
     if (!out.ok) {
-      ui.alert(rtlUiText_('שגיאה'), rtlUiText_(out.message), ui.ButtonSet.OK);
-      return;
+      throw new Error(out.message);
     }
-    var msg = '✅ טבלת ההוגנות והערות בתאים עודכנו!\n';
+    var msg = '✅ צבעי התאים, טבלת ההוגנות והערות עודכנו!\n';
     if (out.warnings && out.warnings.length > 0) {
       msg += '\n⚠ בעיות:\n';
       for (var w = 0; w < out.warnings.length; w++) {
         msg += '• ' + out.warnings[w] + '\n';
       }
     }
-    ui.alert(rtlUiText_('🔄 רענון שיבוץ'), rtlUiText_(msg), ui.ButtonSet.OK);
+    return menuActionSuccess_('🔄 רענון לו"ז', msg);
   } catch (e) {
-    ui.alert(rtlUiText_('❌ שגיאה'), rtlUiText_('רענון שיבוץ נכשל:\n\n' + e.message), ui.ButtonSet.OK);
     Logger.log('refreshSchedule error: ' + e.message + '\n' + (e.stack || ''));
+    throw new Error('רענון שיבוץ נכשל:\n\n' + (e.message || e));
   }
 }
 
 /**
- * Menu: "מי לא הגיש זמינות?" — shows which employees haven't submitted the form,
+ * Menu: "מי לא מילא טופס זמינות?" — shows which mentors haven't submitted the form,
  * with a ready-to-copy reminder message and a summary of who did submit + their notes.
  */
 function checkMissingResponses() {
@@ -348,6 +384,7 @@ function checkMissingResponses() {
     var responseData = loadAvailability();
     var submitted = responseData.availability;
     var notes = responseData.notes || {};
+    var dayNotes = responseData.dayNotes || {};
 
     var missing = [];
     var present = [];
@@ -363,14 +400,12 @@ function checkMissingResponses() {
     var msg = '';
 
     if (missing.length === 0) {
-      msg += '✅ כל העובדים הגישו זמינות! (' + present.length + '/' + allNames.length + ')\n';
+      msg += '✅ כל המאמנים מילאו את טופס הזמינות! (' + present.length + '/' + allNames.length + ')\n';
     } else {
-      msg += '⚠ ' + missing.length + ' מתוך ' + allNames.length + ' עובדים לא הגישו זמינות:\n\n';
+      msg += '⚠ ' + missing.length + ' מתוך ' + allNames.length + ' מאמנים עוד לא מילאו את הטופס:\n\n';
       for (var i = 0; i < missing.length; i++) {
         var emp = masterMap[missing[i]];
-        var rankLabel = rankToHebrew(emp.rank) + '\'';
-        msg += '• ' + missing[i] + ' (דרגה ' + rankLabel + ')';
-        if (emp.isGlobal || emp.isPriority) msg += ' — עדיפות';
+        msg += '• ' + missing[i] + ' (דרגה ' + rankToHebrew(emp.rank) + ')';
         msg += '\n';
       }
 
@@ -383,7 +418,7 @@ function checkMissingResponses() {
     }
 
     if (present.length > 0) {
-      msg += '\n✅ הגישו (' + present.length + '):\n';
+      msg += '\n✅ מילאו (' + present.length + '):\n';
       for (var i = 0; i < present.length; i++) {
         var line = '• ' + present[i];
         var avail = submitted[present[i]];
@@ -392,15 +427,24 @@ function checkMissingResponses() {
         for (var d = 0; d < days.length; d++) {
           if (avail[days[d]] && avail[days[d]].length > 0) dayCount++;
         }
-        line += ' — ' + dayCount + ' ימים';
+        line += ' — ' + dayCount + ' ימים זמינים';
         if (notes[present[i]]) {
           line += ' 💬 "' + notes[present[i]] + '"';
+        }
+        var empDayNotes = dayNotes[present[i]];
+        if (empDayNotes) {
+          var noteDays = Object.keys(empDayNotes);
+          for (var nd = 0; nd < noteDays.length; nd++) {
+            if (empDayNotes[noteDays[nd]]) {
+              line += '\n   📝 ' + noteDays[nd] + ': "' + empDayNotes[noteDays[nd]] + '"';
+            }
+          }
         }
         msg += line + '\n';
       }
     }
 
-    ui.alert(rtlUiText_('❓ מי לא הגיש זמינות?'), rtlUiText_(msg), ui.ButtonSet.OK);
+    ui.alert(rtlUiText_('❓ מי לא מילא טופס זמינות?'), rtlUiText_(msg), ui.ButtonSet.OK);
 
   } catch (e) {
     ui.alert(rtlUiText_('שגיאה'), rtlUiText_(String(e.message || e)), ui.ButtonSet.OK);
@@ -411,12 +455,11 @@ function checkMissingResponses() {
 function clearSchedule() {
   showRtlConfirmDialog_(
     'clearSchedule',
-    '🗑️ נקה שיבוץ',
-    'מה זה עושה: מוחק את כל התוכן והעיצוב מגיליון הלו"ז — כדי להתחיל שיבוץ מחדש.\n\n'
-      + 'טבלאות: נוגע רק בגיליון "' + CONFIG.sheets.schedule + '".\n'
-      + 'לא נוגע ב-' + CONFIG.sheets.masterData + ', ' + CONFIG.sheets.responses + ', '
-      + CONFIG.sheets.shiftTemplate + ', ' + CONFIG.sheets.rules + ', '
-      + CONFIG.sheets.shiftHistory + '.\n\n'
+    '🗑️ נקה את גיליון הלו"ז',
+    'מה זה עושה: מוחק את כל התוכן והעיצוב מגיליון "' + CONFIG.sheets.schedule + '" — כדי להתחיל שיבוץ מחדש מאפס.\n\n'
+      + 'לא נוגע ב-"' + CONFIG.sheets.masterData + '", "' + CONFIG.sheets.responses + '", '
+      + '"' + CONFIG.sheets.shiftTemplate + '", "' + CONFIG.sheets.rules + '", '
+      + '"' + CONFIG.sheets.shiftHistory + '".\n\n'
       + 'להמשיך?'
   );
 }
@@ -427,10 +470,9 @@ function clearScheduleRun_() {
   if (sheet) {
     sheet.clear();
     sheet.clearFormats();
-    SpreadsheetApp.getUi().alert(rtlUiText_('גיליון השיבוץ נוקה.'));
-  } else {
-    SpreadsheetApp.getUi().alert(rtlUiText_('לא נמצא גיליון שיבוץ.'));
+    return menuActionSuccess_('🗑️ ניקוי גיליון לו"ז', 'גיליון הלו"ז נוקה.');
   }
+  throw new Error('לא נמצא גיליון שיבוץ.');
 }
 
 // ============================================================
@@ -698,15 +740,49 @@ function getFairnessHistory(weeksBack) {
 }
 
 /**
- * Force OAuth for script.container.ui scope.
- * Run from Apps Script editor to approve permissions.
+ * Approve OAuth scopes. Safe from the script editor (getUi is not available there).
+ * For script.container.ui, use menu "אשר הרשאות חלונות" from the spreadsheet after GCP test-user setup.
  */
 function authorizeForDialogs() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error('אין גיליון מקושר. ודאו שהסקריפט קשור ל-Mentor spreadsheet.');
+  }
+
+  // Touches spreadsheet + scriptapp scopes (works from editor).
+  ss.getName();
+  ScriptApp.getProjectTriggers();
+
+  try {
+    authorizeForDialogsFromSheet_();
+    return;
+  } catch (e) {
+    var msg = String(e.message || e);
+    if (msg.indexOf('getUi') === -1 && msg.indexOf('context') === -1) {
+      throw e;
+    }
+  }
+
+  Logger.log(
+    '✓ הרשאות גיליון + טריגרים אושרו מהעורך.\n' +
+    'להרשאת חלונות (container.ui): פתחו את הגיליון, רעננו, ובחרו בתפריט:\n' +
+    '  "' + CONFIG.menuTitle + '" → "🔐 אשר הרשאות חלונות"'
+  );
+}
+
+/** Sheet only — opens a tiny dialog to grant script.container.ui. */
+function authorizeForDialogsFromSheet_() {
   var html =
     '<!DOCTYPE html><html lang="he" dir="rtl"><head><meta charset="utf-8"/>' +
-    '<style>body{font-family:sans-serif;padding:8px;direction:rtl;}</style></head><body><p>אם מופיע חלון זה — ההרשאה לחלונות הוענקה. אפשר לסגור.</p></body></html>';
+    '<style>body{font-family:sans-serif;padding:8px;direction:rtl;}</style></head><body>' +
+    '<p>אם מופיע חלון זה — ההרשאה לחלונות הוענקה. אפשר לסגור.</p></body></html>';
   SpreadsheetApp.getUi().showModalDialog(
     HtmlService.createHtmlOutput(html).setWidth(400).setHeight(160),
     'אישור הרשאה לתצוגת חלונות'
   );
+}
+
+/** Menu entry for authorizeForDialogsFromSheet_ */
+function authorizeForDialogsMenu() {
+  authorizeForDialogsFromSheet_();
 }

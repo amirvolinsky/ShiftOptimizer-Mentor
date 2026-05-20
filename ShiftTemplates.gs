@@ -1,15 +1,19 @@
 /**
  * Reads shift template definitions from the ShiftTemplate sheet.
  *
- * Expected columns:
- *   Location | Day | Block | Headcount | StartTime | EndTime
+ * Expected columns (matched by header name, order is flexible):
+ *   Location | Day | Block | StartTime | EndTime
  *
- * Location: "Geula" or "Gordon"
- * Day: Hebrew day name (ראשון, שני, ...)
- * Block: "בוקר", "אמצע", or "ערב"
- * Headcount: number of employees needed for this slot
- * StartTime: e.g., "7:00" or "7:30" (for cost calculation)
- * EndTime: e.g., "14:00" (for cost calculation)
+ * Location: a specific location name (e.g. "Net1") OR "*"/empty to mean
+ *           "this slot exists on every location in CONFIG.locations".
+ *           Using "*" avoids duplicating every training slot once per net.
+ * Day:      Hebrew day name (ראשון, שני, ...)
+ * Block:    "בוקר", "אמצע", or "ערב"
+ * StartTime / EndTime: e.g., "7:00", "14:00"
+ *
+ * Legacy: a `Headcount` column is still honored if present (back-compat with
+ * older seeded sheets), otherwise every row produces exactly one slot per
+ * resolved location.
  *
  * Returns an array of slot objects:
  * [{ location, day, block, headcount, startTime, endTime, durationHours, slotId }]
@@ -21,18 +25,24 @@ function loadShiftTemplates() {
   var data = sheet.getDataRange().getValues();
   if (data.length < 2) throw new Error("ShiftTemplate sheet is empty (no data rows).");
 
+  var cols = mapShiftTemplateColumns_(data[0]);
   var slots = [];
   var positionCounters = {};
 
   for (var i = 1; i < data.length; i++) {
-    var location = String(data[i][0]).trim();
-    var day = String(data[i][1]).trim();
-    var block = String(data[i][2]).trim();
-    var headcount = parseInt(data[i][3], 10) || 1;
-    var startTime = parseTimeValue(data[i][4]);
-    var endTime = parseTimeValue(data[i][5]);
+    var rawLocation = String(data[i][cols.location]).trim();
+    var day = String(data[i][cols.day]).trim();
+    var block = String(data[i][cols.block]).trim();
+    var headcount = cols.headcount >= 0
+      ? (parseInt(data[i][cols.headcount], 10) || 1)
+      : 1;
+    var startTime = parseTimeValue(data[i][cols.startTime]);
+    var endTime = parseTimeValue(data[i][cols.endTime]);
 
-    if (!location || !day || !block) continue;
+    if (!day || !block) continue;
+
+    var locationsForRow = expandTemplateLocations_(rawLocation);
+    if (locationsForRow.length === 0) continue;
 
     var durationHours = 0;
     if (startTime !== null && endTime !== null) {
@@ -40,27 +50,81 @@ function loadShiftTemplates() {
       if (durationHours <= 0) durationHours += 24;
     }
 
-    var counterKey = location + '_' + day + '_' + block;
-    if (!positionCounters[counterKey]) positionCounters[counterKey] = 0;
+    for (var li = 0; li < locationsForRow.length; li++) {
+      var location = locationsForRow[li];
+      var counterKey = location + '_' + day + '_' + block;
+      if (!positionCounters[counterKey]) positionCounters[counterKey] = 0;
 
-    for (var h = 0; h < headcount; h++) {
-      var globalPos = positionCounters[counterKey];
-      positionCounters[counterKey]++;
-      slots.push({
-        location: location,
-        day: day,
-        block: block,
-        headcount: headcount,
-        positionIndex: globalPos,
-        startTime: startTime,
-        endTime: endTime,
-        durationHours: durationHours,
-        slotId: location + '_' + day + '_' + block + '_' + globalPos
-      });
+      for (var h = 0; h < headcount; h++) {
+        var globalPos = positionCounters[counterKey];
+        positionCounters[counterKey]++;
+        slots.push({
+          location: location,
+          day: day,
+          block: block,
+          headcount: headcount,
+          positionIndex: globalPos,
+          startTime: startTime,
+          endTime: endTime,
+          durationHours: durationHours,
+          slotId: location + '_' + day + '_' + block + '_' + globalPos
+        });
+      }
     }
   }
 
   return slots;
+}
+
+/**
+ * Resolve ShiftTemplate column positions by header name.
+ * Returns { location, day, block, startTime, endTime, headcount }.
+ * `headcount` is -1 when the (legacy) column is absent.
+ */
+function mapShiftTemplateColumns_(headerRow) {
+  var headers = [];
+  for (var h = 0; h < headerRow.length; h++) {
+    headers.push(String(headerRow[h]).trim());
+  }
+  function idx(name, fallback) {
+    var i = headers.indexOf(name);
+    return i >= 0 ? i : fallback;
+  }
+  return {
+    location:  idx('Location', 0),
+    day:       idx('Day', 1),
+    block:     idx('Block', 2),
+    startTime: idx('StartTime', 3),
+    endTime:   idx('EndTime', 4),
+    headcount: idx('Headcount', -1)
+  };
+}
+
+/**
+ * Resolves a raw Location cell into the list of concrete locations it covers.
+ *  - "*" / "" / "ALL"        → all CONFIG.locations
+ *  - "Net1,Net2" / "Net1|Net2" → split list (each trimmed) intersected with CONFIG.locations
+ *  - any other single value   → returned as-is (preserved for non-template rows)
+ */
+function expandTemplateLocations_(rawLocation) {
+  var cfgLocations = (CONFIG && CONFIG.locations) ? CONFIG.locations : [];
+  var trimmed = String(rawLocation || '').trim();
+
+  if (trimmed === '' || trimmed === '*' || trimmed.toUpperCase() === 'ALL') {
+    return cfgLocations.slice();
+  }
+
+  if (trimmed.indexOf(',') >= 0 || trimmed.indexOf('|') >= 0) {
+    var parts = trimmed.split(/[,|]/);
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var name = parts[i].trim();
+      if (name) out.push(name);
+    }
+    return out;
+  }
+
+  return [trimmed];
 }
 
 /**
@@ -70,12 +134,16 @@ function loadShiftTemplates() {
  *  - Numbers (fractional day, e.g., 0.3125 = 7:30)
  *
  * Returns decimal hours (e.g., 7.5 for 7:30) or null if unparseable.
+ *
+ * NOTE: Sheets stores time-only values on epoch date 1899-12-30. Reading them
+ * with getHours()/getMinutes() applies the Asia/Jerusalem LMT offset (+2:20:54)
+ * for pre-1900 dates, which corrupts the time. Always read as UTC.
  */
 function parseTimeValue(val) {
   if (val === null || val === undefined || val === '') return null;
 
   if (val instanceof Date) {
-    return val.getHours() + val.getMinutes() / 60;
+    return val.getUTCHours() + val.getUTCMinutes() / 60;
   }
 
   if (typeof val === 'number') {
@@ -98,37 +166,46 @@ function parseTimeValue(val) {
 }
 
 /**
- * Get unique template rows (before headcount expansion) grouped by location and day.
- * Useful for writing the schedule output.
+ * Get unique template rows grouped by location and day.
+ * Used by the schedule writer to render the output grid.
  *
- * Returns: { "Geula": { "ראשון": [{ block, startTime, endTime, headcount }], ... }, ... }
+ * Returns: { "Net1": { "ראשון": [{ block, startTime, endTime, headcount }], ... }, ... }
  */
 function getTemplateGrid() {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.sheets.shiftTemplate);
   if (!sheet) return {};
 
   var data = sheet.getDataRange().getValues();
+  if (data.length < 2) return {};
+
+  var cols = mapShiftTemplateColumns_(data[0]);
   var grid = {};
 
   for (var i = 1; i < data.length; i++) {
-    var location = String(data[i][0]).trim();
-    var day = String(data[i][1]).trim();
-    var block = String(data[i][2]).trim();
-    var headcount = parseInt(data[i][3], 10) || 1;
-    var startTime = parseTimeValue(data[i][4]);
-    var endTime = parseTimeValue(data[i][5]);
+    var rawLocation = String(data[i][cols.location]).trim();
+    var day = String(data[i][cols.day]).trim();
+    var block = String(data[i][cols.block]).trim();
+    var headcount = cols.headcount >= 0
+      ? (parseInt(data[i][cols.headcount], 10) || 1)
+      : 1;
+    var startTime = parseTimeValue(data[i][cols.startTime]);
+    var endTime = parseTimeValue(data[i][cols.endTime]);
 
-    if (!location || !day || !block) continue;
+    if (!day || !block) continue;
 
-    if (!grid[location]) grid[location] = {};
-    if (!grid[location][day]) grid[location][day] = [];
+    var locationsForRow = expandTemplateLocations_(rawLocation);
+    for (var li = 0; li < locationsForRow.length; li++) {
+      var location = locationsForRow[li];
+      if (!grid[location]) grid[location] = {};
+      if (!grid[location][day]) grid[location][day] = [];
 
-    grid[location][day].push({
-      block: block,
-      startTime: startTime,
-      endTime: endTime,
-      headcount: headcount
-    });
+      grid[location][day].push({
+        block: block,
+        startTime: startTime,
+        endTime: endTime,
+        headcount: headcount
+      });
+    }
   }
 
   return grid;

@@ -6,16 +6,16 @@ Based on the [Chachos Shift Optimizer](https://github.com/amirvolinsky/ShiftOpti
 
 ## How it works
 
-1. Employees fill a Hebrew availability form (בוקר / ערב / אמצע per day).
-2. Manager runs **הרץ אופטימייזר** from the sheet menu.
-3. Output: **Schedule** tab with manual override dropdowns, fairness table, and optional **Share_Export**.
+1. Coaches fill a Hebrew availability form (morning + evening hour ranges per day, optional free-text note).
+2. Manager runs **🚀 הרץ שיבוץ שבועי** from the sheet menu.
+3. Output: **Schedule** tab with manual override dropdowns, fairness table, and on-demand **Share_Export** + ShiftHistory archive on **📤 הפץ לו"ז וסגור שבוע**.
 
 ## Sheet tabs
 
 | Tab | Purpose |
 |-----|---------|
-| `MasterData` | Employees: Rank, IsPriority, Min/Max shifts, location |
-| `ShiftTemplate` | Slots per location / day / block |
+| `MasterData` | Coaches: Rank 1–3 (1 = best), optional location lock |
+| `ShiftTemplate` | Training slots per net / day / block |
 | `Rules` | Key/value business rules |
 | `Form Responses 1` | Linked form (rename in `Config.gs` if different) |
 | `Schedule` | Generated schedule |
@@ -35,10 +35,10 @@ Create a form with:
 
 | Field | Type |
 |-------|------|
-| שם העובד | Dropdown |
-| ראשון … חמישי | Radio: בוקר / ערב / לא זמין |
-| שישי, שבת | Checkbox: בוקר / אמצע / ערב / לא זמין |
-| הערות | Paragraph |
+| שם מאמן | Dropdown |
+| ראשון … חמישי | Checkbox time ranges (morning + evening) |
+| שישי | Checkbox time ranges (morning only) |
+| הערה <יום> | Paragraph per day |
 
 Link responses to the spreadsheet. Set `CONFIG.sheets.responses` in [Config.gs](Config.gs) to the **exact** linked tab name.
 
@@ -56,10 +56,10 @@ Reload the sheet → menu **Shift Optimizer Mentor** appears.
 
 ### 4. First run in the sheet
 
-1. **הגדר טבלאות** — seeds sample data (edit for your org).
-2. Update `CONFIG.locations` and `CONFIG.locationNames` in [Config.gs](Config.gs) if you rename sites.
-3. **טען תשובות בדיקה** (optional).
-4. **הרץ אופטימייזר**.
+1. **🏗️ אתחל טבלאות** — seeds the 16 Mentor coaches in MasterData + the hourly training layer in ShiftTemplate (edit for your org).
+2. Update `CONFIG.locations` and `CONFIG.locationNames` in [Config.gs](Config.gs) if you rename nets.
+3. **🧪 טען זמינות דמו לבדיקה** (optional).
+4. **🚀 הרץ שיבוץ שבועי**.
 
 ## Deploy code changes
 
@@ -71,9 +71,9 @@ npm run clasp:push
 
 After seeding, edit in the sheet (no code change needed for most tweaks):
 
-- **Locations** — `ShiftTemplate.Location` must match `CONFIG.locations` (`SiteA`, `SiteB` by default).
+- **Locations** — 3 parallel training slots/nets: `Net1`–`Net3`; labels רשת 1–3. They are capacity columns in the same physical place.
 - **Hebrew labels** — `CONFIG.locationNames` in [Config.gs](Config.gs).
-- **Employees** — `MasterData` tab.
+- **Coaches** — `MasterData` tab.
 - **Shift patterns** — `ShiftTemplate` tab.
 - **Rules** — `Rules` tab (`min_morning_score_sitea`, etc.).
 
@@ -83,12 +83,17 @@ See [CONTEXT.md](CONTEXT.md) for full rule documentation.
 
 | Item | Action |
 |------|--------|
-| הרץ אופטימייזר | Build schedule from form + rules |
-| רענן שיבוץ | Refresh notes + fairness after manual edits |
-| הפץ משמרות | Share_Export + ShiftHistory + archive form |
-| מי לא הגיש זמינות? | Missing submissions |
-| הגדר טבלאות | Seed MasterData / ShiftTemplate / Rules |
-| טען תשובות בדיקה | Sample form rows |
+| 🚀 הרץ שיבוץ שבועי | Build schedule from form availability + rank priority |
+| 🔄 רענן לו"ז אחרי עריכה ידנית | Refresh notes + fairness after manual edits |
+| 📤 הפץ לו"ז וסגור שבוע | Share_Export + ShiftHistory + archive form responses |
+| ❓ מי לא מילא טופס זמינות? | Missing submissions + ready-to-copy reminder |
+| 🗑️ נקה את גיליון הלו"ז | Clear Schedule tab |
+| 📖 מדריך שימוש | Show the in-product guide |
+| 🏗️ אתחל טבלאות | Seed MasterData / ShiftTemplate / Rules |
+| 📅 עדכן תבנית אימונים | Rewrite ShiftTemplate (hourly trainings × 3 nets) |
+| 📝 בנה מחדש טופס Google | Rebuild the linked Google Form from code |
+| 🔧 הכן טאב תשובות דמו | Create the demo responses tab with mentor headers |
+| 🧪 טען זמינות דמו לבדיקה | Fill MasterData + demo responses with fake mentor data |
 
 ## License
 

@@ -16,8 +16,10 @@ var CLIENT = {
 var CONFIG = {
   sheets: {
     masterData:    'MasterData',
-    /** Set to your linked form tab name (e.g. "Form Responses 1") */
+    /** Linked Google Form tab — live submissions only; never overwritten by test seeders */
     responses:     'Form Responses 1',
+    /** Copy of form headers + demo rows for optimizer testing */
+    responsesDemo: 'Form Responses Demo',
     shiftTemplate: 'ShiftTemplate',
     rules:         'Rules',
     schedule:      'Schedule',
@@ -25,11 +27,16 @@ var CONFIG = {
     shiftHistory:  'ShiftHistory'
   },
 
-  locations: ['SiteA', 'SiteB'],
+  /**
+   * Beach volleyball nets (רשתות על החוף) — 3 courts. IDs Net1–Net3 = net, not "network".
+   * No per-coach lock; all coaches may be assigned to any net.
+   */
+  locations: ['Net1', 'Net2', 'Net3'],
 
   locationNames: {
-    'SiteA': 'סניף א',
-    'SiteB': 'סניף ב'
+    'Net1': 'רשת 1',
+    'Net2': 'רשת 2',
+    'Net3': 'רשת 3'
   },
 
   days: ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'],
@@ -45,9 +52,9 @@ var CONFIG = {
     headerBg:    '#2E7D6B',
     headerFont:  '#FFFFFF',
     ok:          '#C6EFCE',
-    noSenior:    '#FFEB9C',
     unfilled:    '#FFC7CE',
     suggested:   '#BDD7EE',
+    overlap:     '#FFB74D',
     summaryRow:  '#E8E8E8',
     normal:      '#FFFFFF'
   },
@@ -61,5 +68,42 @@ var CONFIG = {
   menuTitle: CLIENT.menuTitle,
   guideBannerHe: CLIENT.guideBannerHe,
   optimizerResultsTitleHe: CLIENT.optimizerResultsTitleHe,
-  toastBrandName: CLIENT.toastBrandName
+  toastBrandName: CLIENT.toastBrandName,
+
+  /**
+   * true = availability + fairness only (no Rules sheet enforcement).
+   * Set false after adding business rules with the Mentor team.
+   */
+  basicMode: true,
+
+  /**
+   * Development: keep true — reads Form Responses Demo (פייק), not the live form tab.
+   * Go-live: set false — reads Form Responses 1 (טופס אמיתי).
+   */
+  useDemoResponses: true,
+
+  /**
+   * Mentor availability form (edit URL in browser; script uses ID only).
+   * https://docs.google.com/forms/d/1_8coyaLHL13nvYBncd3lZg_ep33EnQnw1Fs5Vn24ASs/edit
+   */
+  googleFormId: '1_8coyaLHL13nvYBncd3lZg_ep33EnQnw1Fs5Vn24ASs',
+
+  /** Coach tiers: 1 = best, 3 = lowest. Three levels only. */
+  ranks: {
+    best: 1,
+    min: 1,
+    max: 3
+  }
 };
+
+function isBasicMode_() {
+  return CONFIG.basicMode !== false;
+}
+
+/** Clamp MasterData rank to Mentor 1–3 scale (1 = best). */
+function normalizeMentorRank_(rank) {
+  var r = parseInt(rank, 10);
+  if (isNaN(r) || r < 1) return CONFIG.ranks.best;
+  if (r > CONFIG.ranks.max) return CONFIG.ranks.max;
+  return r;
+}

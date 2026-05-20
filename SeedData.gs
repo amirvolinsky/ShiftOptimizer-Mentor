@@ -5,33 +5,83 @@
 function setupTables() {
   showRtlConfirmDialog_(
     'setupTables',
-    '🏗️ הגדר טבלאות',
-    'מה זה עושה: יוצר או ממלא מחדש את טבלאות ברירת המחדל לעובדים, משמרות וחוקים.\n\n'
-      + 'טבלאות: דורס תוכן קיים בגיליונות "' + CONFIG.sheets.masterData + '", '
-      + '"' + CONFIG.sheets.shiftTemplate + '", "' + CONFIG.sheets.rules + '".\n'
-      + 'לא נוגע ב-' + CONFIG.sheets.responses + '.\n\n'
+    '🏗️ אתחל טבלאות (MasterData / ShiftTemplate / Rules)',
+    'מה זה עושה: יוצר מחדש את שלוש טבלאות ברירת המחדל של המערכת —\n'
+      + '• "' + CONFIG.sheets.masterData + '" — רשימת ' + FAKE_MENTOR_ROSTER_.length + ' מאמני מנטור עם דרגה (1–3, 1 הכי טוב)\n'
+      + '• "' + CONFIG.sheets.shiftTemplate + '" — שכבת אימונים שעתיים × 3 רשתות, א\'–ה\' בוקר+ערב, שישי בוקר בלבד\n'
+      + '• "' + CONFIG.sheets.rules + '" — דגלי שיבוץ ניתנים לכיבוי/הפעלה (TRUE/FALSE) עם תיאור בעברית\n\n'
+      + '⚠ דורס כל תוכן קיים בשלוש הטבלאות.\n'
+      + 'לא נוגע ב-"' + CONFIG.sheets.responses + '" ולא בטופס Google.\n\n'
       + 'להמשיך?'
   );
 }
 
-function setupTablesRun_() {
+/**
+ * Seeds tables without HtmlService confirm dialog (avoids script.container.ui on first auth).
+ */
+function setupTablesQuick() {
+  try {
+    setupTablesCore_();
+    try {
+      ensureSpreadsheetOpenGuideTrigger_();
+    } catch (ignore) {}
+    SpreadsheetApp.getActive().toast(
+      'MasterData, ShiftTemplate, Rules — עודכנו',
+      CONFIG.toastBrandName,
+      8
+    );
+  } catch (e) {
+    SpreadsheetApp.getActive().toast('שגיאה: ' + e.message, CONFIG.toastBrandName, -1);
+    throw e;
+  }
+}
+
+/** Editor-only: no UI scopes. Run from Apps Script if the sheet menu is blocked. */
+function setupTablesFromEditor() {
+  setupTablesCore_();
+  Logger.log('setupTablesFromEditor: MasterData, ShiftTemplate, Rules seeded.');
+}
+
+function setupTablesCore_() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   seedMasterData_(ss);
   seedShiftTemplate_(ss);
   seedRules_(ss);
+}
+
+function setupTablesRun_() {
+  setupTablesCore_();
   try {
     ensureSpreadsheetOpenGuideTrigger_();
   } catch (ignore) {}
-  SpreadsheetApp.getUi().alert(
-    rtlUiText_('✅ טבלאות הוגדרו!'),
-    rtlUiText_(
-      '• MasterData — רשימת עובדים לדוגמה\n'
-      + '• ShiftTemplate — תבנית משמרות (שני סניפים)\n'
-      + '• Rules — חוקים\n\n'
-      + 'ערכו את הטבלאות לפי הארגון שלכם.\n'
-      + 'ודאו ש-' + CONFIG.sheets.responses + ' מחובר לטופס Google.'
-    ),
-    SpreadsheetApp.getUi().ButtonSet.OK
+  return menuActionSuccess_(
+    '✅ טבלאות אותחלו',
+    '• ' + CONFIG.sheets.masterData + ' — ' + FAKE_MENTOR_ROSTER_.length + ' מאמני מנטור (עם דרגה)\n'
+      + '• ' + CONFIG.sheets.shiftTemplate + ' — שכבת אימונים שעתיים × 3 רשתות\n'
+      + '• ' + CONFIG.sheets.rules + ' — דגלי שיבוץ עם ערכי ברירת מחדל וטקסט הסבר\n\n'
+      + 'ודאו ש-"' + CONFIG.sheets.responses + '" מחובר לטופס Google.'
+  );
+}
+
+function updateTrainingTemplate() {
+  showRtlConfirmDialog_(
+    'updateTrainingTemplate',
+    '📅 עדכן תבנית אימונים',
+    'מה זה עושה: ממלא מחדש את "' + CONFIG.sheets.shiftTemplate + '" — שכבת האימונים שהמערכת משבצת אליה:\n'
+      + '• בוקר א\'–ו\': אימונים שעתיים 07:00–12:00 (5 אימונים)\n'
+      + '• ערב א\'–ה\': 16:00–19:15 באימונים שעתיים + 19:15–20:15 + 20:15–21:15\n'
+      + '• כל אימון מופיע על 3 רשתות (Net1–Net3) — קיבולת מקבילה באותו מקום\n\n'
+      + '⚠ דורס תוכן קיים ב-"' + CONFIG.sheets.shiftTemplate + '".\n'
+      + 'לא נוגע ב-MasterData, Rules או בתשובות הטופס.\n\n'
+      + 'להמשיך?'
+  );
+}
+
+function updateTrainingTemplateRun_() {
+  seedShiftTemplate_(SpreadsheetApp.getActiveSpreadsheet());
+  return menuActionSuccess_(
+    '✅ תבנית אימונים עודכנה',
+    'ShiftTemplate: א\'–ה\' בוקר+ערב, שישי בוקר בלבד, × 3 רשתות.\nהריצו שוב "🚀 הרץ שיבוץ שבועי".'
   );
 }
 
@@ -39,38 +89,56 @@ function loadTestResponses() {
   showRtlConfirmDialog_(
     'loadTestResponses',
     '🧪 טען תשובות בדיקה',
-    'מה זה עושה: ממלא את גיליון הטופס בתשובות לדוגמה — רק לבדיקה.\n\n'
-      + 'טבלאות: דורס את כל התוכן בגיליון "' + CONFIG.sheets.responses + '".\n'
-      + 'אם יש שם הגשות אמיתיות — אל תאשר.\n\n'
+    'מה זה עושה: ממלא את גיליון הדמו בתשובות לדוגמה — לבדיקה בלבד.\n\n'
+      + '⚠ דורס תוכן ב-"' + CONFIG.sheets.responsesDemo + '".\n'
+      + 'לא נוגע ב-"' + CONFIG.sheets.responses + '" (טופס אמיתי).\n\n'
       + 'להמשיך?'
   );
 }
 
 function loadTestResponsesRun_() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  seedResponses_(ss);
-  SpreadsheetApp.getUi().alert(
-    rtlUiText_('✅ תשובות בדיקה נטענו.\nלחצו הרץ אופטימייזר.')
-  );
+  seedResponses_(SpreadsheetApp.getActiveSpreadsheet());
+  return menuActionSuccess_('✅ תשובות בדיקה', 'תשובות בדיקה נטענו.\nהריצו "🚀 הרץ שיבוץ שבועי".');
 }
 
-function seedMasterData_(ss) {
-  var sheet = ss.getSheetByName(CONFIG.sheets.masterData);
-  if (!sheet) sheet = ss.insertSheet(CONFIG.sheets.masterData);
+/**
+ * MasterData rows for the Mentor roster.
+ *
+ * Columns:
+ *   Name  | Rank (1=best … 3=lowest)
+ *   WeeklyMin | WeeklyMax — typical weekly shift count requested by the coach
+ *                          (derived from the monthly view; a "shift" = morning
+ *                           OR evening half-day block).
+ *
+ * Edit FAKE_MENTOR_ROSTER_ to change names/ranks, and MENTOR_WEEKLY_SHIFT_TARGETS_
+ * to change the weekly targets.
+ */
+function buildMentorMasterDataRows_() {
+  var data = [['Name', 'Rank', 'WeeklyMin', 'WeeklyMax']];
+  for (var i = 0; i < FAKE_MENTOR_ROSTER_.length; i++) {
+    var name = FAKE_MENTOR_ROSTER_[i].name;
+    var target = getMentorWeeklyTarget_(name);
+    data.push([
+      name,
+      normalizeMentorRank_(FAKE_MENTOR_ROSTER_[i].rank),
+      target.min,
+      target.max
+    ]);
+  }
+  return data;
+}
+
+/** Coach display names for form dropdown and fake responses. */
+function getMentorCoachNames_() {
+  var names = [];
+  for (var i = 0; i < FAKE_MENTOR_ROSTER_.length; i++) {
+    names.push(FAKE_MENTOR_ROSTER_[i].name);
+  }
+  return names;
+}
+
+function writeMasterDataSheet_(sheet, data) {
   sheet.clear();
-
-  var data = [
-    ['Name', 'Rank', 'IsPriority', 'MinShifts', 'MaxShifts', 'LocationRestriction', 'RequestedShifts', 'BlockRestriction'],
-    ['מנטור א', 4, true, 5, 6, 'SiteA', 5, ''],
-    ['מנטור ב', 4, true, 5, 6, 'SiteB', 5, ''],
-    ['דנה', 3, false, 0, 6, '', 4, ''],
-    ['יוסי', 3, false, 0, 6, '', 5, ''],
-    ['מיה', 2, false, 0, 6, 'SiteA', 4, ''],
-    ['עומר', 2, false, 0, 6, 'SiteB', 4, ''],
-    ['נועה', 1, false, 0, 6, '', 5, ''],
-    ['איתי', 1, false, 0, 6, '', 4, '']
-  ];
-
   sheet.getRange(1, 1, data.length, data[0].length).setValues(data);
   sheet.getRange(1, 1, 1, data[0].length)
     .setFontWeight('bold').setBackground('#2E7D6B').setFontColor('#FFFFFF');
@@ -78,30 +146,59 @@ function seedMasterData_(ss) {
   for (var c = 1; c <= data[0].length; c++) sheet.autoResizeColumn(c);
 }
 
+function seedMasterData_(ss) {
+  var sheet = ss.getSheetByName(CONFIG.sheets.masterData);
+  if (!sheet) sheet = ss.insertSheet(CONFIG.sheets.masterData);
+  writeMasterDataSheet_(sheet, buildMentorMasterDataRows_());
+}
+
+/**
+ * Mentor training slots: Sun–Fri morning; Sun–Thu evening (no Friday evening).
+ */
+/**
+ * Builds the ShiftTemplate rows in the compact form. One row per Day/Block/Time
+ * with Location='*' meaning "all CONFIG.locations". The loader expands '*' rows
+ * into one slot per net at read time, so the sheet stays at ~55 rows instead of
+ * 3×55=165 with identical duplication across Net1/Net2/Net3.
+ *
+ * Columns: Location | Day | Block | StartTime | EndTime (one trainer per slot,
+ * no headcount column — that information is intentionally fixed in code so
+ * editors can't accidentally request multiple trainers per training).
+ */
+function buildMentorTrainingTemplateRows_() {
+  var rows = [];
+  var morning = [[7, 8], [8, 9], [9, 10], [10, 11], [11, 12]];
+  var evening = [[16, 17], [17, 18], [18, 19], [19.25, 20.25], [20.25, 21.25]];
+
+  for (var di = 0; di < MENTOR_WEEKDAYS_HE_.length; di++) {
+    var day = MENTOR_WEEKDAYS_HE_[di];
+    for (var h = 0; h < morning.length; h++) {
+      rows.push(['*', day, 'בוקר', formatTemplateTime_(morning[h][0]), formatTemplateTime_(morning[h][1])]);
+    }
+    if (!isMentorFriday_(day)) {
+      for (var h = 0; h < evening.length; h++) {
+        rows.push(['*', day, 'ערב', formatTemplateTime_(evening[h][0]), formatTemplateTime_(evening[h][1])]);
+      }
+    }
+  }
+  return rows;
+}
+
+function formatTemplateTime_(decimalHour) {
+  var h = Math.floor(decimalHour);
+  var m = Math.round((decimalHour - h) * 60);
+  return h + ':' + (m < 10 ? '0' : '') + m;
+}
+
 function seedShiftTemplate_(ss) {
   var sheet = ss.getSheetByName(CONFIG.sheets.shiftTemplate);
   if (!sheet) sheet = ss.insertSheet(CONFIG.sheets.shiftTemplate);
   sheet.clear();
 
-  var data = [['Location', 'Day', 'Block', 'Headcount', 'StartTime', 'EndTime']];
-  var weekdays = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי'];
-  var locations = CONFIG.locations;
-
-  for (var li = 0; li < locations.length; li++) {
-    var loc = locations[li];
-    for (var i = 0; i < weekdays.length; i++) {
-      var day = weekdays[i];
-      data.push([loc, day, 'בוקר', 2, '8:00', '14:00']);
-      data.push([loc, day, 'בוקר', 1, '9:00', '14:00']);
-      data.push([loc, day, 'ערב', 2, '14:00', '20:00']);
-    }
-    data.push([loc, 'שישי', 'בוקר', 1, '8:00', '14:00']);
-    data.push([loc, 'שישי', 'אמצע', 1, '10:00', '17:00']);
-    data.push([loc, 'שישי', 'ערב', 2, '14:00', '19:00']);
-    if (loc === 'SiteA') {
-      data.push([loc, 'שבת', 'בוקר', 2, '8:00', '14:00']);
-      data.push([loc, 'שבת', 'ערב', 2, '14:00', '19:00']);
-    }
+  var data = [['Location', 'Day', 'Block', 'StartTime', 'EndTime']];
+  var templateRows = buildMentorTrainingTemplateRows_();
+  for (var i = 0; i < templateRows.length; i++) {
+    data.push(templateRows[i]);
   }
 
   sheet.getRange(1, 1, data.length, data[0].length).setValues(data);
@@ -115,35 +212,563 @@ function seedRules_(ss) {
   var sheet = ss.getSheetByName(CONFIG.sheets.rules);
   if (!sheet) sheet = ss.insertSheet(CONFIG.sheets.rules);
   sheet.clear();
+  sheet.clearFormats();
 
-  var data = [
-    ['Key', 'Value'],
-    ['no_juniors_alone', 'TRUE'],
-    ['min_morning_score', 7],
-    ['min_morning_score_sitea', 7],
-    ['min_morning_score_siteb', 6],
-    ['default_target_shifts_per_week', 5],
-    ['max_shifts_per_week', 6],
-    ['min_rest_hours', 0],
-    ['allow_double_shift', 'FALSE']
+  var defaults = getDefaultMentorRules_();
+  var descriptions = getMentorRuleDescriptions_();
+
+  // Order rules: Mentor-specific behavior toggles first (most impactful),
+  // then dormant/legacy. Keys not present here will still be written below in
+  // arbitrary order to be safe.
+  var orderedKeys = [
+    'rank_1_unconditional',
+    'rank_priority_enabled',
+    'soft_cap_weekly_max',
+    'avoid_back_to_back',
+    'suggest_outside_availability',
+    'default_target_shifts_per_week',
+    'max_shifts_per_week',
+    'min_rest_hours',
+    'allow_double_shift'
   ];
+  var seenKey = {};
+  for (var i = 0; i < orderedKeys.length; i++) seenKey[orderedKeys[i]] = true;
+  var allKeys = Object.keys(defaults);
+  for (var j = 0; j < allKeys.length; j++) {
+    if (!seenKey[allKeys[j]]) orderedKeys.push(allKeys[j]);
+  }
 
-  sheet.getRange(1, 1, data.length, 2).setValues(data);
-  sheet.getRange(1, 1, 1, 2)
+  var data = [['Key', 'Value', 'תיאור']];
+  for (var k = 0; k < orderedKeys.length; k++) {
+    var key = orderedKeys[k];
+    data.push([key, defaults[key], descriptions[key] || '']);
+  }
+
+  sheet.getRange(1, 1, data.length, 3).setValues(data);
+  sheet.getRange(1, 1, 1, 3)
     .setFontWeight('bold').setBackground('#2E7D6B').setFontColor('#FFFFFF');
   sheet.setFrozenRows(1);
-  sheet.autoResizeColumn(1);
-  sheet.autoResizeColumn(2);
+
+  // Add TRUE/FALSE dropdown on boolean rule cells so the staff can't type
+  // free-form text by mistake.
+  var trueFalseRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['TRUE', 'FALSE'], true)
+    .setAllowInvalid(false)
+    .build();
+  for (var r = 0; r < orderedKeys.length; r++) {
+    if (typeof defaults[orderedKeys[r]] === 'boolean') {
+      sheet.getRange(r + 2, 2).setDataValidation(trueFalseRule);
+    }
+  }
+
+  sheet.setColumnWidth(1, 230);
+  sheet.setColumnWidth(2, 90);
+  sheet.setColumnWidth(3, 520);
+  sheet.getRange(1, 1, data.length, 3).setVerticalAlignment('middle').setWrap(true);
+  sheet.getRange(2, 1, orderedKeys.length, 1).setFontFamily('Menlo').setFontSize(11);
+}
+
+/**
+ * Mentor coach roster — edit name + rank (1 = best, 3 = lowest).
+ * Used by MasterData seed, form sync, and demo responses.
+ */
+var FAKE_MENTOR_ROSTER_ = [
+  { name: 'רון', rank: 1 },
+  { name: 'מנש', rank: 1 },
+  { name: 'איתם', rank: 1 },
+  { name: 'בבה', rank: 2 },
+  { name: 'יובל כץ', rank: 2 },
+  { name: 'דורון', rank: 1 },
+  { name: 'עומר אופק', rank: 2 },
+  { name: 'קורין', rank: 3 },
+  { name: 'שירי', rank: 3 },
+  { name: 'לילוש', rank: 3 },
+  { name: 'סהר כהן', rank: 3 },
+  { name: 'מיתר', rank: 3 },
+  { name: 'תומר אסף', rank: 3 },
+  { name: 'טומי', rank: 3 },
+  { name: 'טל נחמיאס', rank: 2 },
+  { name: 'ינון שוב', rank: 3 }
+];
+
+/**
+ * Expected sheet: Timestamp, שם מאמן, then one column per day (ראשון–חמישי + שישי בוקר בלבד).
+ * Form: one section per day; one question (checkbox) with all time-range options.
+ */
+function buildDefaultMentorFormHeaders_() {
+  var headers = ['Timestamp', 'שם מאמן'];
+  for (var d = 0; d < MENTOR_WEEKDAYS_HE_.length; d++) {
+    var day = MENTOR_WEEKDAYS_HE_[d];
+    headers.push(mentorDayBilingualLabel_(day));
+    headers.push(mentorDayNoteHeader_(day));
+  }
+  return headers;
+}
+
+/** Sheet column for per-day free-text note (matches Google Form paragraph title). */
+function mentorDayNoteHeader_(dayHe) {
+  return 'הערה ' + dayHe;
+}
+
+/** Form + availability days: Sun–Fri (Friday morning only in form options). */
+var MENTOR_WEEKDAYS_HE_ = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי'];
+
+/** Portuguese day names as used by Mentor staff (ראשון-Domingo, …, שישי-Sexta) */
+var MENTOR_WEEKDAYS_PT_ = [
+  'Domingo',
+  'Segunda',
+  'Terça',
+  'Quarta',
+  'Quinta',
+  'Sexta'
+];
+
+function isMentorFriday_(dayHe) {
+  return String(dayHe || '').trim() === 'שישי';
+}
+
+/** Friday has morning availability only — no evening shifts or form options. */
+function mentorFormDayIncludesEvening_(dayHe) {
+  return !isMentorFriday_(dayHe);
+}
+
+function mentorDayBilingualLabel_(dayHe) {
+  var i = MENTOR_WEEKDAYS_HE_.indexOf(dayHe);
+  if (i < 0) return dayHe;
+  return dayHe + '-' + MENTOR_WEEKDAYS_PT_[i];
+}
+
+/** Maps sheet column header to Hebrew day key (e.g. "ראשון-Domingo" → "ראשון"). */
+function matchMentorDayColumnHeader_(header) {
+  var h = String(header || '').trim();
+  for (var i = 0; i < MENTOR_WEEKDAYS_HE_.length; i++) {
+    var day = MENTOR_WEEKDAYS_HE_[i];
+    if (h === day || h === mentorDayBilingualLabel_(day)) return day;
+  }
+  return null;
+}
+
+function mentorNotAvailableLabel_() {
+  return 'לא זמין / Não disponível';
+}
+
+function isMentorNotAvailableText_(text) {
+  var s = String(text || '').trim();
+  if (!s) return true;
+  if (/^לא\s*זמין/i.test(s)) return true;
+  if (/n[aã]o\s*dispon[ií]vel/i.test(s)) return true;
+  return false;
+}
+
+/**
+ * All time-range options shown in the form, sorted chronologically
+ * by start time, then end time. Used in fake data + parsing.
+ */
+var MENTOR_MORNING_LABELS_ = [
+  '7:00 עד 9:00',
+  '7:00 עד 10:00',
+  '7:00 עד 11:00',
+  '7:00 עד 12:00',
+  '8:00 עד 10:00',
+  '8:00 עד 11:00',
+  '8:00 עד 12:00',
+  '9:00 עד 11:00',
+  '9:00 עד 12:00',
+  '10:00 עד 12:00'
+];
+var MENTOR_EVENING_LABELS_ = [
+  '16:00 עד 18:00',
+  '16:00 עד 20:15',
+  '16:00 עד 21:15',
+  '17:00 עד 19:00',
+  '17:00 עד 21:15',
+  '18:00 עד 20:15',
+  '18:00 עד 21:15',
+  '19:00 עד 21:15',
+  '19:15 עד 21:15'
+];
+
+/**
+ * Weekly shift target per coach (min, max), derived from the monthly view
+ * the staff aligned on. A "shift" = one morning OR one evening half-day block.
+ *
+ * This is the single source of truth for both:
+ *   • The WeeklyMin/WeeklyMax columns in MasterData (the optimizer + fairness table)
+ *   • The fake demo seeder, so the simulated form responses match what the real
+ *     coaches actually request.
+ */
+var MENTOR_WEEKLY_SHIFT_TARGETS_ = {
+  'רון':       { min: 1, max: 2 },
+  'מנש':       { min: 1, max: 2 },
+  'איתם':      { min: 2, max: 4 },
+  'בבה':       { min: 2, max: 4 },
+  'יובל כץ':   { min: 2, max: 3 },
+  'דורון':     { min: 0, max: 1 },
+  'עומר אופק': { min: 2, max: 3 },
+  'קורין':     { min: 0, max: 1 },
+  'שירי':      { min: 1, max: 2 },
+  'לילוש':     { min: 1, max: 2 },
+  'סהר כהן':   { min: 0, max: 1 },
+  'מיתר':      { min: 0, max: 1 },
+  'תומר אסף':  { min: 0, max: 1 },
+  'טומי':      { min: 1, max: 2 },
+  'טל נחמיאס': { min: 1, max: 2 },
+  'ינון שוב':  { min: 0, max: 0 }
+};
+var MENTOR_DEFAULT_WEEKLY_TARGET_ = { min: 1, max: 2 };
+
+function getMentorWeeklyTarget_(coachName) {
+  return MENTOR_WEEKLY_SHIFT_TARGETS_[coachName] || MENTOR_DEFAULT_WEEKLY_TARGET_;
+}
+
+function responsesHeadersUseLegacyTimeColumns_(headers) {
+  for (var c = 0; c < headers.length; c++) {
+    var h = String(headers[c] || '');
+    if (h.indexOf('התחלה') >= 0 || h.indexOf('סיום') >= 0) return true;
+  }
+  return false;
+}
+
+function responsesHeadersUseSplitDayBlocks_(headers) {
+  for (var c = 0; c < headers.length; c++) {
+    var h = String(headers[c] || '').trim();
+    if (/\sבוקר$/.test(h) || /\sערב$/.test(h)) return true;
+  }
+  return false;
+}
+
+function responsesHeadersNeedDefaultMentorFormat_(headers) {
+  return responsesHeadersUseLegacyTimeColumns_(headers)
+    || responsesHeadersUseSplitDayBlocks_(headers);
+}
+
+function setupDemoResponsesTab() {
+  showRtlConfirmDialog_(
+    'setupDemoResponsesTab',
+    '🔧 הכן טאב תשובות דמו',
+    'מה זה עושה: יוצר או מנקה את "' + CONFIG.sheets.responsesDemo + '" — גיליון רגיל עם הכותרות של טופס מנטור בלבד, בלי קישור לטופס Google.\n\n'
+      + 'הכותרות מסונכרנות מ-"' + CONFIG.sheets.responses + '" אם קיים, אחרת נבנות לפי המבנה הנוכחי בקוד.\n\n'
+      + 'משמש לדמו / טסטים — האופטימייזר יקרא מ-"' + CONFIG.sheets.responsesDemo + '" כש-`useDemoResponses` ב-Config פעיל.\n\n'
+      + 'להמשיך?'
+  );
+}
+
+function setupDemoResponsesTabRun_() {
+  ensureDemoResponsesSheet_(SpreadsheetApp.getActiveSpreadsheet());
+  return menuActionSuccess_(
+    '✅ טאב תשובות דמו מוכן',
+    '• "' + CONFIG.sheets.responsesDemo + '" נוצר/נוקה עם כותרות מנטור\n'
+      + '• האופטימייזר קורא מכאן כשמופעל מצב דמו ב-Config\n\n'
+      + 'השלב הבא: "🧪 טען זמינות דמו לבדיקה".'
+  );
+}
+
+function loadFakeMentorResponses() {
+  showRtlConfirmDialog_(
+    'loadFakeMentorResponses',
+    '🧪 טען זמינות דמו לבדיקה',
+    'מה זה עושה: טוען דאטה דמו מלא של מנטור — לבדיקת האלגוריתם בלי לחכות שמאמנים ימלאו טופס:\n'
+      + '• דורס וממלא "' + CONFIG.sheets.masterData + '" ב-' + FAKE_MENTOR_ROSTER_.length + ' מאמני מנטור (עם דרגות)\n'
+      + '• דורס וממלא "' + CONFIG.sheets.responsesDemo + '" ב-' + FAKE_MENTOR_ROSTER_.length + ' תשובות זמינות לדוגמה\n\n'
+      + 'לא נוגע ב-"' + CONFIG.sheets.responses + '" (טופס Google האמיתי).\n\n'
+      + 'להמשיך?'
+  );
+}
+
+function loadFakeMentorResponsesRun_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  seedFakeMasterData_(ss);
+  seedFakeMentorResponses_(ss);
+  return menuActionSuccess_(
+    '✅ זמינות דמו נטענה',
+    '• ' + CONFIG.sheets.masterData + ' — ' + FAKE_MENTOR_ROSTER_.length + ' שורות מאמנים\n'
+      + '• ' + CONFIG.sheets.responsesDemo + ' — ' + FAKE_MENTOR_ROSTER_.length + ' תשובות זמינות\n\n'
+      + 'הריצו "🚀 הרץ שיבוץ שבועי" כדי לראות שיבוץ מלא.'
+  );
+}
+
+function seedFakeMentorResponses_(ss) {
+  var sheet = ensureDemoResponsesSheet_(ss);
+
+  var headers;
+  if (sheet.getLastRow() >= 1 && sheet.getLastColumn() >= 2) {
+    headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    var h1 = String(headers[1] || '').trim();
+    if ((h1.indexOf('מאמן') < 0 && h1.indexOf('עובד') < 0) || responsesHeadersNeedDefaultMentorFormat_(headers)) {
+      headers = buildDefaultMentorFormHeaders_();
+    }
+  } else {
+    headers = buildDefaultMentorFormHeaders_();
+  }
+
+  var layout = detectResponsesLayout_(headers);
+  var data = [headers];
+  var baseTime = new Date();
+
+  var coachNames = getMentorCoachNames_();
+  for (var i = 0; i < coachNames.length; i++) {
+    var row = [];
+    for (var c = 0; c < headers.length; c++) row.push('');
+    row[0] = new Date(baseTime.getTime() - i * 37 * 60 * 1000);
+    row[layout.nameCol] = coachNames[i];
+    fillFakeMentorAvailabilityRow_(row, layout, i, coachNames[i]);
+    data.push(row);
+  }
+
+  sheet.clear();
+  sheet.getRange(1, 1, data.length, headers.length).setValues(data);
+  sheet.getRange(1, 1, 1, headers.length)
+    .setFontWeight('bold').setBackground('#2E7D6B').setFontColor('#FFFFFF');
+  sheet.setFrozenRows(1);
+  for (var col = 1; col <= headers.length; col++) sheet.autoResizeColumn(col);
+  resetMakeAvailabilityNotifyCycle_();
+
+  // Refresh the per-coach availability summary columns (hours + shifts) so
+  // the demo shows what each coach offered before the optimizer ever runs.
+  try {
+    var demoAvail = loadAvailability(sheet).availability;
+    updateAvailabilitySummary_(sheet, demoAvail);
+  } catch (e) {
+    Logger.log('updateAvailabilitySummary_ (demo) failed: ' + e);
+  }
+}
+
+/**
+ * Coaches whose fake demo row stays empty (didn't submit any availability).
+ * Lets the demo exercise the "missing response" path of the optimizer + UI.
+ */
+var FAKE_MENTOR_UNAVAILABLE_ALL_WEEK_ = ['ינון שוב'];
+
+function isFakeMentorUnavailableAllWeek_(coachName) {
+  if (!coachName) return false;
+  for (var i = 0; i < FAKE_MENTOR_UNAVAILABLE_ALL_WEEK_.length; i++) {
+    if (FAKE_MENTOR_UNAVAILABLE_ALL_WEEK_[i] === coachName) return true;
+  }
+  return false;
+}
+
+function fillFakeMentorAvailabilityRow_(row, layout, seed, coachName) {
+  if (isFakeMentorUnavailableAllWeek_(coachName)) {
+    return;
+  }
+
+  var picks = pickFakeMentorWeek_(coachName, seed);
+  applyMentorPicksToRow_(row, layout, picks, coachName, seed);
+}
+
+/**
+ * Probability that a coach's demo row includes a Friday-morning availability.
+ * In real life mid-week is almost always covered, Friday is sparser. Keeping
+ * this around 40% surfaces some Friday gaps without starving mid-week.
+ */
+var FAKE_MENTOR_FRIDAY_INCLUDE_PROB_ = 0.4;
+
+/**
+ * Minimum picks per coach in the demo. Real coaches rarely submit "nothing"
+ * unless they're truly unavailable for the whole week — those go in
+ * FAKE_MENTOR_UNAVAILABLE_ALL_WEEK_ instead.
+ */
+var FAKE_MENTOR_MIN_PICKS_ = 3;
+
+/**
+ * Coaches who, in real life, submit availability close to their target instead
+ * of the generous "max + extras" pattern. Demo mirrors this by giving them at
+ * most target.max + 1 picks (and never below target.min).
+ */
+var FAKE_MENTOR_TIGHT_AVAILABILITY_ = ['רון', 'מנש', 'דורון'];
+
+function isMentorTightAvailability_(coachName) {
+  if (!coachName) return false;
+  for (var i = 0; i < FAKE_MENTOR_TIGHT_AVAILABILITY_.length; i++) {
+    if (FAKE_MENTOR_TIGHT_AVAILABILITY_[i] === coachName) return true;
+  }
+  return false;
+}
+
+/**
+ * Decide the (day, block) picks for one fake coach for the week.
+ *
+ * Two profiles:
+ *  • "Tight": coach submits availability close to their target (target.max ±
+ *    a tiny random nudge). Used by senior/low-availability coaches like Ron,
+ *    Manash, Dorin. Reflects real-world behavior — they only ask for what
+ *    they actually want to work.
+ *  • "Generous" (default): coach submits target.max + 2..4 extra picks so the
+ *    optimizer has flexibility. Used by everyone else.
+ *
+ * Deterministic by coachName+seed.
+ *
+ * @returns {Array<{dayIndex:number, block:'morning'|'evening'}>}
+ */
+function pickFakeMentorWeek_(coachName, seed) {
+  var target = getMentorWeeklyTarget_(coachName);
+  var rngExtra = makeMentorFakeRng_(coachName + '|extra', seed);
+
+  var n;
+  if (isMentorTightAvailability_(coachName)) {
+    // Tight profile: target.max OR target.max+1 (50/50). Honor target.min.
+    var bump = Math.floor(rngExtra() * 2); // 0 or 1
+    n = Math.max(target.min, target.max + bump);
+    if (n <= 0) n = 1;
+  } else {
+    var extra = 2 + Math.floor(rngExtra() * 3); // 2, 3, or 4 extras
+    n = Math.max(FAKE_MENTOR_MIN_PICKS_, target.max + extra);
+  }
+
+  var weekdayPairs = [];
+  var fridayPairs = [];
+  for (var di = 0; di < MENTOR_WEEKDAYS_HE_.length; di++) {
+    var dayHe = MENTOR_WEEKDAYS_HE_[di];
+    var bucket = isMentorFriday_(dayHe) ? fridayPairs : weekdayPairs;
+    bucket.push({ dayIndex: di, block: 'morning' });
+    if (mentorFormDayIncludesEvening_(dayHe)) {
+      bucket.push({ dayIndex: di, block: 'evening' });
+    }
+  }
+
+  shuffleMentorPairsInPlace_(weekdayPairs, makeMentorFakeRng_(coachName + '|wd', seed));
+  shuffleMentorPairsInPlace_(fridayPairs, makeMentorFakeRng_(coachName + '|fri', seed));
+
+  var picks = weekdayPairs.slice(0, Math.min(n, weekdayPairs.length));
+
+  if (fridayPairs.length > 0) {
+    var rngFri = makeMentorFakeRng_(coachName + '|friCoin', seed);
+    if (rngFri() < FAKE_MENTOR_FRIDAY_INCLUDE_PROB_) {
+      picks.push(fridayPairs[0]);
+    }
+  }
+
+  return picks;
+}
+
+function applyMentorPicksToRow_(row, layout, picks, coachName, seed) {
+  var byDay = {};
+  for (var i = 0; i < picks.length; i++) {
+    var p = picks[i];
+    if (!byDay[p.dayIndex]) byDay[p.dayIndex] = { morning: false, evening: false };
+    byDay[p.dayIndex][p.block] = true;
+  }
+
+  if (layout.mode === 'dayRanges') {
+    for (var di = 0; di < MENTOR_WEEKDAYS_HE_.length; di++) {
+      var col = layout.dayColumns[MENTOR_WEEKDAYS_HE_[di]];
+      if (col === undefined) continue;
+      var blocks = byDay[di] || { morning: false, evening: false };
+      writeFakeMentorDayCell_(row, col, blocks, coachName, seed, di);
+    }
+    return;
+  }
+
+  for (var di2 = 0; di2 < MENTOR_WEEKDAYS_HE_.length; di2++) {
+    var fields = layout.dayFields[MENTOR_WEEKDAYS_HE_[di2]];
+    if (!fields) continue;
+    var b = byDay[di2] || { morning: false, evening: false };
+    if (b.morning) {
+      setFakeBlockChoice_(row, fields, 'morning', MENTOR_MORNING_LABELS_, seed, di2);
+    } else {
+      setFakeBlockUnavailable_(row, fields, 'morning');
+    }
+    if (b.evening) {
+      setFakeBlockChoice_(row, fields, 'evening', MENTOR_EVENING_LABELS_, seed, di2);
+    } else {
+      setFakeBlockUnavailable_(row, fields, 'evening');
+    }
+  }
+}
+
+/** Day cell for the checkbox-per-day layout. Joins selected ranges, or "לא זמין" when empty. */
+function writeFakeMentorDayCell_(row, col, blocks, coachName, seed, dayIndex) {
+  var parts = [];
+  if (blocks.morning) {
+    parts.push(pickFakeMentorLabel_(MENTOR_MORNING_LABELS_, coachName, seed, dayIndex, 'morning'));
+  }
+  if (blocks.evening) {
+    parts.push(pickFakeMentorLabel_(MENTOR_EVENING_LABELS_, coachName, seed, dayIndex, 'evening'));
+  }
+  row[col] = parts.length > 0 ? parts.join(', ') : mentorNotAvailableLabel_();
+}
+
+function pickFakeMentorLabel_(labels, coachName, seed, dayIndex, blockTag) {
+  var rng = makeMentorFakeRng_(coachName + '|label|' + blockTag + '|' + dayIndex, seed);
+  return labels[Math.floor(rng() * labels.length)];
+}
+
+/** In-place Fisher-Yates shuffle using a deterministic PRNG. */
+function shuffleMentorPairsInPlace_(arr, rng) {
+  for (var i = arr.length - 1; i > 0; i--) {
+    var j = Math.floor(rng() * (i + 1));
+    var tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+}
+
+/**
+ * Tiny deterministic PRNG (xorshift32 seeded by an FNV-1a-style hash of the key).
+ * Same key + same seed always produces the same sequence — so fake responses are
+ * stable across reseeds, but vary between coaches and across runs.
+ */
+function makeMentorFakeRng_(key, seed) {
+  var s = 0x811c9dc5;
+  var str = String(key) + ':' + String(seed);
+  for (var i = 0; i < str.length; i++) {
+    s ^= str.charCodeAt(i);
+    s = Math.imul(s, 16777619) >>> 0;
+  }
+  if (s === 0) s = 1;
+  return function() {
+    s ^= s << 13; s >>>= 0;
+    s ^= s >>> 17;
+    s ^= s << 5; s >>>= 0;
+    return s / 0x100000000;
+  };
+}
+
+function setFakeBlockUnavailable_(row, fields, block) {
+  var na = 'לא זמין';
+  if (block === 'morning') {
+    if (fields.morningBlock !== undefined) row[fields.morningBlock] = na;
+    if (fields.morningStart !== undefined) row[fields.morningStart] = na;
+    if (fields.morningEnd !== undefined) row[fields.morningEnd] = na;
+  } else {
+    if (fields.eveningBlock !== undefined) row[fields.eveningBlock] = na;
+    if (fields.eveningStart !== undefined) row[fields.eveningStart] = na;
+    if (fields.eveningEnd !== undefined) row[fields.eveningEnd] = na;
+  }
+}
+
+/** Fills one block column (dropdown label) or legacy start/end pair. */
+function setFakeBlockChoice_(row, fields, block, labels, seed, dayIndex) {
+  var label = labels[(seed + dayIndex) % labels.length];
+  if (block === 'morning') {
+    if (fields.morningBlock !== undefined) {
+      row[fields.morningBlock] = label;
+    } else if (fields.morningStart !== undefined || fields.morningEnd !== undefined) {
+      var parts = label.replace(/:/g, '').split(/\s*עד\s*/);
+      if (fields.morningStart !== undefined) row[fields.morningStart] = parts[0] || label;
+      if (fields.morningEnd !== undefined) row[fields.morningEnd] = parts[1] || '';
+    }
+  } else {
+    if (fields.eveningBlock !== undefined) {
+      row[fields.eveningBlock] = label;
+    } else if (fields.eveningStart !== undefined || fields.eveningEnd !== undefined) {
+      var partsE = label.split(/\s*עד\s*/);
+      if (fields.eveningStart !== undefined) row[fields.eveningStart] = partsE[0] || label;
+      if (fields.eveningEnd !== undefined) row[fields.eveningEnd] = partsE[1] || '';
+    }
+  }
+}
+
+function seedFakeMasterData_(ss) {
+  seedMasterData_(ss);
 }
 
 function seedResponses_(ss) {
-  var sheetName = CONFIG.sheets.responses;
-  var sheet = ss.getSheetByName(sheetName);
-  if (!sheet) sheet = ss.insertSheet(sheetName);
+  var sheet = ensureDemoResponsesSheet_(ss);
   sheet.clear();
 
   var headers = ['Timestamp', 'שם העובד', 'ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת', 'הערות', 'Email Address'];
-  var names = ['דנה', 'יוסי', 'מיה', 'עומר', 'נועה', 'איתי', 'מנטור א', 'מנטור ב'];
+  var names = ['דנה', 'יוסי', 'מיה', 'עומר', 'נועה', 'איתי'];
   var data = [headers];
 
   for (var n = 0; n < names.length; n++) {

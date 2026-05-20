@@ -2,12 +2,18 @@
  * @OnlyCurrentDoc
  * Writes the optimized schedule to a single sheet.
  *
- * Layout per location (horizontal):
- *   [time] ראשון..חמישי | [gap] | [time] שישי | [gap] | [time] שבת
- *   shift rows ...
- *   summary row (shift counts)
+ * Unified weekly layout (one wide table):
+ *   Row 1:      day headers (ראשון..שישי), each merged across 3 net columns.
+ *   Row 2:      net sub-headers (רשת 1 / רשת 2 / רשת 3) under each day.
+ *   Rows 3..N:  one row per hour-block. Time label in column 1 (right side under RTL).
+ *               A coach assigned to consecutive adjacent hours in the same (day, net)
+ *               is rendered as one tall merged cell.
+ *               Friday's evening rows are greyed out (no trainings on Friday evening).
  *
- * Then fairness table + legend at the bottom.
+ * Then a fairness table + legend at the bottom.
+ *
+ * DAY_GROUPS_ is still used by the WhatsApp share/export and refresh paths,
+ * which have their own narrower layouts.
  */
 
 var DAY_GROUPS_ = [
@@ -15,6 +21,13 @@ var DAY_GROUPS_ = [
   ['שישי'],
   ['שבת']
 ];
+
+/** Unified Schedule grid layout constants. */
+var SCHEDULE_TIME_COL_WIDTH_ = 70;
+var SCHEDULE_NET_COL_WIDTH_ = 76;
+var SCHEDULE_DAY_DIVIDER_COLOR_ = '#2E7D6B';
+var SCHEDULE_DAY_EDGE_SUBHEADER_BG_ = '#D0D9DE';
+var UNIFIED_SCHEDULE_DAYS_ = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי'];
 
 function writeSchedule(result, slots, masterMap, availability, notes) {
   HISTORY_SCORES_CACHE_ = null;
@@ -24,255 +37,382 @@ function writeSchedule(result, slots, masterMap, availability, notes) {
   if (!sheet) {
     sheet = ss.insertSheet(CONFIG.sheets.schedule);
   }
+  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).breakApart();
   sheet.clear();
   sheet.clearFormats();
   sheet.clearNotes();
 
-  var currentRow = 1;
   var slotMap = buildSlotMap_(slots);
+  var consecutiveShifts = computeConsecutiveShiftsMap_(slots, result.assignments);
 
-  var locations = CONFIG.locations;
-  for (var loc = 0; loc < locations.length; loc++) {
-    var location = locations[loc];
-    var locationSlots = slots.filter(function(s) { return s.location === location; });
-    if (locationSlots.length === 0) continue;
+  var lastDataRow = writeUnifiedScheduleGrid_(
+    sheet, result.assignments, slots, slotMap, masterMap, availability, consecutiveShifts, 1
+  );
 
-    var locResult = writeLocationRow_(
-      sheet, location, locationSlots, result.assignments, masterMap, availability, currentRow, slotMap
-    );
-    currentRow = locResult.nextRow + 2;
-  }
+  writeFairnessTable_(
+    sheet, result.employeeStats, masterMap, availability, slots, lastDataRow + 2, notes
+  );
 
-  // Fairness table
-  currentRow++;
-  writeFairnessTable_(sheet, result.employeeStats, masterMap, availability, slots, currentRow, notes);
-
-  // Sheet formatting
   sheet.setRightToLeft(true);
-  var lastCol = sheet.getLastColumn();
-  for (var c = 1; c <= lastCol; c++) {
-    sheet.autoResizeColumn(c);
-    if (sheet.getColumnWidth(c) < 70) sheet.setColumnWidth(c, 70);
-  }
-  if (lastCol >= 2) sheet.setColumnWidth(2, 70);
+  applyUnifiedScheduleLayout_(sheet, 1, lastDataRow);
+  var lastCol = 1 + UNIFIED_SCHEDULE_DAYS_.length * CONFIG.locations.length;
   if (sheet.getLastRow() > 0 && lastCol > 0) {
     sheet.getRange(1, 1, sheet.getLastRow(), lastCol)
       .setHorizontalAlignment('center')
       .setVerticalAlignment('middle');
   }
-
 }
 
 // ============================================================
-//  Write one location as a single horizontal row of day-groups
+//  Unified weekly grid: days across, hour blocks down
 // ============================================================
 
-function writeLocationRow_(sheet, location, locationSlots, assignments, masterMap, availability, startRow, slotMap) {
-  var locationLabel = CONFIG.locationNames[location] || location;
-  var startCol = 1;
-  var locationShiftCount = 0;
-  var maxBlockHeight = 0;
-
-  // First pass: compute height of each group to know the maximum
-  var groupInfos = [];
-  for (var g = 0; g < DAY_GROUPS_.length; g++) {
-    var days = DAY_GROUPS_[g];
-    var groupSlots = locationSlots.filter(function(s) {
-      return days.indexOf(s.day) >= 0;
-    });
-    if (groupSlots.length === 0) {
-      groupInfos.push(null);
-      continue;
-    }
-
-    var dayRows = buildDayRows_(groupSlots, days);
-    var height = dayRows.maxRows;
-    if (height > maxBlockHeight) maxBlockHeight = height;
-    groupInfos.push({ days: days, slots: groupSlots, dayRows: dayRows });
-  }
-
-  // header row + data rows + summary row
-  var totalHeight = 1 + maxBlockHeight + 1;
-
-  // Second pass: write each group side by side
-  var col = 1;
-  for (var g = 0; g < groupInfos.length; g++) {
-    var info = groupInfos[g];
-    if (!info) continue;
-
-    var groupCost = writeDayGroupAt_(
-      sheet, location, locationLabel, info, assignments, masterMap, availability, startRow, col, maxBlockHeight, slotMap
-    );
-    locationShiftCount += groupCost;
-
-    // columns used: 1 (time label) + numDays
-    col += 1 + info.days.length + 1; // +1 gap column
-  }
-
-  var totalRow = startRow + 1 + maxBlockHeight;
-  sheet.getRange(totalRow, 1).setValue('סה"כ משמרות ' + locationLabel)
-    .setFontWeight('bold').setBackground(CONFIG.colors.summaryRow);
-  sheet.getRange(totalRow, 2).setValue(locationShiftCount)
-    .setFontWeight('bold').setBackground(CONFIG.colors.summaryRow);
-
-  return { shiftCount: locationShiftCount, nextRow: totalRow + 1 };
-}
-
 /**
- * Build per-day sorted slot arrays and compute max row count.
+ * Writes the schedule as one wide table:
+ *   Row 1: day headers (each merged across its 3 net columns)
+ *   Row 2: net sub-headers (רשת 1 / 2 / 3) under each day
+ *   Rows 3..N: one row per hour block. Time label in column 1.
+ *
+ * Same coach assigned to consecutive adjacent-time slots in the same (day, net)
+ * column is rendered as one tall merged cell. Friday's evening rows are greyed
+ * (no scheduled trainings on Friday evening).
+ *
+ * @returns {number} the row index of the last data row.
  */
-function buildDayRows_(groupSlots, days) {
-  var dayRows = {};
-  var maxRows = 0;
-  for (var d = 0; d < days.length; d++) {
-    var day = days[d];
-    var arr = [];
-    for (var s = 0; s < groupSlots.length; s++) {
-      if (groupSlots[s].day !== day) continue;
-      arr.push(groupSlots[s]);
-    }
-    arr.sort(function(a, b) {
-      var aStart = a.startTime || 0;
-      var bStart = b.startTime || 0;
-      if (aStart !== bStart) return aStart - bStart;
-      var aEnd = a.endTime || 0;
-      var bEnd = b.endTime || 0;
-      return aEnd - bEnd;
-    });
-    dayRows[day] = arr;
-    if (arr.length > maxRows) maxRows = arr.length;
-  }
-  return { dayRows: dayRows, maxRows: maxRows };
-}
+function writeUnifiedScheduleGrid_(sheet, assignments, slots, slotMap, masterMap, availability, consecutiveShifts, startRow) {
+  var DAYS = UNIFIED_SCHEDULE_DAYS_;
+  var locations = CONFIG.locations;
+  var locationLabels = CONFIG.locationNames || {};
+  var perDayCols = locations.length;
 
-/**
- * Write one day-group block at a specific (startRow, startCol).
- * Returns the cost for this group.
- */
-function writeDayGroupAt_(sheet, location, locationLabel, info, assignments, masterMap, availability, startRow, startCol, maxBlockHeight, slotMap) {
-  var days = info.days;
-  var numDays = days.length;
-  var dayRows = info.dayRows.dayRows;
-  var myMaxRows = info.dayRows.maxRows;
+  var timeGrid = buildOrderedTimeGrid_(slots);
+  var slotIndex = buildSlotIndexByDayLocationTime_(slots);
 
-  // --- Header row ---
   var headerRow = startRow;
-  var timeCol = startCol;
+  var subHeaderRow = startRow + 1;
+  var firstDataRow = startRow + 2;
 
-  sheet.getRange(headerRow, timeCol).setValue(locationLabel);
-  for (var d = 0; d < numDays; d++) {
-    sheet.getRange(headerRow, timeCol + 1 + d).setValue(days[d]);
-  }
-  sheet.getRange(headerRow, timeCol, 1, numDays + 1)
+  sheet.getRange(headerRow, 1, 2, 1).merge()
+    .setValue('שעה')
     .setFontWeight('bold')
     .setBackground(CONFIG.colors.headerBg)
-    .setFontColor(CONFIG.colors.headerFont)
-    .setHorizontalAlignment('center');
+    .setFontColor(CONFIG.colors.headerFont);
 
-  // --- Time labels ---
-  var rowTimeLabels = [];
-  for (var r = 0; r < myMaxRows; r++) {
-    var st = null, et = null;
-    for (var d = 0; d < numDays; d++) {
-      var arr = dayRows[days[d]];
-      if (r < arr.length) { st = arr[r].startTime; et = arr[r].endTime; break; }
-    }
-    rowTimeLabels.push({ startTime: st, endTime: et });
-  }
-
-  // --- Data rows ---
-  var dataStartRow = headerRow + 1;
-  var groupShiftCount = 0;
-
-  for (var r = 0; r < maxBlockHeight; r++) {
-    var row = dataStartRow + r;
-
-    // Time label
-    var timeLabelText = '';
-    if (r < myMaxRows) {
-      var cur = rowTimeLabels[r];
-      var prev = r > 0 ? rowTimeLabels[r - 1] : null;
-      var show = true;
-      if (prev && prev.startTime === cur.startTime && prev.endTime === cur.endTime) show = false;
-      if (show && cur.startTime !== null && cur.endTime !== null) {
-        timeLabelText = formatTime_(cur.startTime) + '-' + formatTime_(cur.endTime);
-      }
-    }
-    sheet.getRange(row, timeCol).setValue(timeLabelText)
+  for (var d = 0; d < DAYS.length; d++) {
+    var dayStartCol = 2 + d * perDayCols;
+    sheet.getRange(headerRow, dayStartCol, 1, perDayCols).merge()
+      .setValue(DAYS[d])
       .setFontWeight('bold')
-      .setBackground(CONFIG.colors.summaryRow)
-      .setHorizontalAlignment('center');
+      .setBackground(CONFIG.colors.headerBg)
+      .setFontColor(CONFIG.colors.headerFont);
 
-    // Day columns
-    for (var d = 0; d < numDays; d++) {
-      var day = days[d];
-      var arr = dayRows[day];
-      var cell = sheet.getRange(row, timeCol + 1 + d);
+    for (var li = 0; li < locations.length; li++) {
+      sheet.getRange(subHeaderRow, dayStartCol + li)
+        .setValue(locationLabels[locations[li]] || locations[li])
+        .setFontWeight('bold')
+        .setBackground(CONFIG.colors.summaryRow);
+    }
+  }
 
-      if (r >= arr.length) {
-        cell.setValue('');
-        continue;
+  for (var t = 0; t < timeGrid.length; t++) {
+    var row = firstDataRow + t;
+    var tg = timeGrid[t];
+
+    sheet.getRange(row, 1)
+      .setValue(formatTime_(tg.startTime) + '-' + formatTime_(tg.endTime))
+      .setFontWeight('bold')
+      .setBackground(CONFIG.colors.summaryRow);
+
+    for (var d2 = 0; d2 < DAYS.length; d2++) {
+      var dayHe = DAYS[d2];
+      var dayMap = slotIndex[dayHe] || {};
+
+      for (var li2 = 0; li2 < locations.length; li2++) {
+        var loc = locations[li2];
+        var col = 2 + d2 * perDayCols + li2;
+        var cell = sheet.getRange(row, col);
+        var slot = dayMap[loc] && dayMap[loc][slotTimeKey_(tg)];
+
+        if (!slot) {
+          cell.setValue('').setBackground('#F0F0F0');
+          continue;
+        }
+
+        writeScheduleAssignmentCell_(
+          cell, slot, assignments[slot.slotId],
+          masterMap, availability, assignments, slotMap, consecutiveShifts
+        );
+      }
+    }
+  }
+
+  var lastDataRow = firstDataRow + timeGrid.length - 1;
+  mergeConsecutiveSameCoach_(sheet, firstDataRow, timeGrid, assignments, slotIndex, DAYS, locations);
+  return lastDataRow;
+}
+
+/**
+ * Equal net column widths, narrower time column, and a thick left border on the
+ * first column of each day block so Sun–Fri read as separate 3-column panels.
+ */
+function applyUnifiedScheduleLayout_(sheet, headerRow, lastDataRow) {
+  var perDayCols = CONFIG.locations.length;
+  var netColStart = 2;
+  var netColEnd = netColStart + UNIFIED_SCHEDULE_DAYS_.length * perDayCols - 1;
+  var subHeaderRow = headerRow + 1;
+  var numRows = Math.max(lastDataRow - headerRow + 1, 2);
+
+  sheet.setColumnWidth(1, SCHEDULE_TIME_COL_WIDTH_);
+  for (var c = netColStart; c <= netColEnd; c++) {
+    sheet.setColumnWidth(c, SCHEDULE_NET_COL_WIDTH_);
+  }
+
+  for (var d = 0; d < UNIFIED_SCHEDULE_DAYS_.length; d++) {
+    var dayStartCol = netColStart + d * perDayCols;
+    sheet.getRange(headerRow, dayStartCol, numRows, 1)
+      .setBorder(null, true, null, null, null, null, SCHEDULE_DAY_DIVIDER_COLOR_, SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
+    sheet.getRange(subHeaderRow, dayStartCol)
+      .setBackground(SCHEDULE_DAY_EDGE_SUBHEADER_BG_);
+  }
+}
+
+/** Fills one (day, net, hour) cell with the proper value, color, note and dropdown. */
+function writeScheduleAssignmentCell_(cell, slot, asgn, masterMap, availability, assignments, slotMap, consecutiveShifts) {
+  if (!asgn) {
+    cell.setValue('');
+    return;
+  }
+
+  if (asgn.managerSlot) {
+    cell.setValue('מנהל')
+        .setBackground('#D9E2F3')
+        .setFontWeight('bold');
+    cell.setNote('יובל / דורי / גלו — מחליטים ביניהם מי עולה.');
+    return;
+  }
+
+  if (asgn.unfilled) {
+    cell.setValue('⚠')
+        .setBackground(CONFIG.colors.unfilled)
+        .setFontColor('#9C0006');
+    cell.setNote(buildOverrideNote_(slot, null, masterMap, availability, assignments));
+    setOverrideDropdown_(cell, slot, masterMap);
+    return;
+  }
+
+  cell.setValue(asgn.name);
+
+  var consecutiveNote = consecutiveShifts && consecutiveShifts[slot.slotId];
+  var bgColor = CONFIG.colors.ok;
+  if (consecutiveNote) {
+    bgColor = CONFIG.colors.overlap;
+  } else if (asgn.suggested) {
+    bgColor = CONFIG.colors.suggested;
+  }
+  cell.setBackground(bgColor);
+
+  var noteText = buildOverrideNote_(slot, asgn, masterMap, availability, assignments);
+  if (consecutiveNote) noteText = '🟠 ' + consecutiveNote + '\n\n' + noteText;
+  cell.setNote(noteText);
+
+  setOverrideDropdown_(cell, slot, masterMap);
+}
+
+function setOverrideDropdown_(cell, slot, masterMap) {
+  var dropdown = getOverrideCandidates_(slot, masterMap);
+  if (!dropdown || dropdown.length === 0) return;
+  var rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(dropdown, true)
+    .setAllowInvalid(true)
+    .build();
+  cell.setDataValidation(rule);
+}
+
+/** Unique sorted list of {startTime, endTime, block} pairs across all slots. */
+function buildOrderedTimeGrid_(slots) {
+  var seen = {};
+  var grid = [];
+  for (var i = 0; i < slots.length; i++) {
+    var s = slots[i];
+    if (s.startTime === null || s.endTime === null) continue;
+    var key = slotTimeKey_(s);
+    if (seen[key]) continue;
+    seen[key] = true;
+    grid.push({ startTime: s.startTime, endTime: s.endTime, block: s.block });
+  }
+  grid.sort(function(a, b) { return a.startTime - b.startTime; });
+  return grid;
+}
+
+/** Index slots by day → location → timeKey for fast O(1) lookup. */
+function buildSlotIndexByDayLocationTime_(slots) {
+  var index = {};
+  for (var i = 0; i < slots.length; i++) {
+    var s = slots[i];
+    if (!index[s.day]) index[s.day] = {};
+    if (!index[s.day][s.location]) index[s.day][s.location] = {};
+    index[s.day][s.location][slotTimeKey_(s)] = s;
+  }
+  return index;
+}
+
+/**
+ * Merge cells in each (day, net) column when the same coach is assigned to
+ * consecutive adjacent-time slots. Top-left cell value/color/note/validation
+ * are kept; other cells in the run are absorbed by the merge.
+ */
+function mergeConsecutiveSameCoach_(sheet, firstDataRow, timeGrid, assignments, slotIndex, DAYS, locations) {
+  for (var d = 0; d < DAYS.length; d++) {
+    var dayHe = DAYS[d];
+    var dayMap = slotIndex[dayHe] || {};
+
+    for (var li = 0; li < locations.length; li++) {
+      var loc = locations[li];
+      var locMap = dayMap[loc] || {};
+      var col = 2 + d * locations.length + li;
+
+      var runStart = 0;
+      var runEnd = -1;
+      var runName = null;
+
+      for (var t = 0; t < timeGrid.length; t++) {
+        var slot = locMap[slotTimeKey_(timeGrid[t])];
+        var asgn = slot && assignments[slot.slotId];
+        var name = (asgn && asgn.name && !asgn.unfilled && !asgn.managerSlot)
+          ? asgn.name : null;
+
+        var continuous = (
+          name !== null &&
+          name === runName &&
+          t > 0 &&
+          Math.abs(timeGrid[t - 1].endTime - timeGrid[t].startTime) < 0.001
+        );
+
+        if (continuous) {
+          runEnd = t;
+        } else {
+          if (runName !== null && runEnd > runStart) {
+            sheet.getRange(firstDataRow + runStart, col, runEnd - runStart + 1, 1).merge();
+          }
+          runStart = t;
+          runEnd = t;
+          runName = name;
+        }
+      }
+      if (runName !== null && runEnd > runStart) {
+        sheet.getRange(firstDataRow + runStart, col, runEnd - runStart + 1, 1).merge();
+      }
+    }
+  }
+}
+
+/**
+ * Find coach assignments that form "consecutive shifts" (back-to-back blocks):
+ *  - Same coach with morning AND evening on the same day.
+ *  - Same coach with evening on day X AND morning on day X+1.
+ *
+ * Returns: { slotId: explanationHe } — every slotId that participates in such a
+ * back-to-back pair maps to a human-readable Hebrew note. The schedule writer
+ * colors these cells orange and prepends the note to the hover tooltip.
+ */
+function computeConsecutiveShiftsMap_(slots, assignments) {
+  var DAY_ORDER = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
+  var dayIndexOf = {};
+  for (var i = 0; i < DAY_ORDER.length; i++) dayIndexOf[DAY_ORDER[i]] = i;
+
+  var slotById = {};
+  for (var s = 0; s < slots.length; s++) slotById[slots[s].slotId] = slots[s];
+
+  // Group: coach -> dayIndex -> { morning: [slotIds], evening: [slotIds] }
+  var coachShifts = {};
+  var slotIds = Object.keys(assignments);
+  for (var k = 0; k < slotIds.length; k++) {
+    var asgn = assignments[slotIds[k]];
+    if (!asgn || asgn.unfilled || !asgn.name || asgn.managerSlot) continue;
+    var slot = slotById[slotIds[k]];
+    if (!slot) continue;
+    var di = dayIndexOf[slot.day];
+    if (di === undefined) continue;
+    var blockKey = slot.block === 'בוקר' ? 'morning' : (slot.block === 'ערב' ? 'evening' : null);
+    if (!blockKey) continue;
+
+    if (!coachShifts[asgn.name]) coachShifts[asgn.name] = {};
+    if (!coachShifts[asgn.name][di]) coachShifts[asgn.name][di] = { morning: [], evening: [] };
+    coachShifts[asgn.name][di][blockKey].push(slotIds[k]);
+  }
+
+  var out = {};
+  var names = Object.keys(coachShifts);
+  for (var n = 0; n < names.length; n++) {
+    var name = names[n];
+    var byDay = coachShifts[name];
+    var dayKeys = Object.keys(byDay).map(Number).sort(function(a, b) { return a - b; });
+
+    for (var d = 0; d < dayKeys.length; d++) {
+      var di2 = dayKeys[d];
+      var dayHe = DAY_ORDER[di2];
+      var morn = byDay[di2].morning;
+      var even = byDay[di2].evening;
+
+      if (morn.length > 0 && even.length > 0) {
+        var mornSummary = summarizeBlockSlotIds_(morn, slotById);
+        var evenSummary = summarizeBlockSlotIds_(even, slotById);
+        var noteSameDay = 'רצף משמרות צמודות — ' + name + ': בוקר (' + mornSummary +
+          ') + ערב (' + evenSummary + ') ביום ' + dayHe + '.';
+        addConsecutiveNote_(out, morn, noteSameDay);
+        addConsecutiveNote_(out, even, noteSameDay);
       }
 
-      var slot = arr[r];
-      var asgn = assignments[slot.slotId];
-
-      if (!asgn) {
-        cell.setValue('');
-      } else if (asgn.managerSlot) {
-        cell.setValue('מנהל')
-            .setBackground('#D9E2F3')
-            .setFontWeight('bold')
-            .setHorizontalAlignment('center')
-            .setVerticalAlignment('middle');
-        cell.setNote('יובל / דורי / גלו — מחליטים ביניהם מי עולה.');
-      } else if (asgn.unfilled) {
-        cell.setValue('⚠');
-        cell.setBackground(CONFIG.colors.unfilled)
-            .setFontColor('#9C0006')
-            .setHorizontalAlignment('center');
-
-        var noteText = buildOverrideNote_(slot, null, masterMap, availability, assignments);
-        cell.setNote(noteText);
-
-        var dropdownNames = getOverrideCandidates_(slot, masterMap);
-        if (dropdownNames.length > 0) {
-          var rule = SpreadsheetApp.newDataValidation()
-            .requireValueInList(dropdownNames, true)
-            .setAllowInvalid(true)
-            .build();
-          cell.setDataValidation(rule);
-        }
-      } else {
-        cell.setValue(asgn.name);
-        groupShiftCount++;
-
-        var bgColor = CONFIG.colors.ok;
-        if (asgn.suggested) {
-          bgColor = CONFIG.colors.suggested;
-        } else if (isJuniorAloneForSlot_(slot, assignments, slotMap)) {
-          bgColor = CONFIG.colors.noSenior;
-        }
-        cell.setBackground(bgColor)
-            .setHorizontalAlignment('center')
-            .setVerticalAlignment('middle');
-
-        var noteText = buildOverrideNote_(slot, asgn, masterMap, availability, assignments);
-        cell.setNote(noteText);
-
-        var dropdownNames = getOverrideCandidates_(slot, masterMap);
-        if (dropdownNames.length > 0) {
-          var rule = SpreadsheetApp.newDataValidation()
-            .requireValueInList(dropdownNames, true)
-            .setAllowInvalid(true)
-            .build();
-          cell.setDataValidation(rule);
+      var nextDi = di2 + 1;
+      if (nextDi < DAY_ORDER.length && byDay[nextDi]) {
+        var nextDayHe = DAY_ORDER[nextDi];
+        var nextMorn = byDay[nextDi].morning;
+        if (even.length > 0 && nextMorn.length > 0) {
+          var evenSummaryCross = summarizeBlockSlotIds_(even, slotById);
+          var nextMornSummary = summarizeBlockSlotIds_(nextMorn, slotById);
+          var noteCross = 'רצף משמרות צמודות — ' + name + ': ערב ' + dayHe + ' (' + evenSummaryCross +
+            ') + בוקר ' + nextDayHe + ' (' + nextMornSummary + ').';
+          addConsecutiveNote_(out, even, noteCross);
+          addConsecutiveNote_(out, nextMorn, noteCross);
         }
       }
     }
   }
 
-  return groupShiftCount;
+  return out;
+}
+
+function addConsecutiveNote_(map, ids, note) {
+  for (var i = 0; i < ids.length; i++) {
+    var existing = map[ids[i]];
+    map[ids[i]] = existing ? existing + '\n' + note : note;
+  }
+}
+
+/**
+ * Hebrew summary of assignments in one half-day block: "רשת 1 7:00-12:00, רשת 2 …".
+ */
+function summarizeBlockSlotIds_(slotIds, slotById) {
+  var locationLabels = CONFIG.locationNames || {};
+  var byLoc = {};
+  for (var i = 0; i < slotIds.length; i++) {
+    var slot = slotById[slotIds[i]];
+    if (!slot || slot.startTime === null || slot.endTime === null) continue;
+    var locLabel = locationLabels[slot.location] || slot.location;
+    if (!byLoc[locLabel]) {
+      byLoc[locLabel] = { minStart: slot.startTime, maxEnd: slot.endTime };
+    } else {
+      if (slot.startTime < byLoc[locLabel].minStart) byLoc[locLabel].minStart = slot.startTime;
+      if (slot.endTime > byLoc[locLabel].maxEnd) byLoc[locLabel].maxEnd = slot.endTime;
+    }
+  }
+  var keys = Object.keys(byLoc).sort();
+  var parts = [];
+  for (var k = 0; k < keys.length; k++) {
+    var w = byLoc[keys[k]];
+    parts.push(keys[k] + ' ' + formatTime_(w.minStart) + '-' + formatTime_(w.maxEnd));
+  }
+  return parts.length ? parts.join(', ') : '—';
 }
 
 // ============================================================
@@ -300,7 +440,8 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
     var emp = masterMap[names[i]];
     if (!emp) continue;
 
-    var target = stat.shiftTarget || getShiftTarget(names[i], masterMap, availability);
+    var targetMax = stat.shiftTarget || getShiftTarget(names[i], masterMap, availability);
+    var targetMin = getShiftTargetMin_(names[i], masterMap);
     var received = stat.shiftsCount || 0;
     var availableCount = countAvailableSlots_(names[i], availability, slots, emp);
     var availableDays = countAvailableDays_(names[i], availability);
@@ -308,23 +449,28 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
     var satisfaction = '';
     if (availableDays === 0) {
       satisfaction = 'לא הגיש זמינות';
-    } else if (received === target && target > 0) {
-      satisfaction = 'בול =)';
-    } else if (received > target && target > 0) {
+    } else if (targetMax > 0 && received > targetMax) {
       satisfaction = 'מעל היעד';
+    } else if (received >= availableDays && targetMin > 0 && received < targetMin) {
+      satisfaction = 'קיבל מקסימום אפשרי';
+    } else if (targetMin > 0 && received < targetMin) {
+      satisfaction = 'מתחת ליעד';
+    } else if (targetMax > 0 && received >= targetMin && received <= targetMax) {
+      satisfaction = 'ביעד =)';
     } else if (received >= availableDays) {
       satisfaction = 'קיבל מקסימום אפשרי';
-    } else if (target > 0 && received >= target - 1) {
+    } else if (targetMax > 0 && received >= targetMax - 1) {
       satisfaction = 'כמעט מלא';
     } else {
       satisfaction = 'קיבל פחות =(';
     }
 
     var dist = getBlockDistribution_(names[i], employeeStats);
+    var targetDisplay = formatShiftTargetRange_(targetMin, targetMax);
 
     sheet.getRange(row, 1).setValue(stat.name);
     sheet.getRange(row, 2).setValue(rankToHebrew(stat.rank));
-    sheet.getRange(row, 3).setValue(target > 0 ? target : '');
+    sheet.getRange(row, 3).setValue(targetDisplay);
     sheet.getRange(row, 4).setValue(availableDays);
     sheet.getRange(row, 5).setValue(availableCount);
     sheet.getRange(row, 6).setValue(received);
@@ -333,12 +479,14 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
     sheet.getRange(row, 9).setValue(satisfaction);
 
     var satCell = sheet.getRange(row, 9);
-    if (satisfaction === 'בול =)' || satisfaction === 'קיבל מקסימום אפשרי') {
+    if (satisfaction === 'ביעד =)' || satisfaction === 'קיבל מקסימום אפשרי') {
       satCell.setBackground('#C6EFCE').setFontColor('#006100');
     } else if (satisfaction === 'מעל היעד') {
       satCell.setBackground('#FFEB9C').setFontColor('#9C6500');
     } else if (satisfaction === 'כמעט מלא') {
       satCell.setBackground('#FFEB9C').setFontColor('#9C6500');
+    } else if (satisfaction === 'מתחת ליעד') {
+      satCell.setBackground('#FFC7CE').setFontColor('#9C0006');
     } else if (satisfaction === 'קיבל פחות =(') {
       satCell.setBackground('#FFC7CE').setFontColor('#9C0006');
     } else if (satisfaction === 'לא הגיש זמינות') {
@@ -354,19 +502,22 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
   sheet.getRange(row, 1).setValue('מקרא צבעים בלו"ז:').setFontWeight('bold');
   row++;
   sheet.getRange(row, 1).setValue('🟢');
-  sheet.getRange(row, 2).setValue('עובד שובץ — הכל תקין');
+  sheet.getRange(row, 2).setValue('שובץ בתוך החלון שהמאמן הגיש, ללא רצף משמרות — תקין.');
   sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.ok);
   row++;
   sheet.getRange(row, 1).setValue('🔵');
-  sheet.getRange(row, 2).setValue('הצעת המערכת — העובד לא סימן זמינות, אבל מתאים. צריך אישור.');
+  sheet.getRange(row, 2).setValue('הצעת המערכת — שובץ מחוץ לחלון הזמינות שהגיש. דורש תיאום מולו. הסיבה לבחירה מופיעה בהערה.');
   sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.suggested);
   row++;
-  sheet.getRange(row, 1).setValue('🟡');
-  sheet.getRange(row, 2).setValue('עובד חדש (ג\') בלי עובד מנוסה במשמרת');
-  sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.noSenior);
+  sheet.getRange(row, 1).setValue('🟠');
+  sheet.getRange(row, 2).setValue(
+    'רצף משמרות צמודות — בוקר+ערב באותו יום או ערב→בוקר למחרת. ' +
+    'לא מסמן כמה אימונים באותה משמרת (בוקר או ערב) — רק חצי יום אחד מול השני. צריך תיאום עם המאמן.'
+  );
+  sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.overlap);
   row++;
   sheet.getRange(row, 1).setValue('🔴');
-  sheet.getRange(row, 2).setValue('משמרת לא מולאה — צריך שיבוץ ידני');
+  sheet.getRange(row, 2).setValue('משמרת לא מולאה — צריך שיבוץ ידני.');
   sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.unfilled);
 }
 
@@ -433,7 +584,11 @@ function buildOverrideNote_(slot, currentAsgn, masterMap, availability, assignme
     var curHistory = historyScores[currentAsgn.name];
     var curScoreStr = curHistory ? ' | ציון היסטורי: ' + curHistory + '%' : '';
     lines.push('✅ משובץ: ' + currentAsgn.name + ' (דרגה ' + curRank + ')' + curScoreStr);
-    if (currentAsgn.suggested) lines.push('💙 הצעת מערכת — צריך אישור');
+    if (currentAsgn.suggested) {
+      var reason = currentAsgn.suggestedReason
+        || 'שובץ מחוץ לחלון הזמינות שהמאמן הגיש בטופס. דורש תיאום מולו (לרוב כדי לעמוד ביעד השבועי).';
+      lines.push('💙 הצעת מערכת: ' + reason);
+    }
   } else {
     lines.push('⚠ משמרת ריקה — צריך שיבוץ ידני');
   }
@@ -481,33 +636,26 @@ function buildOverrideNote_(slot, currentAsgn, masterMap, availability, assignme
       hasConflict = true;
     }
 
-    if (emp.isGlobal || emp.isPriority) flags.push('עדיפות');
 
-    var isAvail = false;
-    if (availability && availability[name]) {
-      var dayAvail = availability[name][slot.day];
-      if (dayAvail) {
-        for (var b = 0; b < dayAvail.length; b++) {
-          if (dayAvail[b] === slot.block) { isAvail = true; break; }
-        }
-      }
-    }
+    var isAvail = isAvailableForSlot(name, slot, availability);
     if (!isAvail && !hasConflict) flags.push('❌ לא סימן זמינות');
 
-    // How far from target?
+    // How far from target? Target is in SHIFTS (day×block), not trainings.
     var target = getShiftTarget(name, masterMap, availability);
     var currentShifts = 0;
+    var seenShifts = {};
     for (var si = 0; si < allSlotIds.length; si++) {
       var sa = assignments[allSlotIds[si]];
-      if (sa && sa.name === name && !sa.unfilled && !sa.managerSlot) currentShifts++;
+      if (!sa || sa.name !== name || sa.unfilled || sa.managerSlot) continue;
+      var parts = allSlotIds[si].split('_');
+      var shiftKey = parts[1] + '|' + parts[2];
+      if (seenShifts[shiftKey]) continue;
+      seenShifts[shiftKey] = true;
+      currentShifts++;
     }
     var underTarget = target > 0 && currentShifts < target;
     if (underTarget && !hasConflict) {
       flags.push('📊 ' + currentShifts + '/' + target + ' מהיעד');
-    }
-
-    if (wouldJuniorBeAloneAtSlot_(slot, emp.rank, assignments, slotMap)) {
-      flags.push('⚠ יהיה א\'/ב\' לבד (ללא חפיפה עם ג\'/ד\')');
     }
 
     var rankLabel = rankToHebrew(emp.rank);
@@ -528,7 +676,7 @@ function buildOverrideNote_(slot, currentAsgn, masterMap, availability, assignme
     var bScore = b.hasConflict ? 3 : (b.isAvail ? 0 : (b.underTarget ? 1 : 2));
     if (aScore !== bScore) return aScore - bScore;
     if (a.underTarget !== b.underTarget) return b.underTarget ? 1 : -1;
-    return b.rank - a.rank;
+    return a.rank - b.rank;
   });
 
   var shown = Math.min(alts.length, 12);
@@ -571,8 +719,8 @@ function countAvailableDays_(name, availability) {
   var count = 0;
   var days = Object.keys(avail);
   for (var d = 0; d < days.length; d++) {
-    var dayBlocks = avail[days[d]];
-    if (dayBlocks && dayBlocks.length > 0) count++;
+    var dayData = avail[days[d]];
+    if (dayData && dayData.length > 0) count++;
   }
   return count;
 }
@@ -586,40 +734,45 @@ function countAvailableSlots_(name, availability, slots, emp) {
   for (var s = 0; s < slots.length; s++) {
     var slot = slots[s];
     if (slot.block === 'מנהל') continue;
-    if (emp.locationRestriction && emp.locationRestriction !== slot.location) continue;
+    if (emp && emp.locationRestriction && emp.locationRestriction !== slot.location) continue;
     var dayAvail = avail[slot.day];
     if (!dayAvail || dayAvail.length === 0) continue;
 
-    var hasBlock = false;
-    for (var b = 0; b < dayAvail.length; b++) {
-      if (dayAvail[b] === slot.block) { hasBlock = true; break; }
+    var covered = false;
+    if (typeof dayAvail[0] === 'string') {
+      for (var b = 0; b < dayAvail.length; b++) {
+        if (dayAvail[b] === slot.block) { covered = true; break; }
+      }
+    } else {
+      covered = slotCoveredByMentorRanges_(slot, dayAvail);
     }
-    if (!hasBlock) continue;
+    if (!covered) continue;
 
-    var key = slot.day + '_' + slot.block;
+    // Count unique (day, block) — one shift = morning OR evening half-day.
+    var key = slot.day + '|' + slot.block;
     if (!seen[key]) { seen[key] = true; count++; }
   }
   return count;
 }
 
-/** @deprecated — use isJuniorAloneForSlot_ / hasSeniorTimeCoverageForSlot_ */
-function hasSeniorInAssignedBlock_(location, day, block, assignments, masterMap) {
-  var slotMap = buildSlotMap_(loadShiftTemplates());
-  var keys = Object.keys(assignments);
-  for (var i = 0; i < keys.length; i++) {
-    if (keys[i].indexOf(location + '_' + day + '_' + block + '_') !== 0) continue;
-    var slot = slotMap[keys[i]];
-    if (slot && isJuniorAloneForSlot_(slot, assignments, slotMap)) return false;
-  }
-  return true;
+function rankToHebrew(rank) {
+  return String(normalizeMentorRank_(rank));
 }
 
-function rankToHebrew(rank) {
-  if (rank === 4) return 'ד';
-  if (rank === 3) return 'ג';
-  if (rank === 2) return 'ב';
-  if (rank === 1) return 'א';
-  return String(rank);
+/**
+ * Format the weekly target as "min-max" (e.g., "1-2"), or just the single
+ * number when both bounds are equal, or "" when neither is set. Min === 0 is a
+ * valid bound (e.g., "0-1" for coaches who often skip the week).
+ */
+function formatShiftTargetRange_(min, max) {
+  var hasMin = (typeof min === 'number' && !isNaN(min) && min >= 0);
+  var hasMax = (typeof max === 'number' && !isNaN(max) && max >= 0);
+  if (!hasMin && !hasMax) return '';
+  if (hasMin && hasMax) {
+    if (min === max) return String(min);
+    return min + '-' + max;
+  }
+  return String(hasMax ? max : min);
 }
 
 function formatTime_(decimalHours) {
@@ -634,45 +787,42 @@ function formatTime_(decimalHours) {
 // ============================================================
 
 /**
- * Menu: "הפץ משמרות" — writes Share_Export, syncs names to the distribution sheet, logs ShiftHistory.
+ * Menu: "הפץ לו"ז וסגור שבוע" — writes Share_Export, logs ShiftHistory, archives form responses.
  */
 function shareSchedule() {
   showRtlConfirmDialog_(
     'shareSchedule',
-    '📤 הפץ משמרות',
-    'מה זה עושה: בונה גיליון נקי להפצה ומעדכן את היסטוריית השיבוצים לפי הלו"ז הנוכחי בגיליון.\n\n'
-      + 'טבלאות:\n'
-      + '• קורא: בעיקר "' + CONFIG.sheets.schedule + '".\n'
-      + '• כותב: "' + CONFIG.sheets.shareExport + '" (נבנה מחדש), מעדכן "' + CONFIG.sheets.shiftHistory + '".\n\n'
+    '📤 הפץ לו"ז וסגור שבוע',
+    'מה זה עושה: שלב הסיום של השבוע —\n'
+      + '• בונה את "' + CONFIG.sheets.shareExport + '" — תצוגה נקייה של הלו"ז (להפצה ב-WhatsApp)\n'
+      + '• רושם את שיבוצי השבוע ב-"' + CONFIG.sheets.shiftHistory + '" לטובת מעקב הוגנות\n'
+      + '• מארכב את תשובות הטופס הנוכחיות ומנקה את "' + CONFIG.sheets.responses + '" לקראת השבוע הבא\n\n'
+      + '⚠ דורס את "' + CONFIG.sheets.shareExport + '" ומנקה את "' + CONFIG.sheets.responses + '".\n'
+      + 'הרץ רק אחרי שהלו"ז ב-"' + CONFIG.sheets.schedule + '" סופי.\n\n'
       + 'להמשיך?'
   );
 }
 
 function shareScheduleRun_() {
-  var ui = SpreadsheetApp.getUi();
   try {
     var data = buildShareableScheduleData_();
     if (!data) {
-      ui.alert(
-        rtlUiText_('אין לו"ז'),
-        rtlUiText_('לא נמצא גיליון Schedule, או שלא מולאו במשבצות.'),
-        ui.ButtonSet.OK
-      );
-      return;
+      throw new Error('לא נמצא גיליון Schedule, או שלא מולאו במשבצות.');
     }
 
     exportShareableScheduleToSheet_(data);
-
     logHistoryFromSheet_();
-
-    // Archive raw form responses + clear for next week (best-effort, does not block sharing).
     archiveAndClearFormResponsesLikeShare_();
 
-    SpreadsheetApp.getActive()
-      .toast('הלו"ז מוכן בטאב "' + CONFIG.sheets.shareExport + '" — צלמו מסך ושלחו לעובדים!\nההיסטוריה עודכנה ב-ShiftHistory.', '📤 הפצת משמרות', 8);
+    return menuActionSuccess_(
+      '📤 הלו"ז הופץ והשבוע נסגר',
+      '• "' + CONFIG.sheets.shareExport + '" מוכן להפצה.\n'
+        + '• "' + CONFIG.sheets.shiftHistory + '" עודכן עם שיבוצי השבוע.\n'
+        + '• תשובות הטופס אורכבו, "' + CONFIG.sheets.responses + '" נוקה לקראת השבוע הבא.'
+    );
   } catch (e) {
     Logger.log('shareSchedule: ' + e + (e && e.stack ? '\n' + e.stack : ''));
-    ui.alert(rtlUiText_('שגיאה'), rtlUiText_(String(e.message || e)), ui.ButtonSet.OK);
+    throw new Error(String(e.message || e));
   }
 }
 
@@ -888,8 +1038,6 @@ function logHistoryFromSheet_() {
       name: names[i],
       rank: masterMap[names[i]].rank,
       shiftsCount: 0, morningCount: 0, eveningCount: 0,
-      isGlobal: masterMap[names[i]].isGlobal,
-      isPriority: masterMap[names[i]].isPriority,
       shiftTarget: getShiftTarget(names[i], masterMap, availability)
     };
   }
@@ -1641,8 +1789,95 @@ function escapeHtmlForShare_(s) {
   return s;
 }
 
+/** True when row 1 col 1 is the unified grid time header ("שעה"). */
+function isUnifiedScheduleSheet_(data) {
+  if (!data || data.length < 3) return false;
+  return String(data[0][0]).trim() === 'שעה';
+}
+
 /**
- * After manual schedule edits: refresh cell notes and fairness table (no costs).
+ * Read coach names from the unified Schedule grid (handles merged cells via getDisplayValue).
+ * @returns {Object} slotId → assignment object
+ */
+function readUnifiedScheduleAssignments_(sheet, timeGrid, slotIndex, masterMap, warnings) {
+  var locations = CONFIG.locations;
+  var perDayCols = locations.length;
+  var firstDataRow = 3;
+  var assignments = {};
+  warnings = warnings || [];
+
+  for (var t = 0; t < timeGrid.length; t++) {
+    var row = firstDataRow + t;
+    for (var d = 0; d < UNIFIED_SCHEDULE_DAYS_.length; d++) {
+      var dayHe = UNIFIED_SCHEDULE_DAYS_[d];
+      var dayMap = slotIndex[dayHe] || {};
+
+      for (var li = 0; li < locations.length; li++) {
+        var loc = locations[li];
+        var col = 2 + d * perDayCols + li;
+        var slot = dayMap[loc] && dayMap[loc][slotTimeKey_(timeGrid[t])];
+        if (!slot) continue;
+
+        var cellValue = String(sheet.getRange(row, col).getDisplayValue()).trim();
+        if (!cellValue) continue;
+
+        if (cellValue === '⚠') {
+          assignments[slot.slotId] = { unfilled: true };
+          continue;
+        }
+        if (cellValue === 'מנהל') {
+          assignments[slot.slotId] = { managerSlot: true, name: 'מנהל', unfilled: false };
+          continue;
+        }
+
+        var emp = masterMap[cellValue];
+        if (!emp) {
+          warnings.push(cellValue + ' — לא נמצא ב-MasterData');
+          continue;
+        }
+        assignments[slot.slotId] = { name: cellValue, rank: emp.rank, unfilled: false };
+      }
+    }
+  }
+  return assignments;
+}
+
+/**
+ * Reapply green/orange/blue backgrounds and hover notes on every filled unified-grid cell.
+ */
+function reapplyUnifiedScheduleCellStyles_(
+  sheet, timeGrid, slotIndex, assignments, masterMap, availability, slotMap, consecutiveShifts
+) {
+  var locations = CONFIG.locations;
+  var perDayCols = locations.length;
+  var firstDataRow = 3;
+
+  for (var t = 0; t < timeGrid.length; t++) {
+    var row = firstDataRow + t;
+    for (var d = 0; d < UNIFIED_SCHEDULE_DAYS_.length; d++) {
+      var dayHe = UNIFIED_SCHEDULE_DAYS_[d];
+      var dayMap = slotIndex[dayHe] || {};
+
+      for (var li = 0; li < locations.length; li++) {
+        var loc = locations[li];
+        var col = 2 + d * perDayCols + li;
+        var slot = dayMap[loc] && dayMap[loc][slotTimeKey_(timeGrid[t])];
+        if (!slot) continue;
+
+        var asgn = assignments[slot.slotId];
+        if (!asgn && !sheet.getRange(row, col).getDisplayValue()) continue;
+
+        writeScheduleAssignmentCell_(
+          sheet.getRange(row, col), slot, asgn,
+          masterMap, availability, assignments, slotMap, consecutiveShifts
+        );
+      }
+    }
+  }
+}
+
+/**
+ * After manual schedule edits: refresh cell colors/notes and fairness table.
  * @returns {{ok:boolean, message:string, warnings:string[]}}
  */
 function refreshScheduleFromSheet_() {
@@ -1659,91 +1894,26 @@ function refreshScheduleFromSheet_() {
   var notes = responseData.notes || {};
   var data = sheet.getDataRange().getValues();
   var slotMap = buildSlotMap_(slots);
-  var currentAssignments = {};
   var warnings = [];
 
-  var locations = CONFIG.locations;
-  for (var loc = 0; loc < locations.length; loc++) {
-    var location = locations[loc];
-    var locationLabel = CONFIG.locationNames[location] || location;
-    var locationSlots = slots.filter(function(s) { return s.location === location; });
-    if (locationSlots.length === 0) continue;
-
-    var headerRow = -1;
-    for (var r = 0; r < data.length; r++) {
-      for (var c = 0; c < data[r].length; c++) {
-        if (String(data[r][c]).trim() === locationLabel) {
-          headerRow = r;
-          break;
-        }
-      }
-      if (headerRow >= 0) break;
-    }
-    if (headerRow < 0) continue;
-
-    for (var g = 0; g < DAY_GROUPS_.length; g++) {
-      var days = DAY_GROUPS_[g];
-      var groupStartCol = -1;
-      for (var c = 0; c < data[headerRow].length; c++) {
-        if (String(data[headerRow][c]).trim() === days[0]) {
-          groupStartCol = c;
-          break;
-        }
-      }
-      if (groupStartCol < 0) continue;
-
-      var groupSlots = locationSlots.filter(function(s) {
-        return days.indexOf(s.day) >= 0;
-      });
-
-      var dayRows = {};
-      for (var d = 0; d < days.length; d++) {
-        var day = days[d];
-        var arr = [];
-        for (var s = 0; s < groupSlots.length; s++) {
-          if (groupSlots[s].day !== day) continue;
-          arr.push(groupSlots[s]);
-        }
-        arr.sort(function(a, b) {
-          return (a.startTime || 0) - (b.startTime || 0) || (a.endTime || 0) - (b.endTime || 0);
-        });
-        dayRows[day] = arr;
-      }
-
-      var dataStartRow = headerRow + 1;
-      for (var d = 0; d < days.length; d++) {
-        var day = days[d];
-        var arr = dayRows[day];
-        for (var r = 0; r < arr.length; r++) {
-          var slot = arr[r];
-          var cellRow = dataStartRow + r;
-          var cellCol = groupStartCol + d;
-          var cellValue = String(data[cellRow] ? data[cellRow][cellCol] || '' : '').trim();
-
-          if (!cellValue || cellValue === '⚠' || cellValue === 'מנהל') {
-            if (cellValue === '⚠') {
-              sheet.getRange(cellRow + 1, cellCol + 1).setNote(
-                buildOverrideNote_(slot, null, masterMap, availability, currentAssignments)
-              );
-            }
-            continue;
-          }
-
-          var emp = masterMap[cellValue];
-          if (!emp) {
-            warnings.push(cellValue + ' — לא נמצא ב-MasterData');
-            continue;
-          }
-
-          var asgn = { name: cellValue, rank: emp.rank, unfilled: false };
-          currentAssignments[slot.slotId] = asgn;
-          sheet.getRange(cellRow + 1, cellCol + 1).setNote(
-            buildOverrideNote_(slot, asgn, masterMap, availability, currentAssignments)
-          );
-        }
-      }
-    }
+  if (!isUnifiedScheduleSheet_(data)) {
+    return {
+      ok: false,
+      message: 'גיליון הלו"ז אינו בפריסה המאוחדת (שורה 1: "שעה"). הרץ שיבוץ שבועי לבניית הלו"ז.',
+      warnings: warnings
+    };
   }
+
+  var timeGrid = buildOrderedTimeGrid_(slots);
+  var slotIndex = buildSlotIndexByDayLocationTime_(slots);
+  var currentAssignments = readUnifiedScheduleAssignments_(sheet, timeGrid, slotIndex, masterMap, warnings);
+  var consecutiveShifts = computeConsecutiveShiftsMap_(slots, currentAssignments);
+  reapplyUnifiedScheduleCellStyles_(
+    sheet, timeGrid, slotIndex, currentAssignments, masterMap, availability, slotMap, consecutiveShifts
+  );
+
+  var lastDataRow = 2 + timeGrid.length;
+  applyUnifiedScheduleLayout_(sheet, 1, lastDataRow);
 
   var empStats = {};
   var allNames = Object.keys(masterMap);
@@ -1754,9 +1924,7 @@ function refreshScheduleFromSheet_() {
       shiftsCount: 0,
       morningCount: 0,
       eveningCount: 0,
-      shiftTarget: getShiftTarget(allNames[i], masterMap, availability),
-      isGlobal: masterMap[allNames[i]].isGlobal,
-      isPriority: masterMap[allNames[i]].isPriority
+      shiftTarget: getShiftTarget(allNames[i], masterMap, availability)
     };
   }
   var asgnKeys = Object.keys(currentAssignments);

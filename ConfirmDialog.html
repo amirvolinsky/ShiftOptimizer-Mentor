@@ -28,6 +28,8 @@
       word-wrap: break-word;
       unicode-bidi: plaintext;
       text-align: right;
+      max-height: 420px;
+      overflow-y: auto;
     }
     .actions {
       margin-top: 22px;
@@ -82,10 +84,10 @@
   </style>
 </head>
 <body>
-  <h1><?= title ?></h1>
-  <div class="body-text"><?= message ?></div>
+  <h1 id="dlgTitle"><?= title ?></h1>
+  <div class="body-text" id="dlgBody"><?= message ?></div>
   <div id="err"></div>
-  <div class="actions">
+  <div class="actions" id="actions">
     <button type="button" id="btnOk" class="primary" onclick="onConfirm()">אישור</button>
     <button type="button" id="btnCancel" onclick="google.script.host.close()">ביטול</button>
   </div>
@@ -108,6 +110,22 @@
       }
     }
 
+    function showResult(result) {
+      setBusy(false);
+      locked = false;
+      var title = (result && result.title) ? result.title : '✅ הושלם';
+      var message = (result && result.message) ? result.message : 'הפעולה הסתיימה בהצלחה.';
+      document.getElementById('dlgTitle').textContent = title;
+      document.getElementById('dlgBody').textContent = message;
+      document.getElementById('err').textContent = '';
+      document.getElementById('btnOk').style.display = 'none';
+      var cancel = document.getElementById('btnCancel');
+      cancel.textContent = 'סגור';
+      cancel.disabled = false;
+      cancel.classList.add('primary');
+      cancel.onclick = function () { google.script.host.close(); };
+    }
+
     function onConfirm() {
       if (locked) return;
       locked = true;
@@ -115,7 +133,11 @@
       setBusy(true);
 
       google.script.run
-        .withSuccessHandler(function () {
+        .withSuccessHandler(function (result) {
+          if (result && result.ok) {
+            showResult(result);
+            return;
+          }
           google.script.host.close();
         })
         .withFailureHandler(function (err) {

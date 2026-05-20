@@ -1,12 +1,12 @@
 /**
  * Reads employee master data from the MasterData sheet.
  *
- * Expected columns:
- *   Name | Rank (1–4) | IsPriority | MinShifts | MaxShifts | LocationRestriction | RequestedShifts | BlockRestriction
- *
- * Rank: 1 = א (entry), 4 = ד (most senior). Used for rules and morning-score.
- * IsPriority: TRUE = must receive MinShifts per week (mentors/leads — not salary-related).
- * LocationRestriction: blank = both sites, or "SiteA" / "SiteB"
+ * Columns:
+ *   Name      | Rank (1–3, 1 = best, default 1 if missing)
+ *   WeeklyMin | WeeklyMax — typical weekly shift target window (a "shift" =
+ *                           morning OR evening half-day block). Both optional;
+ *                           default to 0 / unlimited respectively.
+ *   LocationRestriction    — optional, locks a coach to a specific net.
  */
 function loadMasterData() {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.sheets.masterData);
@@ -15,32 +15,70 @@ function loadMasterData() {
   var data = sheet.getDataRange().getValues();
   if (data.length < 2) throw new Error('MasterData sheet is empty (no data rows).');
 
+  var cols = mapMasterDataColumns_(data[0]);
   var employees = {};
 
   for (var i = 1; i < data.length; i++) {
-    var name = String(data[i][0]).trim();
+    var name = String(data[i][cols.name]).trim();
     if (!name) continue;
 
-    var rank = parseInt(data[i][1], 10) || 1;
-    var isPriority = String(data[i][2]).trim().toUpperCase() === 'TRUE';
-    var minShifts = parseInt(data[i][3], 10) || 0;
-    var maxShifts = parseInt(data[i][4], 10) || 0;
-    var locationRestriction = String(data[i][5] || '').trim();
-    var requestedShifts = parseInt(data[i][6], 10) || 0;
-    var blockRestriction = String(data[i][7] || '').trim();
+    var rank = normalizeMentorRank_(data[i][cols.rank]);
+    var locationRestriction = cols.location >= 0
+      ? String(data[i][cols.location] || '').trim()
+      : '';
+
+    var weeklyMin = cols.weeklyMin >= 0 ? parseShiftTargetNumber_(data[i][cols.weeklyMin], 0) : 0;
+    var weeklyMax = cols.weeklyMax >= 0 ? parseShiftTargetNumber_(data[i][cols.weeklyMax], null) : null;
+    if (weeklyMax !== null && weeklyMax < weeklyMin) weeklyMax = weeklyMin;
 
     employees[name] = {
       name: name,
       rank: rank,
-      isGlobal: isPriority,
-      isPriority: isPriority,
-      minShifts: minShifts,
-      maxShifts: maxShifts,
       locationRestriction: locationRestriction || '',
-      requestedShifts: requestedShifts,
-      blockRestriction: blockRestriction || ''
+      weeklyMin: weeklyMin,
+      weeklyMax: weeklyMax
     };
   }
 
   return employees;
+}
+
+/**
+ * Parses a numeric shift-target cell. Empty / non-numeric → `fallback`.
+ */
+function parseShiftTargetNumber_(val, fallback) {
+  if (val === null || val === undefined || val === '') return fallback;
+  var n = Number(val);
+  if (isNaN(n) || n < 0) return fallback;
+  return Math.floor(n);
+}
+
+/**
+ * @param {Array} headerRow
+ * @returns {{name:number, rank:number, location:number, weeklyMin:number, weeklyMax:number}}
+ */
+function mapMasterDataColumns_(headerRow) {
+  var headers = [];
+  for (var h = 0; h < headerRow.length; h++) {
+    headers.push(String(headerRow[h]).trim());
+  }
+
+  function idx(name, fallback) {
+    var i = headers.indexOf(name);
+    return i >= 0 ? i : fallback;
+  }
+
+  return {
+    name: idx('Name', 0),
+    rank: idx('Rank', 1),
+    location: idx('LocationRestriction', -1),
+    weeklyMin: idx('WeeklyMin', -1),
+    weeklyMax: idx('WeeklyMax', -1)
+  };
+}
+
+/** Weekly shift cap (from Rules when not in basicMode). */
+function getEmployeeMaxShifts_(rules) {
+  if (isBasicMode_()) return 99;
+  return (rules && rules.max_shifts_per_week) || 6;
 }
