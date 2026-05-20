@@ -560,10 +560,26 @@ function getCoachRankForDemo_(coachName) {
 }
 
 /**
+ * Coaches who, in real life, submit a tighter 3–4 shifts of availability
+ * regardless of their rank-typical pattern. Demo pins them to exactly 3 or 4
+ * picks total and skips the Friday bonus so the cap is hard, not approximate.
+ */
+var FAKE_MENTOR_HARD_CAP_3_TO_4_ = ['יובל כץ', 'תומר אסף'];
+
+function isMentorHardCap3To4_(coachName) {
+  for (var i = 0; i < FAKE_MENTOR_HARD_CAP_3_TO_4_.length; i++) {
+    if (FAKE_MENTOR_HARD_CAP_3_TO_4_[i] === coachName) return true;
+  }
+  return false;
+}
+
+/**
  * How many (day, block) availability picks a fake coach submits this week.
  * Rank 1: usually 1 (איתם 2–3). Rank 2: 4–5. Rank 3: 3–4. Rank 4: rarely 1.
+ * Coaches in FAKE_MENTOR_HARD_CAP_3_TO_4_ override their rank with a 3–4 cap.
  */
 function pickFakeWeeklyPickCount_(rank, coachName, rng) {
+  if (isMentorHardCap3To4_(coachName)) return 3 + Math.floor(rng() * 2);
   if (rank === 1) {
     if (coachName === 'איתם') return 2 + Math.floor(rng() * 2);
     return 1;
@@ -602,7 +618,7 @@ function pickFakeMentorWeek_(coachName, seed) {
 
   var picks = weekdayPairs.slice(0, Math.min(n, weekdayPairs.length));
 
-  if (fridayPairs.length > 0) {
+  if (fridayPairs.length > 0 && !isMentorHardCap3To4_(coachName)) {
     var rngFri = makeMentorFakeRng_(coachName + '|friCoin', seed);
     if (rngFri() < FAKE_MENTOR_FRIDAY_INCLUDE_PROB_) {
       picks.push(fridayPairs[0]);
