@@ -91,11 +91,11 @@ Two-layer model:
 
 ## Mentor roster (16 coaches)
 
-Loaded automatically into `MasterData` by **🏗️ אתחל טבלאות** or **🧪 טען זמינות דמו לבדיקה** (Name + Rank 1–3; no site lock). Edit roster in `FAKE_MENTOR_ROSTER_` in [SeedData.gs](SeedData.gs):
+Loaded automatically into `MasterData` by **🏗️ אתחל טבלאות** or **🧪 טען זמינות דמו לבדיקה** (Name + Rank 1–4; no site lock). Edit roster in `FAKE_MENTOR_ROSTER_` in [SeedData.gs](SeedData.gs):
 
 רון · מנש · איתם · בבה · יובל כץ · דורון · עומר אופק · קורין · שירי · לילוש · סהר כהן · מיתר · תומר אסף · טומי · טל נחמיאס · ינון שוב
 
-Rank per coach (1–3, 1 = best) set in `MasterData`. Business rules pending staff meeting.
+Rank per coach (1–4, 1 = best; 4 = out-of-town reserve) set in `MasterData`. Business rules pending staff meeting.
 
 Menu **📝 בנה מחדש טופס Google** rebuilds the linked form (roster names + Sun–Fri hour-range checkboxes + per-day note field). Requires re-authorizing the script (forms scope) once.
 
@@ -106,12 +106,12 @@ Menu **📝 בנה מחדש טופס Google** rebuilds the linked form (roster n
 | Column | Meaning |
 |--------|---------|
 | Name | Hebrew display name |
-| Rank | 1–3 — `1` = best; default `1`. Three tiers only. |
+| Rank | 1–4 — `1` = best, `4` = reserve (fills gaps after 1–3); default `1`. |
 | LocationRestriction | _(optional column later)_ blank = any site |
 
 ## Basic mode (`CONFIG.basicMode: true`)
 
-- Optimizer uses **form availability windows**, **rank priority (1→2→3)**, and a soft preference against back-to-back shifts for ranks 2–3.
+- Optimizer uses **form availability windows**, **rank priority (1→2→3→4)**, and a soft preference against back-to-back shifts for ranks 2–4.
 - **Rules** sheet can stay empty.
 - Set `CONFIG.basicMode` to `false` in `Config.gs` after adding rules with the team.
 

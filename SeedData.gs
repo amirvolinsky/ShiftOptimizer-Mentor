@@ -7,7 +7,7 @@ function setupTables() {
     'setupTables',
     '🏗️ אתחל טבלאות (MasterData / ShiftTemplate / Rules)',
     'מה זה עושה: יוצר מחדש את שלוש טבלאות ברירת המחדל של המערכת —\n'
-      + '• "' + CONFIG.sheets.masterData + '" — רשימת ' + FAKE_MENTOR_ROSTER_.length + ' מאמני מנטור עם דרגה (1–3, 1 הכי טוב)\n'
+      + '• "' + CONFIG.sheets.masterData + '" — רשימת ' + FAKE_MENTOR_ROSTER_.length + ' מאמני מנטור עם דרגה (1–4, 1 הכי טוב)\n'
       + '• "' + CONFIG.sheets.shiftTemplate + '" — שכבת אימונים שעתיים × 3 רשתות, א\'–ה\' בוקר+ערב, שישי בוקר בלבד\n'
       + '• "' + CONFIG.sheets.rules + '" — דגלי שיבוץ ניתנים לכיבוי/הפעלה (TRUE/FALSE) עם תיאור בעברית\n\n'
       + '⚠ דורס כל תוכן קיים בשלוש הטבלאות.\n'
@@ -269,7 +269,7 @@ function seedRules_(ss) {
 }
 
 /**
- * Mentor coach roster — edit name + rank (1 = best, 3 = lowest).
+ * Mentor coach roster — edit name + rank (1 = best, 4 = out-of-town reserve).
  * Used by MasterData seed, form sync, and demo responses.
  */
 var FAKE_MENTOR_ROSTER_ = [
@@ -284,11 +284,11 @@ var FAKE_MENTOR_ROSTER_ = [
   { name: 'שירי', rank: 3 },
   { name: 'לילוש', rank: 3 },
   { name: 'סהר כהן', rank: 3 },
-  { name: 'מיתר', rank: 3 },
+  { name: 'מיתר', rank: 4 },
   { name: 'תומר אסף', rank: 3 },
   { name: 'טומי', rank: 3 },
-  { name: 'טל נחמיאס', rank: 2 },
-  { name: 'ינון שוב', rank: 3 }
+  { name: 'טל נחמיאס', rank: 4 },
+  { name: 'ינון שוב', rank: 4 }
 ];
 
 /**
@@ -398,22 +398,22 @@ var MENTOR_EVENING_LABELS_ = [
  *     coaches actually request.
  */
 var MENTOR_WEEKLY_SHIFT_TARGETS_ = {
-  'רון':       { min: 1, max: 2 },
-  'מנש':       { min: 1, max: 2 },
-  'איתם':      { min: 2, max: 4 },
-  'בבה':       { min: 2, max: 4 },
-  'יובל כץ':   { min: 2, max: 3 },
-  'דורון':     { min: 0, max: 1 },
-  'עומר אופק': { min: 2, max: 3 },
-  'קורין':     { min: 0, max: 1 },
+  'רון':       { min: 1, max: 1 },
+  'מנש':       { min: 1, max: 1 },
+  'איתם':      { min: 2, max: 3 },
+  'בבה':       { min: 3, max: 4 },
+  'יובל כץ':   { min: 3, max: 4 },
+  'דורון':     { min: 1, max: 1 },
+  'עומר אופק': { min: 3, max: 4 },
+  'קורין':     { min: 1, max: 2 },
   'שירי':      { min: 1, max: 2 },
   'לילוש':     { min: 1, max: 2 },
-  'סהר כהן':   { min: 0, max: 1 },
+  'סהר כהן':   { min: 1, max: 2 },
   'מיתר':      { min: 0, max: 1 },
-  'תומר אסף':  { min: 0, max: 1 },
+  'תומר אסף':  { min: 1, max: 2 },
   'טומי':      { min: 1, max: 2 },
-  'טל נחמיאס': { min: 1, max: 2 },
-  'ינון שוב':  { min: 0, max: 0 }
+  'טל נחמיאס': { min: 0, max: 1 },
+  'ינון שוב':  { min: 0, max: 1 }
 };
 var MENTOR_DEFAULT_WEEKLY_TARGET_ = { min: 1, max: 2 };
 
@@ -533,25 +533,7 @@ function seedFakeMentorResponses_(ss) {
   }
 }
 
-/**
- * Coaches whose fake demo row stays empty (didn't submit any availability).
- * Lets the demo exercise the "missing response" path of the optimizer + UI.
- */
-var FAKE_MENTOR_UNAVAILABLE_ALL_WEEK_ = ['ינון שוב'];
-
-function isFakeMentorUnavailableAllWeek_(coachName) {
-  if (!coachName) return false;
-  for (var i = 0; i < FAKE_MENTOR_UNAVAILABLE_ALL_WEEK_.length; i++) {
-    if (FAKE_MENTOR_UNAVAILABLE_ALL_WEEK_[i] === coachName) return true;
-  }
-  return false;
-}
-
 function fillFakeMentorAvailabilityRow_(row, layout, seed, coachName) {
-  if (isFakeMentorUnavailableAllWeek_(coachName)) {
-    return;
-  }
-
   var picks = pickFakeMentorWeek_(coachName, seed);
   applyMentorPicksToRow_(row, layout, picks, coachName, seed);
 }
@@ -563,57 +545,46 @@ function fillFakeMentorAvailabilityRow_(row, layout, seed, coachName) {
  */
 var FAKE_MENTOR_FRIDAY_INCLUDE_PROB_ = 0.4;
 
-/**
- * Minimum picks per coach in the demo. Real coaches rarely submit "nothing"
- * unless they're truly unavailable for the whole week — those go in
- * FAKE_MENTOR_UNAVAILABLE_ALL_WEEK_ instead.
- */
-var FAKE_MENTOR_MIN_PICKS_ = 3;
+/** Full shift windows used in demo form responses (matches Mentor half-day blocks). */
+var FAKE_MENTOR_FULL_MORNING_LABEL_ = '7:00 עד 12:00';
+var FAKE_MENTOR_FULL_EVENING_LABEL_ = '16:00 עד 21:15';
 
-/**
- * Coaches who, in real life, submit availability close to their target instead
- * of the generous "max + extras" pattern. Demo mirrors this by giving them at
- * most target.max + 1 picks (and never below target.min).
- */
-var FAKE_MENTOR_TIGHT_AVAILABILITY_ = ['רון', 'מנש', 'דורון'];
-
-function isMentorTightAvailability_(coachName) {
-  if (!coachName) return false;
-  for (var i = 0; i < FAKE_MENTOR_TIGHT_AVAILABILITY_.length; i++) {
-    if (FAKE_MENTOR_TIGHT_AVAILABILITY_[i] === coachName) return true;
+/** Rank from FAKE_MENTOR_ROSTER_ (demo seeder does not depend on MasterData sheet). */
+function getCoachRankForDemo_(coachName) {
+  for (var i = 0; i < FAKE_MENTOR_ROSTER_.length; i++) {
+    if (FAKE_MENTOR_ROSTER_[i].name === coachName) {
+      return normalizeMentorRank_(FAKE_MENTOR_ROSTER_[i].rank);
+    }
   }
-  return false;
+  return CONFIG.ranks.best;
+}
+
+/**
+ * How many (day, block) availability picks a fake coach submits this week.
+ * Rank 1: usually 1 (איתם 2–3). Rank 2: 4–5. Rank 3: 3–4. Rank 4: rarely 1.
+ */
+function pickFakeWeeklyPickCount_(rank, coachName, rng) {
+  if (rank === 1) {
+    if (coachName === 'איתם') return 2 + Math.floor(rng() * 2);
+    return 1;
+  }
+  if (rank === 2) return 4 + Math.floor(rng() * 2);
+  if (rank === 3) return 3 + Math.floor(rng() * 2);
+  if (rank === 4) return rng() < 0.25 ? 1 : 0;
+  return 1;
 }
 
 /**
  * Decide the (day, block) picks for one fake coach for the week.
- *
- * Two profiles:
- *  • "Tight": coach submits availability close to their target (target.max ±
- *    a tiny random nudge). Used by senior/low-availability coaches like Ron,
- *    Manash, Dorin. Reflects real-world behavior — they only ask for what
- *    they actually want to work.
- *  • "Generous" (default): coach submits target.max + 2..4 extra picks so the
- *    optimizer has flexibility. Used by everyone else.
- *
  * Deterministic by coachName+seed.
  *
  * @returns {Array<{dayIndex:number, block:'morning'|'evening'}>}
  */
 function pickFakeMentorWeek_(coachName, seed) {
-  var target = getMentorWeeklyTarget_(coachName);
-  var rngExtra = makeMentorFakeRng_(coachName + '|extra', seed);
-
-  var n;
-  if (isMentorTightAvailability_(coachName)) {
-    // Tight profile: target.max OR target.max+1 (50/50). Honor target.min.
-    var bump = Math.floor(rngExtra() * 2); // 0 or 1
-    n = Math.max(target.min, target.max + bump);
-    if (n <= 0) n = 1;
-  } else {
-    var extra = 2 + Math.floor(rngExtra() * 3); // 2, 3, or 4 extras
-    n = Math.max(FAKE_MENTOR_MIN_PICKS_, target.max + extra);
-  }
+  var rank = getCoachRankForDemo_(coachName);
+  var rng = makeMentorFakeRng_(coachName + '|count', seed);
+  var n = pickFakeWeeklyPickCount_(rank, coachName, rng);
+  if (n <= 0) return [];
 
   var weekdayPairs = [];
   var fridayPairs = [];
@@ -689,8 +660,8 @@ function writeFakeMentorDayCell_(row, col, blocks, coachName, seed, dayIndex) {
 }
 
 function pickFakeMentorLabel_(labels, coachName, seed, dayIndex, blockTag) {
-  var rng = makeMentorFakeRng_(coachName + '|label|' + blockTag + '|' + dayIndex, seed);
-  return labels[Math.floor(rng() * labels.length)];
+  if (blockTag === 'morning') return FAKE_MENTOR_FULL_MORNING_LABEL_;
+  return FAKE_MENTOR_FULL_EVENING_LABEL_;
 }
 
 /** In-place Fisher-Yates shuffle using a deterministic PRNG. */

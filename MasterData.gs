@@ -2,7 +2,7 @@
  * Reads employee master data from the MasterData sheet.
  *
  * Columns:
- *   Name      | Rank (1–3, 1 = best, default 1 if missing)
+ *   Name      | Rank (1–4, 1 = best, 4 = reserve; default 1 if missing)
  *   WeeklyMin | WeeklyMax — typical weekly shift target window (a "shift" =
  *                           morning OR evening half-day block). Both optional;
  *                           default to 0 / unlimited respectively.

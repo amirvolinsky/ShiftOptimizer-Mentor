@@ -88,11 +88,11 @@ var CONFIG = {
    */
   googleFormId: '1_8coyaLHL13nvYBncd3lZg_ep33EnQnw1Fs5Vn24ASs',
 
-  /** Coach tiers: 1 = best, 3 = lowest. Three levels only. */
+  /** Coach tiers: 1 = best, 4 = out-of-town reserve (fills gaps after 1–3). */
   ranks: {
     best: 1,
     min: 1,
-    max: 3
+    max: 4
   }
 };
 
@@ -100,7 +100,7 @@ function isBasicMode_() {
   return CONFIG.basicMode !== false;
 }
 
-/** Clamp MasterData rank to Mentor 1–3 scale (1 = best). */
+/** Clamp MasterData rank to Mentor 1–4 scale (1 = best, 4 = reserve). */
 function normalizeMentorRank_(rank) {
   var r = parseInt(rank, 10);
   if (isNaN(r) || r < 1) return CONFIG.ranks.best;
