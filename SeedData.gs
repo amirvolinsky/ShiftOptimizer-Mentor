@@ -675,9 +675,31 @@ function writeFakeMentorDayCell_(row, col, blocks, coachName, seed, dayIndex) {
   row[col] = parts.length > 0 ? parts.join(', ') : mentorNotAvailableLabel_();
 }
 
+/**
+ * Probability that a fake submission uses the full half-day window
+ * (7:00–12:00 / 16:00–21:15). The remainder lands on one of the partial
+ * windows from MENTOR_MORNING_LABELS_ / MENTOR_EVENING_LABELS_ so the demo
+ * exercises the partial-coverage path the optimizer has to handle in real
+ * life (coaches who can only do 8:00–10:00, 17:00–19:00, etc.).
+ */
+var FAKE_MENTOR_FULL_WINDOW_PROB_ = 0.65;
+
 function pickFakeMentorLabel_(labels, coachName, seed, dayIndex, blockTag) {
-  if (blockTag === 'morning') return FAKE_MENTOR_FULL_MORNING_LABEL_;
-  return FAKE_MENTOR_FULL_EVENING_LABEL_;
+  var fullLabel = blockTag === 'morning'
+    ? FAKE_MENTOR_FULL_MORNING_LABEL_
+    : FAKE_MENTOR_FULL_EVENING_LABEL_;
+
+  var coinRng = makeMentorFakeRng_(coachName + '|label|coin|' + blockTag + '|' + dayIndex, seed);
+  if (coinRng() < FAKE_MENTOR_FULL_WINDOW_PROB_) return fullLabel;
+
+  var partial = [];
+  for (var i = 0; i < labels.length; i++) {
+    if (labels[i] !== fullLabel) partial.push(labels[i]);
+  }
+  if (!partial.length) return fullLabel;
+
+  var pickRng = makeMentorFakeRng_(coachName + '|label|pick|' + blockTag + '|' + dayIndex, seed);
+  return partial[Math.floor(pickRng() * partial.length)];
 }
 
 /** In-place Fisher-Yates shuffle using a deterministic PRNG. */
