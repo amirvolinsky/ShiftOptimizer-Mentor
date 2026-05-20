@@ -41,6 +41,10 @@ function writeSchedule(result, slots, masterMap, availability, notes) {
   sheet.clear();
   sheet.clearFormats();
   sheet.clearNotes();
+  // Drop any data-validation rules left over from a previous run. Without this,
+  // fairness / legend rows inherit coach-name dropdowns from the old grid and
+  // flag every status text ("ביעד =)" וכו') as invalid (red dots).
+  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).clearDataValidations();
 
   var slotMap = buildSlotMap_(slots);
   var consecutiveShifts = computeConsecutiveShiftsMap_(slots, result.assignments);
@@ -55,12 +59,17 @@ function writeSchedule(result, slots, masterMap, availability, notes) {
 
   sheet.setRightToLeft(true);
   applyUnifiedScheduleLayout_(sheet, 1, lastDataRow);
-  var lastCol = 1 + UNIFIED_SCHEDULE_DAYS_.length * CONFIG.locations.length;
-  if (sheet.getLastRow() > 0 && lastCol > 0) {
-    sheet.getRange(1, 1, sheet.getLastRow(), lastCol)
-      .setHorizontalAlignment('center')
-      .setVerticalAlignment('middle');
-  }
+  centerAllScheduleCells_(sheet);
+}
+
+/** Center-align horizontally + vertically across every used cell on the schedule sheet. */
+function centerAllScheduleCells_(sheet) {
+  var lastRow = sheet.getLastRow();
+  var lastCol = sheet.getLastColumn();
+  if (lastRow <= 0 || lastCol <= 0) return;
+  sheet.getRange(1, 1, lastRow, lastCol)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle');
 }
 
 // ============================================================
@@ -493,7 +502,9 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
       satCell.setBackground('#E8E8E8').setFontColor('#666666');
     }
 
-    sheet.getRange(row, 1, 1, headers.length).setHorizontalAlignment('center');
+    sheet.getRange(row, 1, 1, headers.length)
+      .setHorizontalAlignment('center')
+      .setVerticalAlignment('middle');
     row++;
   }
 
@@ -1908,6 +1919,10 @@ function refreshScheduleFromSheet_() {
   var slotIndex = buildSlotIndexByDayLocationTime_(slots);
   var currentAssignments = readUnifiedScheduleAssignments_(sheet, timeGrid, slotIndex, masterMap, warnings);
   var consecutiveShifts = computeConsecutiveShiftsMap_(slots, currentAssignments);
+  // Wipe stale validations before re-applying styles. The grid cells get fresh
+  // coach-name dropdowns added back via setOverrideDropdown_; fairness/legend
+  // cells stay validation-free so their status text doesn't trip "Invalid".
+  sheet.getRange(1, 1, sheet.getMaxRows(), sheet.getMaxColumns()).clearDataValidations();
   reapplyUnifiedScheduleCellStyles_(
     sheet, timeGrid, slotIndex, currentAssignments, masterMap, availability, slotMap, consecutiveShifts
   );
@@ -1948,6 +1963,8 @@ function refreshScheduleFromSheet_() {
   if (fairnessHeaderRow >= 0) {
     writeFairnessTable_(sheet, empStats, masterMap, availability, slots, fairnessHeaderRow + 1, notes);
   }
+
+  centerAllScheduleCells_(sheet);
 
   return { ok: true, message: '', warnings: warnings };
 }
