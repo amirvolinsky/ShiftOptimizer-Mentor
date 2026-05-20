@@ -561,14 +561,17 @@ function getCoachRankForDemo_(coachName) {
 
 /**
  * How many (day, block) availability picks a fake coach submits this week.
- * Rank 1: usually 1 (איתם 2–3). Rank 2: 4–5. Rank 3: 3–4. Rank 4: rarely 1.
+ * Rank 1: usually 1 (איתם 2–3). Rank 2: 4–5 (יובל כץ 3–4). Rank 3: 3–4. Rank 4: rarely 1.
  */
 function pickFakeWeeklyPickCount_(rank, coachName, rng) {
   if (rank === 1) {
     if (coachName === 'איתם') return 2 + Math.floor(rng() * 2);
     return 1;
   }
-  if (rank === 2) return 4 + Math.floor(rng() * 2);
+  if (rank === 2) {
+    if (coachName === 'יובל כץ') return 3 + Math.floor(rng() * 2);
+    return 4 + Math.floor(rng() * 2);
+  }
   if (rank === 3) return 3 + Math.floor(rng() * 2);
   if (rank === 4) return rng() < 0.25 ? 1 : 0;
   return 1;
