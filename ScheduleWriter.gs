@@ -110,7 +110,7 @@ function writeUnifiedScheduleGrid_(sheet, assignments, slots, slotMap, masterMap
   for (var d = 0; d < DAYS.length; d++) {
     var dayStartCol = 2 + d * perDayCols;
     sheet.getRange(headerRow, dayStartCol, 1, perDayCols).merge()
-      .setValue(DAYS[d])
+      .setValue(mentorDayBilingualLabel_(DAYS[d]))
       .setFontWeight('bold')
       .setBackground(CONFIG.colors.headerBg)
       .setFontColor(CONFIG.colors.headerFont);
