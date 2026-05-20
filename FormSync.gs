@@ -70,9 +70,22 @@ function rebuildMentorGoogleForm_(form) {
     form.addPageBreakItem().setTitle(dayLabel);
     var dayItem = form.addCheckboxItem();
     dayItem.setTitle(dayLabel).setRequired(true);
-    setMentorDayCheckboxChoices_(dayItem, mentorFormDayIncludesEvening_(dayHe));
+    var expected = setMentorDayCheckboxChoices_(dayItem, mentorFormDayIncludesEvening_(dayHe));
+    // Defensive: a previous live form had Monday with zero choices despite the
+    // code path being symmetric for every day. Re-fetch the checkbox and throw
+    // a clear error naming the day if Forms didn't persist the choices.
+    var refetched = dayItem.asCheckboxItem();
+    var actualCount = refetched.getChoices().length;
+    if (actualCount !== expected) {
+      throw new Error(
+        'בניית הטופס נכשלה ביום "' + dayLabel + '": נכתבו ' + actualCount +
+        ' אפשרויות במקום ' + expected + '. נסה להריץ שוב "📝 בנה מחדש טופס Google".'
+      );
+    }
     var noteItem = form.addParagraphTextItem();
     noteItem.setTitle(mentorDayNoteHeader_(dayHe)).setRequired(false);
+    // Tiny pause to avoid sporadic Forms API rate-limit hiccups between days.
+    Utilities.sleep(60);
   }
 
   form.setConfirmationMessage('תודה! הזמינות נשמרה.');
@@ -80,6 +93,12 @@ function rebuildMentorGoogleForm_(form) {
   form.setPublishingSummary(true);
 }
 
+/**
+ * Populates a day checkbox item with morning (+ evening if not Friday) ranges
+ * plus the "not available" option.
+ *
+ * @returns {number} expected number of choices that were written.
+ */
 function setMentorDayCheckboxChoices_(checkboxItem, includeEvening) {
   if (includeEvening === undefined) includeEvening = true;
   var labels = MENTOR_MORNING_LABELS_.slice();
@@ -90,4 +109,5 @@ function setMentorDayCheckboxChoices_(checkboxItem, includeEvening) {
     choices.push(checkboxItem.createChoice(labels[i]));
   }
   checkboxItem.setChoices(choices);
+  return labels.length;
 }
