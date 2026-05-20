@@ -267,8 +267,13 @@ function buildSlotIndexByDayLocationTime_(slots) {
 
 /**
  * Merge cells in each (day, net) column when the same coach is assigned to
- * consecutive adjacent-time slots. Top-left cell value/color/note/validation
- * are kept; other cells in the run are absorbed by the merge.
+ * adjacent rows within the same half-day block. Top-left cell value/color/
+ * note/validation are kept; other cells in the run are absorbed by the merge.
+ *
+ * The merge keys on (name, block) rather than strict time continuity, so the
+ * 19:00→19:15 evening break does not split a coach's evening shift into two
+ * blocks. Morning↔evening transitions still break the run because the slot
+ * block string differs.
  */
 function mergeConsecutiveSameCoach_(sheet, firstDataRow, timeGrid, assignments, slotIndex, DAYS, locations) {
   for (var d = 0; d < DAYS.length; d++) {
@@ -283,18 +288,21 @@ function mergeConsecutiveSameCoach_(sheet, firstDataRow, timeGrid, assignments, 
       var runStart = 0;
       var runEnd = -1;
       var runName = null;
+      var runBlock = null;
 
       for (var t = 0; t < timeGrid.length; t++) {
         var slot = locMap[slotTimeKey_(timeGrid[t])];
         var asgn = slot && assignments[slot.slotId];
         var name = (asgn && asgn.name && !asgn.unfilled && !asgn.managerSlot)
           ? asgn.name : null;
+        var block = slot ? slot.block : null;
 
         var continuous = (
           name !== null &&
           name === runName &&
-          t > 0 &&
-          Math.abs(timeGrid[t - 1].endTime - timeGrid[t].startTime) < 0.001
+          block !== null &&
+          block === runBlock &&
+          t > 0
         );
 
         if (continuous) {
@@ -306,6 +314,7 @@ function mergeConsecutiveSameCoach_(sheet, firstDataRow, timeGrid, assignments, 
           runStart = t;
           runEnd = t;
           runName = name;
+          runBlock = block;
         }
       }
       if (runName !== null && runEnd > runStart) {
