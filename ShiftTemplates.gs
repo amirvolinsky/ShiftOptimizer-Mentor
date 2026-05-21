@@ -2,7 +2,7 @@
  * Reads shift template definitions from the ShiftTemplate sheet.
  *
  * Expected columns (matched by header name, order is flexible):
- *   Location | Day | Block | StartTime | EndTime
+ *   Location | Day | Block | StartTime | EndTime | ClassType
  *
  * Location: a specific location name (e.g. "Net1") OR "*"/empty to mean
  *           "this slot exists on every location in CONFIG.locations".
@@ -10,13 +10,16 @@
  * Day:      Hebrew day name (ראשון, שני, ...)
  * Block:    "בוקר", "אמצע", or "ערב"
  * StartTime / EndTime: e.g., "7:00", "14:00"
+ * ClassType: one of the ids from ClassTypes.gs (Childs / Hi-Tech / A / B /
+ *            C / D / E / League). Blank = no class-type filter (anyone
+ *            available may teach).
  *
  * Legacy: a `Headcount` column is still honored if present (back-compat with
  * older seeded sheets), otherwise every row produces exactly one slot per
  * resolved location.
  *
  * Returns an array of slot objects:
- * [{ location, day, block, headcount, startTime, endTime, durationHours, slotId }]
+ * [{ location, day, block, headcount, startTime, endTime, durationHours, classType, slotId }]
  */
 function loadShiftTemplates() {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.sheets.shiftTemplate);
@@ -38,6 +41,9 @@ function loadShiftTemplates() {
       : 1;
     var startTime = parseTimeValue(data[i][cols.startTime]);
     var endTime = parseTimeValue(data[i][cols.endTime]);
+    var classType = cols.classType >= 0
+      ? normalizeClassTypeId_(data[i][cols.classType])
+      : '';
 
     if (!day || !block) continue;
 
@@ -67,6 +73,7 @@ function loadShiftTemplates() {
           startTime: startTime,
           endTime: endTime,
           durationHours: durationHours,
+          classType: classType,
           slotId: location + '_' + day + '_' + block + '_' + globalPos
         });
       }
@@ -78,8 +85,8 @@ function loadShiftTemplates() {
 
 /**
  * Resolve ShiftTemplate column positions by header name.
- * Returns { location, day, block, startTime, endTime, headcount }.
- * `headcount` is -1 when the (legacy) column is absent.
+ * Returns { location, day, block, startTime, endTime, headcount, classType }.
+ * `headcount` and `classType` are -1 when the column is absent (back-compat).
  */
 function mapShiftTemplateColumns_(headerRow) {
   var headers = [];
@@ -96,7 +103,8 @@ function mapShiftTemplateColumns_(headerRow) {
     block:     idx('Block', 2),
     startTime: idx('StartTime', 3),
     endTime:   idx('EndTime', 4),
-    headcount: idx('Headcount', -1)
+    headcount: idx('Headcount', -1),
+    classType: idx('ClassType', -1)
   };
 }
 
@@ -190,6 +198,9 @@ function getTemplateGrid() {
       : 1;
     var startTime = parseTimeValue(data[i][cols.startTime]);
     var endTime = parseTimeValue(data[i][cols.endTime]);
+    var classType = cols.classType >= 0
+      ? normalizeClassTypeId_(data[i][cols.classType])
+      : '';
 
     if (!day || !block) continue;
 
@@ -203,7 +214,8 @@ function getTemplateGrid() {
         block: block,
         startTime: startTime,
         endTime: endTime,
-        headcount: headcount
+        headcount: headcount,
+        classType: classType
       });
     }
   }

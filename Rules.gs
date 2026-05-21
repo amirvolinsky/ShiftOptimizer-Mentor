@@ -21,13 +21,7 @@ function getDefaultMentorRules_() {
     soft_cap_weekly_max: true,
     avoid_back_to_back: true,
     suggest_outside_availability: true,
-
-    // --- Legacy global caps (kept for forward compatibility; dormant under
-    //     CONFIG.basicMode = true because Mentor uses per-coach WeeklyMax). ---
-    default_target_shifts_per_week: 5,
-    max_shifts_per_week: 6,
-    min_rest_hours: 0,
-    allow_double_shift: false
+    class_type_eligibility_enabled: true
   };
 }
 
@@ -48,22 +42,16 @@ function getMentorRuleDescriptions_() {
       'מאמני דרג 2-4 שהגיעו ל-WeeklyMax יורדים לסוף סדר הבחירה כדי לתת ' +
       'מקום לדרג נמוך יותר. כבה כדי לבטל את התקרה הרכה.',
     avoid_back_to_back:
-      'להעדיף לא ליצור משמרות צמודות (בוקר+ערב באותו יום או ערב→בוקר ' +
-      'למחרת). תאים כאלה מסומנים כתום — לא כמה אימונים באותה משמרת (בוקר/ערב). ' +
-      'כבה כדי לבטל את ההעדפה.',
+      'להעדיף לא ליצור משמרות צמודות עם מנוחה קצרה — ערב עד 21:15 + בוקר מ-7:00 ' +
+      'למחרת (פחות מ-10 שעות מנוחה), או יום עבודה מלא 7:00 ועד 21:15 באותו יום. ' +
+      'תאים כאלה מסומנים כתום. כבה כדי לבטל את ההעדפה.',
     suggest_outside_availability:
       'להציע מאמן (סימון כחול) למשבצות ריקות גם אם לא סימן זמינות. ' +
       'כבה כדי שמשבצות ללא מועמדים יישארו אדומות "לא מולא".',
-    default_target_shifts_per_week:
-      'יעד משמרות שבועי ברירת מחדל למאמן שאין לו WeeklyMax ב-MasterData. ' +
-      'דורם תחת basicMode.',
-    max_shifts_per_week:
-      'תקרה גלובלית למספר משמרות שבועי. כרגע דורם כי משתמשים ב-WeeklyMax ' +
-      'פר-מאמן ב-MasterData.',
-    min_rest_hours:
-      'מספר שעות מנוחה מינימלי בין משמרות. דורם.',
-    allow_double_shift:
-      'האם לאפשר 2 משמרות מקבילות לאותו מאמן (לא נתמך — תמיד FALSE).'
+    class_type_eligibility_enabled:
+      'לאכוף חוקי כשירות לסוגי כיתות (ילדים / הייטק / A–E / ליגה) לפי הטאב "ClassTypeRules". ' +
+      'כשמשבצת ב-ShiftTemplate מתויגת בסוג כיתה, רק מאמנים שעומדים בחוק יוצעו לה. ' +
+      'משבצות ללא תיוג זמינות לכל מאמן. כבה כדי לעקוף את הסינון לחלוטין (מצב חירום).'
   };
 }
 

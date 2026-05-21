@@ -63,6 +63,11 @@ Link to sheet → tab name must match `CONFIG.sheets.responses` (default: `Form 
 
 Menu: **🔧 הכן טאב תשובות דמו** creates a **plain** sheet (not Form-linked). **🧪 טען זמינות דמו לבדיקה** fills demo tab only.
 
+Demo realism rules (see `pickFakeMentorWeek_` + `FAKE_MENTOR_FULL_WINDOW_PROB_` in [SeedData.gs](SeedData.gs)):
+
+- A coach never gives morning **and** evening availability on the same day. The seeder picks distinct weekdays first, then chooses one block per day (~60% morning / 40% evening). Friday is morning-only and lands on its own day index.
+- Full half-day windows (`7:00 עד 12:00` / `16:00 עד 21:15`) appear ~40% of the time; the remaining ~60% are partial 2–4h ranges (`8:00 עד 10:00`, `17:00 עד 19:00`, …). All form labels are 2h minimum — 1-hour availabilities never appear.
+
 **Purple columns / Form icon on live tab:** Google links the real responses tab to a **Table**; if the form had more questions before, empty purple columns (`Column 13`…) remain. Shrink the table to columns A–L or delete extra columns on `Form Responses 1` only — not on the demo tab.
 
 Legacy radio/checkbox form (בוקר / ערב / לא זמין per day) still supported on the demo tab.
@@ -107,6 +112,8 @@ Menu **📝 בנה מחדש טופס Google** rebuilds the linked form (roster n
 |--------|---------|
 | Name | Hebrew display name |
 | Rank | 1–4 — `1` = best, `4` = reserve (fills gaps after 1–3); default `1`. |
+| WeeklyMin / WeeklyMax | Soft weekly shift target window. WeeklyMax is the upper bound used for the "יעד" column; Rank 1 still gets every shift they sign up for via `rank_1_unconditional`. |
+| Gender | `M` / `F`. Used by class-type eligibility (E classes are male-only per Mentor staff). Defaults to `M` when the cell or column is blank. |
 | LocationRestriction | _(optional column later)_ blank = any site |
 
 ## Basic mode (`CONFIG.basicMode: true`)
@@ -135,7 +142,111 @@ After changing locations, run **תבנית אימונים** so `ShiftTemplate` u
 
 Empty for now. When ready: add key/value rows and set `CONFIG.basicMode = false` in `Config.gs`.
 
-Example keys for later: `no_juniors_alone`, `min_morning_score_sitea`, `max_shifts_per_week`, etc.
+Example keys for later: `no_juniors_alone`, `min_morning_score_sitea`, etc.
+
+Active toggles already in the sheet (default `TRUE`):
+
+| Key | Meaning |
+|-----|---------|
+| `rank_1_unconditional` | Rank 1 receives every shift they signed up for, even past `WeeklyMax`. |
+| `rank_priority_enabled` | Rank 1 sorts before 2 before 3 in every candidate ordering. |
+| `soft_cap_weekly_max` | Ranks 2–4 at-max go to the back of the queue. |
+| `avoid_back_to_back` | Penalize evening→morning <10h rests and same-day morning+evening for ranks 2–4. |
+| `suggest_outside_availability` | Blue "system suggestion" for empty slots. |
+| `class_type_eligibility_enabled` | Enforce `ClassTypeRules` against `ShiftTemplate.ClassType`. Kill-switch — turn off to bypass class-type filtering entirely on go-live day. |
+
+---
+
+## Class types & eligibility
+
+The 8 class levels Mentor runs (easiest → hardest):
+
+`Childs` (ילדים) → `Hi-Tech` (הייטק) → `A` → `B` → `C` → `D` → `E` → `League` (ליגה).
+
+Two new sheet tabs, both seeded by **🏗️ אתחל טבלאות**:
+
+### `ClassTypeRules` (policy — changes rarely)
+
+| Column | Meaning |
+|--------|---------|
+| `ClassType` | One of the 8 ids above. |
+| `EligibleRule` | DSL string (see below). |
+| `PriorityRank` | Rank preferred inside the eligible set (or blank). |
+| `AllowSplit` | `TRUE` allows a shift's classes to be split between coaches. |
+| `תיאור` | Readable Hebrew description. |
+
+Eligibility DSL (used in the `EligibleRule` cell):
+
+- `*` — every coach in MasterData.
+- `*,-<name>` — everyone except listed names (e.g. `*,-קורין`).
+- `Rank<=N` — coaches with `Rank` ≤ N.
+- `Gender=M` / `Gender=F` — coaches matching the MasterData Gender column.
+- `<name1>,<name2>,...` — explicit allow-list.
+- Predicates combine with `,` as AND, and `-<name>` subtracts a name from the result.
+
+Defaults seeded today (per Mentor staff 2026-05-21):
+
+| Class | EligibleRule | PriorityRank | AllowSplit |
+|-------|--------------|--------------|------------|
+| Childs | `*,-קורין` | — | FALSE |
+| Hi-Tech | `*` | — | FALSE |
+| A | `*` | — | FALSE |
+| B | `*` | — | FALSE |
+| C | `*` | — | FALSE |
+| D | `*` | — | FALSE |
+| E | `Rank<=2,Gender=M` | 1 | TRUE |
+| League | `בבה,יובל כץ` | 1 | FALSE |
+
+Master kill switch: `class_type_eligibility_enabled` (Rules sheet). `FALSE` bypasses all class-type filtering.
+
+### `WeeklyClasses` (weekly headline counts)
+
+One row per class type plus a `סה״כ` row at the bottom that sums the `Count` column. Seeded blank (zeros) — the staff fills the values via the **🚀 הרץ שיבוץ שבועי** dialog every week, which writes the entered counts into this sheet before kicking off the optimizer.
+
+Flow:
+
+1. Menu → **🚀 הרץ שיבוץ שבועי** opens `WeeklyClassCountsDialog.html` (RTL, 8 number inputs + live `סה״כ` + capacity hint).
+2. Inputs pre-fill with whatever's currently in `WeeklyClasses` (zeros after a fresh seed, last-week's values afterwards).
+3. The dialog shows the `ShiftTemplate` capacity (today: 165 = 5 morning hours × 6 days × 3 nets + 5 evening hours × 5 weekdays × 3 nets). If the entered total exceeds capacity the OK button locks and a red warning appears. `runOptimizeWithClassCounts` re-checks the cap server-side.
+4. On "אישור והרץ שיבוץ" the counts are written to the sheet and `optimizeShiftsRun_()` runs. The result panel renders inside the dialog.
+5. The dialog can also be reopened any time without running by using **⚙️ הגדרה ובדיקה → 📊 כמויות אימונים שבועיות** (re-seeds the tab to zero counts only — does not run the optimizer).
+
+### Auto-distribution into `ShiftTemplate` (live, never written back to the sheet)
+
+`distributeClassesIntoSlots_()` in `ClassTypes.gs` runs inside `optimizeShiftsRunCore_()` after `loadShiftTemplates()` and decides which of the 165 capacity slots actually run a class this week:
+
+- **Slot priority** (filled first → last). Rounds 1–5 pair morning + evening peaks:
+  - Round 1: morning 9–10 + evening 18–19
+  - Round 2: morning 10–11 + evening 17–18
+  - Round 3: morning 8–9 + evening 19:15–20:15
+  - Round 4: morning 11–12 + evening 16–17
+  - Round 5: morning 7–8 + evening 20:15–21:15
+  - Within each round: day cycle Sun→Thu→Fri (Friday skipped for evening), then Net1→Net2→Net3.
+- **Class-type assignment**: types are ordered by level descending (League → E → D → C → B → A → Hi-Tech → Childs), and dealt out into the priority-ordered slots in big contiguous blocks. Highest tiers land in the most-popular slots first, which keeps League / E off the late edge hours.
+- **Manual `ShiftTemplate.ClassType` pins win**: any row that already has a `ClassType` set is treated as a pin, counted against the user's requested counts, and never moved. The auto pass only fills the unpinned remainder.
+- **Inactive slots**: every capacity slot not picked by the distribution is tagged `inactive: true`. The optimizer never sees them. `writeSchedule` renders them as a grey "אין אימון" cell (no coach, no override dropdown, no hover note). Distinct from red `⚠` unfilled — those are slots that should have run a class but no coach matched.
+- **Capacity overflow**: if the user enters more than 165 the dialog blocks submission; if a stale POST sneaks through, `runOptimizeWithClassCounts` throws before saving. If pins exceed the user's request for a given type the system keeps the pins and surfaces a warning in the summary.
+
+The `אין אימון` cells survive `refreshSchedule` — the manual-edit refresh path re-detects them from the cell text in `readUnifiedScheduleAssignments_` and re-applies the grey style.
+
+### `ShiftTemplate.ClassType` column
+
+Last column of `ShiftTemplate`. Blank cell = no class-type filter (anyone available may teach the slot). Tag a row with a class id to gate it to the rule above.
+
+### Behavior in the optimizer
+
+- `assignContinuousShiftBlocks_` drops timeKeys where the coach can't teach any of the parallel-net classes at that time. The shift is naturally truncated to the teachable subset and the rest falls to another eligible coach in the same pass (gives "split within a shift" for free for E).
+- `getEligibleCandidates`, `findStickyNetAssignment_`, `findSpreadAssignment_`, and `rankSuggestionCandidates_` all consult `coachEligibleForClassType_` before adding a candidate.
+- The hover tooltip on the Schedule sheet shows `🚫 לא מוסמך/ת לאמן <classType>` for filtered-out coaches.
+
+### Pending (next round)
+
+- **Fixed weekly classes** (~30 rows the staff will pin in `ShiftTemplate.ClassType`, e.g. "Childs always Sun 17:00 Net1"):
+  - Pin mechanism already works end-to-end (`distributeClassesIntoSlots_` treats any tagged row as a fixed pin, subtracts it from the user's request, never moves it).
+  - **Still to wire**: the `🚀 הרץ שיבוץ שבועי` dialog needs to read the current pin counts per class type and use them as the **floor** (and prefill) for each input. So if 8 B-rows are pinned in `ShiftTemplate`, the B input shows `8` with a small "🔒 8 קבועים" hint and the input can't drop below 8. Pending agreement on exact UX after staff meeting (May 22 2026).
+- Render the class type per cell on `Schedule` (color stripe / superscript) so the staff can read the live distribution at a glance.
+- Per-class warning when a manual edit puts a coach into a slot they can't teach.
+- Per-day / per-block manual override of the auto-distribution (today the algorithm is opaque — the only override is to pre-tag `ShiftTemplate.ClassType` rows).
 
 ---
 

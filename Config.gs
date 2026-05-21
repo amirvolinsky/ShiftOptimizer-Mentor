@@ -22,6 +22,10 @@ var CONFIG = {
     responsesDemo: 'Form Responses Demo',
     shiftTemplate: 'ShiftTemplate',
     rules:         'Rules',
+    /** Per-class eligibility rules (who can teach Childs/E/League/etc.) */
+    classTypeRules: 'ClassTypeRules',
+    /** Editable weekly class counts per ClassType (drives target shift volume) */
+    weeklyClasses: 'WeeklyClasses',
     schedule:      'Schedule',
     shareExport:   'Share_Export',
     shiftHistory:  'ShiftHistory'
@@ -106,4 +110,19 @@ function normalizeMentorRank_(rank) {
   if (isNaN(r) || r < 1) return CONFIG.ranks.best;
   if (r > CONFIG.ranks.max) return CONFIG.ranks.max;
   return r;
+}
+
+/**
+ * Normalize the MasterData Gender cell to 'M' / 'F'. Blank, English M/F,
+ * Hebrew זכר/נקבה, and the words male/female (any case) are all accepted.
+ * Anything unrecognised falls back to 'M' so missing data never breaks
+ * eligibility checks.
+ */
+function normalizeMentorGender_(gender) {
+  var s = String(gender == null ? '' : gender).trim();
+  if (!s) return 'M';
+  var u = s.toUpperCase();
+  if (u === 'F' || u === 'FEMALE' || s === 'נקבה' || s === 'נ') return 'F';
+  if (u === 'M' || u === 'MALE'   || s === 'זכר'  || s === 'ז') return 'M';
+  return 'M';
 }

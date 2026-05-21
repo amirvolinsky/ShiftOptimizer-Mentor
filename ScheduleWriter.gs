@@ -27,9 +27,27 @@ var SCHEDULE_TIME_COL_WIDTH_ = 70;
 var SCHEDULE_NET_COL_WIDTH_ = 76;
 var SCHEDULE_DAY_DIVIDER_COLOR_ = '#2E7D6B';
 var SCHEDULE_DAY_EDGE_SUBHEADER_BG_ = '#D0D9DE';
+var SCHEDULE_INACTIVE_BG_ = '#E5E7EB';
+var SCHEDULE_INACTIVE_FG_ = '#9CA3AF';
+var SCHEDULE_INACTIVE_LABEL_HE_ = 'אין אימון';
 var UNIFIED_SCHEDULE_DAYS_ = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי'];
 
-function writeSchedule(result, slots, masterMap, availability, notes) {
+/**
+ * Render a capacity slot that has no class scheduled this week: light-grey
+ * background, faint "אין אימון" label, no coach dropdown, no hover note.
+ */
+function writeInactiveSlotCell_(cell) {
+  cell.setValue(SCHEDULE_INACTIVE_LABEL_HE_)
+    .setBackground(SCHEDULE_INACTIVE_BG_)
+    .setFontColor(SCHEDULE_INACTIVE_FG_)
+    .setFontWeight('normal');
+  cell.setNote('');
+  // Strip any previous data validation (coach-name dropdown) — there's
+  // no coach to override here.
+  cell.setDataValidation(null);
+}
+
+function writeSchedule(result, slots, masterMap, availability, notes, distribution) {
   HISTORY_SCORES_CACHE_ = null;
   notes = notes || {};
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -144,6 +162,14 @@ function writeUnifiedScheduleGrid_(sheet, assignments, slots, slotMap, masterMap
 
         if (!slot) {
           cell.setValue('').setBackground('#F0F0F0');
+          continue;
+        }
+
+        // Slot exists in the template but no class is running this week
+        // (auto-distribution skipped it). Render as a grey "אין אימון" cell
+        // — distinct from red unfilled, no coach, no override dropdown.
+        if (slot.inactive) {
+          writeInactiveSlotCell_(cell);
           continue;
         }
 
@@ -275,9 +301,9 @@ function buildSlotIndexByDayLocationTime_(slots) {
  * Intra-shift gaps (e.g. 19:00→19:15) and the 12:00→16:00 gap between blocks
  * are absorbed by the merge.
  *
- * When the run crosses the morning↔evening boundary, the merged cell is
- * forced to the overlap (orange) color so the back-to-back signal is not
- * lost when the top-left cell happened to be the green morning slot.
+ * The merged cell keeps the top-left cell's background — green / blue / orange
+ * are already set per-cell by writeScheduleAssignmentCell_() based on the
+ * consecutiveShifts map (only TIGHT 7:00↔21:15 cases are orange).
  */
 function mergeConsecutiveSameCoach_(sheet, firstDataRow, timeGrid, assignments, slotIndex, DAYS, locations) {
   for (var d = 0; d < DAYS.length; d++) {
@@ -292,52 +318,56 @@ function mergeConsecutiveSameCoach_(sheet, firstDataRow, timeGrid, assignments, 
       var runStart = 0;
       var runEnd = -1;
       var runName = null;
-      var runBlocks = {};
 
-      var finalizeRun = function(startRow, endRow, blocks) {
+      var finalizeRun = function(startRow, endRow) {
         if (endRow <= startRow) return;
-        var range = sheet.getRange(firstDataRow + startRow, col, endRow - startRow + 1, 1);
-        range.merge();
-        if (blocks['בוקר'] && blocks['ערב']) {
-          range.setBackground(CONFIG.colors.overlap);
-        }
+        sheet.getRange(firstDataRow + startRow, col, endRow - startRow + 1, 1).merge();
       };
 
       for (var t = 0; t < timeGrid.length; t++) {
         var slot = locMap[slotTimeKey_(timeGrid[t])];
         var asgn = slot && assignments[slot.slotId];
-        var name = (asgn && asgn.name && !asgn.unfilled && !asgn.managerSlot)
+        // Inactive slots ("אין אימון") explicitly break runs — they're not a
+        // coach cell, and we don't want them swallowed into the merge above.
+        var inactiveRowBreak = (slot && slot.inactive);
+        var name = (!inactiveRowBreak && asgn && asgn.name && !asgn.unfilled && !asgn.managerSlot)
           ? asgn.name : null;
-        var block = slot ? slot.block : null;
 
         var continuous = (name !== null && name === runName && t > 0);
 
         if (continuous) {
           runEnd = t;
-          if (block) runBlocks[block] = true;
         } else {
-          if (runName !== null) finalizeRun(runStart, runEnd, runBlocks);
+          if (runName !== null) finalizeRun(runStart, runEnd);
           runStart = t;
           runEnd = t;
           runName = name;
-          runBlocks = {};
-          if (block) runBlocks[block] = true;
         }
       }
-      if (runName !== null) finalizeRun(runStart, runEnd, runBlocks);
+      if (runName !== null) finalizeRun(runStart, runEnd);
     }
   }
 }
 
 /**
- * Find coach assignments that form "consecutive shifts" (back-to-back blocks):
- *  - Same coach with morning AND evening on the same day.
- *  - Same coach with evening on day X AND morning on day X+1.
+ * Find coach assignments that form a TIGHT back-to-back schedule, i.e. less
+ * than ~10 hours of rest between two shifts. Flagged cases:
+ *  - Same coach works the LAST evening slot of day X (ending 21:15) AND the
+ *    FIRST morning slot of day X+1 (starting 7:00).
+ *  - Same coach works the FIRST morning slot of day X (starting 7:00) AND the
+ *    LAST evening slot of day X (ending 21:15) — full ~14-hour day.
  *
- * Returns: { slotId: explanationHe } — every slotId that participates in such a
- * back-to-back pair maps to a human-readable Hebrew note. The schedule writer
+ * Looser combinations (morning ending 12:00 + evening starting 18:00, or
+ * evening ending 20:15 + next morning 8:00, etc.) are NOT flagged — there is
+ * enough rest in between.
+ *
+ * Returns: { slotId: explanationHe } — every slotId that participates in such
+ * a tight pair maps to a human-readable Hebrew note. The schedule writer
  * colors these cells orange and prepends the note to the hover tooltip.
  */
+var TIGHT_EVENING_END_ = 21.25;   // 21:15
+var TIGHT_MORNING_START_ = 7.0;   // 7:00
+
 function computeConsecutiveShiftsMap_(slots, assignments) {
   var DAY_ORDER = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי', 'שבת'];
   var dayIndexOf = {};
@@ -377,11 +407,13 @@ function computeConsecutiveShiftsMap_(slots, assignments) {
       var morn = byDay[di2].morning;
       var even = byDay[di2].evening;
 
-      if (morn.length > 0 && even.length > 0) {
+      if (morn.length > 0 && even.length > 0 &&
+          blockStartsAt_(morn, slotById, TIGHT_MORNING_START_) &&
+          blockEndsAt_(even, slotById, TIGHT_EVENING_END_)) {
         var mornSummary = summarizeBlockSlotIds_(morn, slotById);
         var evenSummary = summarizeBlockSlotIds_(even, slotById);
-        var noteSameDay = 'רצף משמרות צמודות — ' + name + ': בוקר (' + mornSummary +
-          ') + ערב (' + evenSummary + ') ביום ' + dayHe + '.';
+        var noteSameDay = 'יום עבודה ארוך במיוחד — ' + name + ': בוקר מ-7:00 (' + mornSummary +
+          ') + ערב עד 21:15 (' + evenSummary + ') ביום ' + dayHe + '. כדאי לתאם איתו.';
         addConsecutiveNote_(out, morn, noteSameDay);
         addConsecutiveNote_(out, even, noteSameDay);
       }
@@ -390,11 +422,14 @@ function computeConsecutiveShiftsMap_(slots, assignments) {
       if (nextDi < DAY_ORDER.length && byDay[nextDi]) {
         var nextDayHe = DAY_ORDER[nextDi];
         var nextMorn = byDay[nextDi].morning;
-        if (even.length > 0 && nextMorn.length > 0) {
+        if (even.length > 0 && nextMorn.length > 0 &&
+            blockEndsAt_(even, slotById, TIGHT_EVENING_END_) &&
+            blockStartsAt_(nextMorn, slotById, TIGHT_MORNING_START_)) {
           var evenSummaryCross = summarizeBlockSlotIds_(even, slotById);
           var nextMornSummary = summarizeBlockSlotIds_(nextMorn, slotById);
-          var noteCross = 'רצף משמרות צמודות — ' + name + ': ערב ' + dayHe + ' (' + evenSummaryCross +
-            ') + בוקר ' + nextDayHe + ' (' + nextMornSummary + ').';
+          var noteCross = 'מנוחה קצרה בין משמרות — ' + name + ': ערב ' + dayHe + ' עד 21:15 (' +
+            evenSummaryCross + ') + בוקר ' + nextDayHe + ' מ-7:00 (' + nextMornSummary +
+            '). פחות מ-10 שעות מנוחה — כדאי לתאם איתו.';
           addConsecutiveNote_(out, even, noteCross);
           addConsecutiveNote_(out, nextMorn, noteCross);
         }
@@ -403,6 +438,26 @@ function computeConsecutiveShiftsMap_(slots, assignments) {
   }
 
   return out;
+}
+
+/** True iff at least one slotId in ids has startTime === target (within 1 min). */
+function blockStartsAt_(ids, slotById, target) {
+  for (var i = 0; i < ids.length; i++) {
+    var s = slotById[ids[i]];
+    if (!s || s.startTime === null || s.startTime === undefined) continue;
+    if (Math.abs(s.startTime - target) < 0.02) return true;
+  }
+  return false;
+}
+
+/** True iff at least one slotId in ids has endTime === target (within 1 min). */
+function blockEndsAt_(ids, slotById, target) {
+  for (var i = 0; i < ids.length; i++) {
+    var s = slotById[ids[i]];
+    if (!s || s.endTime === null || s.endTime === undefined) continue;
+    if (Math.abs(s.endTime - target) < 0.02) return true;
+  }
+  return false;
 }
 
 function addConsecutiveNote_(map, ids, note) {
@@ -536,14 +591,20 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
   row++;
   sheet.getRange(row, 1).setValue('🟠');
   sheet.getRange(row, 2).setValue(
-    'רצף משמרות צמודות — בוקר+ערב באותו יום או ערב→בוקר למחרת. ' +
-    'לא מסמן כמה אימונים באותה משמרת (בוקר או ערב) — רק חצי יום אחד מול השני. צריך תיאום עם המאמן.'
+    'משמרות צמודות עם מנוחה קצרה — ערב עד 21:15 ואחריו בוקר מ-7:00 (פחות מ-10 שעות מנוחה), ' +
+    'או יום עבודה מלא 7:00 + 21:15. צריך תיאום עם המאמן.'
   );
   sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.overlap);
   row++;
   sheet.getRange(row, 1).setValue('🔴');
   sheet.getRange(row, 2).setValue('משמרת לא מולאה — צריך שיבוץ ידני.');
   sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.unfilled);
+  row++;
+  sheet.getRange(row, 1).setValue('⚪');
+  sheet.getRange(row, 2).setValue(
+    'אין אימון השבוע — הזמן הזה נשאר ללא כיתה לפי כמויות ה-WeeklyClasses שהזנת. שנה את הכמויות בדיאלוג והרץ שוב כדי להוסיף.'
+  );
+  sheet.getRange(row, 1, 1, 2).setBackground(SCHEDULE_INACTIVE_BG_).setFontColor(SCHEDULE_INACTIVE_FG_);
 }
 
 // ============================================================
@@ -601,6 +662,9 @@ function buildOverrideNote_(slot, currentAsgn, masterMap, availability, assignme
   var hours = slot.durationHours || 0;
   var isSaturday = slot.day === 'שבת';
   var historyScores = getHistoryScores_();
+  var classTypeRules = loadClassTypeRules_();
+  var classRules = loadRules();
+  var classTypeHe = slot.classType ? classTypeHebrew_(slot.classType) : '';
   var lines = [];
 
   if (currentAsgn && currentAsgn.name) {
@@ -664,6 +728,12 @@ function buildOverrideNote_(slot, currentAsgn, masterMap, availability, assignme
 
     var isAvail = isAvailableForSlot(name, slot, availability);
     if (!isAvail && !hasConflict) flags.push('❌ לא סימן זמינות');
+
+    var classEligible = coachEligibleForClassType_(name, slot.classType, masterMap, classTypeRules, classRules);
+    if (!classEligible) {
+      flags.push('🚫 לא מוסמך/ת לאמן ' + (classTypeHe || slot.classType));
+      hasConflict = true;
+    }
 
     // How far from target? Target is in SHIFTS (day×block), not trainings.
     var target = getShiftTarget(name, masterMap, availability);
@@ -759,6 +829,9 @@ function countAvailableSlots_(name, availability, slots, emp) {
   for (var s = 0; s < slots.length; s++) {
     var slot = slots[s];
     if (slot.block === 'מנהל') continue;
+    // Inactive slots ("אין אימון" — no class running this week) aren't part of
+    // a coach's "available shifts this week" count.
+    if (slot.inactive) continue;
     if (emp && emp.locationRestriction && emp.locationRestriction !== slot.location) continue;
     var dayAvail = avail[slot.day];
     if (!dayAvail || dayAvail.length === 0) continue;
@@ -1846,6 +1919,12 @@ function readUnifiedScheduleAssignments_(sheet, timeGrid, slotIndex, masterMap, 
         var cellValue = String(sheet.getRange(row, col).getDisplayValue()).trim();
         if (!cellValue) continue;
 
+        if (cellValue === SCHEDULE_INACTIVE_LABEL_HE_) {
+          // Capacity slot marked "no class this week" — mark inactive and
+          // skip the assignment lookup entirely.
+          slot.inactive = true;
+          continue;
+        }
         if (cellValue === '⚠') {
           assignments[slot.slotId] = { unfilled: true };
           continue;
@@ -1888,6 +1967,13 @@ function reapplyUnifiedScheduleCellStyles_(
         var col = 2 + d * perDayCols + li;
         var slot = dayMap[loc] && dayMap[loc][slotTimeKey_(timeGrid[t])];
         if (!slot) continue;
+
+        // Preserve "אין אימון" cells across refresh — they were tagged on
+        // the slot during readUnifiedScheduleAssignments_.
+        if (slot.inactive) {
+          writeInactiveSlotCell_(sheet.getRange(row, col));
+          continue;
+        }
 
         var asgn = assignments[slot.slotId];
         if (!asgn && !sheet.getRange(row, col).getDisplayValue()) continue;

@@ -106,6 +106,8 @@ function runMenuConfirmed(actionId) {
       return setupDemoResponsesTabRun_();
     case 'updateTrainingTemplate':
       return updateTrainingTemplateRun_();
+    case 'updateWeeklyClasses':
+      return updateWeeklyClassesRun_();
     case 'syncMentorGoogleForm':
       return syncMentorGoogleFormRun_();
     default:
@@ -125,8 +127,9 @@ function onOpen() {
     .addItem('📖 מדריך שימוש', 'showGuide')
     .addSubMenu(
       ui.createMenu('⚙️ הגדרה ובדיקה')
-        .addItem('🏗️ אתחל טבלאות (MasterData / ShiftTemplate / Rules)', 'setupTables')
+        .addItem('🏗️ אתחל טבלאות (MasterData / ShiftTemplate / Rules / ClassTypeRules / WeeklyClasses)', 'setupTables')
         .addItem('📅 עדכן תבנית אימונים', 'updateTrainingTemplate')
+        .addItem('📊 כמויות אימונים שבועיות', 'updateWeeklyClasses')
         .addItem('📝 בנה מחדש טופס Google', 'syncMentorGoogleForm')
         .addItem('🔧 הכן טאב תשובות דמו', 'setupDemoResponsesTab')
         .addItem('🧪 טען זמינות דמו לבדיקה', 'loadFakeMentorResponses')
@@ -206,17 +209,79 @@ function showGuideImpl_() {
 }
 
 function optimizeShifts() {
-  showRtlConfirmDialog_(
-    'optimizeShifts',
-    '🚀 הרץ שיבוץ שבועי',
-    'מה זה עושה: בונה לו"ז שבועי לפי זמינות המשמרת שהמאמנים סימנו בטופס, ושיבוץ לאימונים שעתיים בתוך החלון שביקשו.\n\n'
-      + 'סדר עדיפויות: דרגה 1 לפני 2 לפני 3. דרגות 2–3 מקבלות העדפה להימנע ממשמרות צמודות (בוקר→ערב באותו יום או ערב→בוקר למחרת).\n\n'
-      + 'טבלאות:\n'
-      + '• קורא בלבד: "' + CONFIG.sheets.masterData + '", "' + getAvailabilitySheetName_() + '", '
-      + '"' + CONFIG.sheets.shiftTemplate + '", "' + CONFIG.sheets.rules + '".\n'
-      + '• כותב מחדש: גיליון "' + CONFIG.sheets.schedule + '" (כל התוכן הקודם נמחק).\n\n'
-      + 'להמשיך?'
+  showWeeklyClassCountsDialog_();
+}
+
+/**
+ * Opens the RTL dialog that asks the user to enter the weekly count per
+ * class type. On submit the dialog calls runOptimizeWithClassCounts (defined
+ * below) which writes the counts into the WeeklyClasses sheet and runs the
+ * optimizer + result toast just like the legacy confirm flow used to.
+ */
+function showWeeklyClassCountsDialog_() {
+  var existing = loadWeeklyClassCountsFromSheet_();
+  var ids = getClassTypeIds_();
+  var rows = [];
+  for (var i = 0; i < ids.length; i++) {
+    var id = ids[i];
+    rows.push({
+      id: id,
+      he: classTypeHebrew_(id),
+      count: existing[id] != null ? existing[id] : 0
+    });
+  }
+  var t = HtmlService.createTemplateFromFile('WeeklyClassCountsDialog');
+  t.classTypes = rows;
+  t.sheetName = CONFIG.sheets.weeklyClasses;
+  t.capacity = computeWeeklyClassCapacity_();
+  SpreadsheetApp.getUi().showModalDialog(
+    t.evaluate().setWidth(560).setHeight(680),
+    '🚀 הרץ שיבוץ שבועי'
   );
+}
+
+/**
+ * Dispatched from WeeklyClassCountsDialog after the user enters counts and
+ * clicks "אישור והרץ שיבוץ". Saves the counts, then runs the optimizer and
+ * returns the standard {ok, title, message} object so the dialog can render
+ * the result panel in place.
+ *
+ * Name must NOT end with "_" — private functions are blocked from
+ * google.script.run.
+ */
+function runOptimizeWithClassCounts(counts) {
+  counts = counts || {};
+
+  // Server-side capacity guard. The dialog already validates total in the
+  // browser, but we double-check here so a stale or hand-crafted POST can't
+  // silently overflow the grid.
+  var capacity = computeWeeklyClassCapacity_();
+  var total = 0;
+  var ids = getClassTypeIds_();
+  for (var i = 0; i < ids.length; i++) {
+    var n = parseInt(counts[ids[i]], 10);
+    if (!isNaN(n) && n > 0) total += n;
+  }
+  if (total === 0) {
+    throw new Error(
+      'לא הוזנו אימונים השבוע. הזן לפחות כיתה אחת לפני הרצת השיבוץ.'
+    );
+  }
+  if (total > capacity) {
+    throw new Error(
+      'סה"כ אימוני השבוע (' + total + ') גדול מהקיבולת המקסימלית של ' +
+      CONFIG.sheets.shiftTemplate + ' (' + capacity + '). ' +
+      'הפחת את הכמויות לפני הרצה.'
+    );
+  }
+
+  try {
+    saveWeeklyClassCounts_(counts);
+  } catch (e) {
+    Logger.log('saveWeeklyClassCounts_ failed: ' + e + (e && e.stack ? '\n' + e.stack : ''));
+    throw new Error('שמירת כמויות האימונים נכשלה:\n\n' + (e && e.message ? e.message : e));
+  }
+  return optimizeShiftsRun_();
 }
 
 /**
@@ -243,12 +308,31 @@ function optimizeShiftsRunCore_() {
     Logger.log('updateAvailabilitySummary_ (live) failed: ' + e);
   }
 
-  var slots = loadShiftTemplates();
-  if (slots.length === 0) throw new Error('לא נמצאו אימונים בטבלת ShiftTemplate.');
+  var allSlots = loadShiftTemplates();
+  if (allSlots.length === 0) throw new Error('לא נמצאו אימונים בטבלת ShiftTemplate.');
+
+  // Distribute the staff-entered weekly class counts across the capacity
+  // grid: tag the active slots with a classType, mark the rest inactive.
+  var weeklyCounts = loadWeeklyClassCountsFromSheet_();
+  var distribution = distributeClassesIntoSlots_(allSlots, weeklyCounts);
+  var activeSlots = distribution.activeSlots;
+  if (activeSlots.length === 0) {
+    throw new Error(
+      'לא הוגדרו אימונים השבוע (סה"כ Count ב-' + CONFIG.sheets.weeklyClasses + ' = 0).\n' +
+      'הזן כמויות בדיאלוג "🚀 הרץ שיבוץ שבועי" לפני שמריצים שיבוץ.'
+    );
+  }
 
   var rules = loadRules();
-  var result = optimizeWeek(slots, availability, masterMap, rules);
-  writeSchedule(result, slots, masterMap, availability, notes);
+  var result = optimizeWeek(activeSlots, availability, masterMap, rules);
+
+  // Surface any distribution warnings (e.g. requested > capacity) up to the
+  // user as part of the post-run summary.
+  if (distribution && distribution.warnings && distribution.warnings.length) {
+    result.warnings = (result.warnings || []).concat(distribution.warnings);
+  }
+
+  writeSchedule(result, allSlots, masterMap, availability, notes, distribution);
   var history = getFairnessHistory(4);
 
   return {
@@ -256,7 +340,8 @@ function optimizeShiftsRunCore_() {
     employeeCount: employeeCount,
     respondentCount: respondentCount,
     availability: availability,
-    slots: slots,
+    slots: activeSlots,
+    distribution: distribution,
     result: result,
     history: history
   };
@@ -276,7 +361,21 @@ function buildOptimizerSummaryMessage_(d) {
   msg += '📊 סיכום כללי:\n';
   msg += '• עובדים במערכת: ' + employeeCount + '\n';
   msg += '• עובדים שמילאו טופס: ' + respondentCount + '\n';
-  msg += '• סה"כ אימונים לשיבוץ: ' + slots.length + '\n';
+  if (d.distribution) {
+    msg += '• סה"כ אימונים השבוע: ' + d.distribution.activeTotal +
+      ' (מתוך קיבולת ' + d.distribution.capacity + ')\n';
+    var placed = d.distribution.placedByType || {};
+    var ids = getClassTypeIds_();
+    var parts = [];
+    for (var ci = 0; ci < ids.length; ci++) {
+      var pid = ids[ci];
+      var pCount = placed[pid] || 0;
+      if (pCount > 0) parts.push(classTypeHebrew_(pid) + ': ' + pCount);
+    }
+    if (parts.length) msg += '• פילוח לפי סוג: ' + parts.join(' · ') + '\n';
+  } else {
+    msg += '• סה"כ אימונים לשיבוץ: ' + slots.length + '\n';
+  }
 
   var unfilledCount = 0;
   var slotIds = Object.keys(result.assignments);

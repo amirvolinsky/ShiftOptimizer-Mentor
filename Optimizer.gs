@@ -54,10 +54,8 @@ function getShiftTarget(name, masterMap, availability, rules) {
     return Math.max(1, daysWithAvail);
   }
 
-  var defaultTarget = Number(rules.default_target_shifts_per_week || 5);
-  if (defaultTarget <= 0) defaultTarget = 5;
   var dyn = Math.max(1, daysWithAvail - 1);
-  return Math.min(dyn, defaultTarget);
+  return Math.min(dyn, 5);
 }
 
 /**
@@ -83,11 +81,13 @@ function optimizeWeek(slots, availability, masterMap, rules) {
   var optimizationMode = 'fair';
   // Ensure shift target uses the same rules object throughout this run.
   SHIFT_TARGET_RULES_CACHE_ = rules || null;
+  var classTypeRules = loadClassTypeRules_();
   var state = {
     assigned: {},
     employeeShifts: {},
     warnings: [],
     _slotMap: buildSlotMap_(slots),
+    _classTypeRules: classTypeRules,
     optimizationMode: optimizationMode
   };
 
@@ -263,9 +263,9 @@ function assignShiftBlock_(group, availability, masterMap, rules, state) {
     if (!canAssignMoreClasses_(cand.name, cand.length, rules, state)) continue;
     if (candidateAlreadyHasAnyTime_(cand, state)) continue;
 
-    var assignedSlots = findStickyNetAssignment_(cand, state);
+    var assignedSlots = findStickyNetAssignment_(cand, state, masterMap, rules);
     if (!assignedSlots) {
-      assignedSlots = findSpreadAssignment_(cand, state);
+      assignedSlots = findSpreadAssignment_(cand, state, masterMap, rules);
     }
     if (!assignedSlots) continue;
 
@@ -291,6 +291,12 @@ function buildShiftBlockCandidates_(group, availability, masterMap, rules, state
 
     for (var r = 0; r < ranges.length; r++) {
       var timeKeys = timeKeysCoveredByRange_(group, ranges[r]);
+      // Drop timeKeys where the coach can't teach ANY of the parallel-net
+      // classes at that time. This naturally truncates the shift to the
+      // teachable subset — and the rest will be picked up by another eligible
+      // coach later in the same pass (gives us "split within a shift" for free
+      // for class types like E with allowSplit: true).
+      timeKeys = filterTimeKeysByClassEligibility_(group, timeKeys, name, masterMap, state, rules);
       if (!timeKeys.length) continue;
       candidates.push({
         name: name,
@@ -309,6 +315,32 @@ function buildShiftBlockCandidates_(group, availability, masterMap, rules, state
     }
   }
   return candidates;
+}
+
+/**
+ * For each timeKey in `keys`, keep it only if the coach can teach at least
+ * one parallel-net slot at that time. Untagged slots (no ClassType) are
+ * always teachable. When the master kill switch
+ * `class_type_eligibility_enabled` is FALSE every timeKey is kept.
+ */
+function filterTimeKeysByClassEligibility_(group, keys, coachName, masterMap, state, rules) {
+  if (rules && rules.class_type_eligibility_enabled === false) return keys.slice();
+  var classTypeRules = state && state._classTypeRules;
+  if (!classTypeRules) return keys.slice();
+
+  var kept = [];
+  for (var i = 0; i < keys.length; i++) {
+    var slotsAtTime = group.slotsByTime[keys[i]] || [];
+    var canTeachAny = false;
+    for (var s = 0; s < slotsAtTime.length; s++) {
+      if (coachEligibleForClassType_(coachName, slotsAtTime[s].classType, masterMap, classTypeRules, rules)) {
+        canTeachAny = true;
+        break;
+      }
+    }
+    if (canTeachAny) kept.push(keys[i]);
+  }
+  return kept;
 }
 
 /** Count unique (day, block) pairs the coach is already assigned to. */
@@ -363,7 +395,7 @@ function candidateAlreadyHasAnyTime_(candidate, state) {
   return false;
 }
 
-function findStickyNetAssignment_(candidate, state) {
+function findStickyNetAssignment_(candidate, state, masterMap, rules) {
   for (var l = 0; l < CONFIG.locations.length; l++) {
     var location = CONFIG.locations[l];
     var out = [];
@@ -371,6 +403,10 @@ function findStickyNetAssignment_(candidate, state) {
     for (var t = 0; t < candidate.timeKeys.length; t++) {
       var slot = findSlotForLocationAtTime_(candidate.group.slotsByTime[candidate.timeKeys[t]], location);
       if (!slot || state.assigned[slot.slotId] || hasTimeConflict(candidate.name, slot, null, state)) {
+        ok = false;
+        break;
+      }
+      if (!coachEligibleForClassType_(candidate.name, slot.classType, masterMap, state._classTypeRules, rules)) {
         ok = false;
         break;
       }
@@ -388,17 +424,18 @@ function findSlotForLocationAtTime_(slotsAtTime, location) {
   return null;
 }
 
-function findSpreadAssignment_(candidate, state) {
+function findSpreadAssignment_(candidate, state, masterMap, rules) {
   var out = [];
   for (var t = 0; t < candidate.timeKeys.length; t++) {
     var slotsAtTime = candidate.group.slotsByTime[candidate.timeKeys[t]] || [];
     var picked = null;
     for (var s = 0; s < slotsAtTime.length; s++) {
       var slot = slotsAtTime[s];
-      if (!state.assigned[slot.slotId] && !hasTimeConflict(candidate.name, slot, null, state)) {
-        picked = slot;
-        break;
-      }
+      if (state.assigned[slot.slotId]) continue;
+      if (hasTimeConflict(candidate.name, slot, null, state)) continue;
+      if (!coachEligibleForClassType_(candidate.name, slot.classType, masterMap, state._classTypeRules, rules)) continue;
+      picked = slot;
+      break;
     }
     if (!picked) return null;
     out.push(picked);
@@ -503,7 +540,8 @@ function rebuildStateFromAssignments_(assignments, slots, masterMap) {
     assigned: {},
     employeeShifts: {},
     warnings: [],
-    _slotMap: buildSlotMap_(slots)
+    _slotMap: buildSlotMap_(slots),
+    _classTypeRules: loadClassTypeRules_()
   };
   var empNames = Object.keys(masterMap);
   for (var i = 0; i < empNames.length; i++) {
@@ -710,6 +748,7 @@ function pickBestCandidate_(slot, availability, masterMap, rules, state) {
 function getEligibleCandidates(slot, availability, masterMap, rules, state) {
   var candidates = [];
   var empNames = Object.keys(masterMap);
+  var classTypeRules = state && state._classTypeRules;
 
   for (var i = 0; i < empNames.length; i++) {
     var name = empNames[i];
@@ -718,6 +757,7 @@ function getEligibleCandidates(slot, availability, masterMap, rules, state) {
     if (!isAvailableForSlot(name, slot, availability)) continue;
     if (!meetsLocationRestriction(emp, slot)) continue;
     if (hasTimeConflict(name, slot, null, state)) continue;
+    if (!coachEligibleForClassType_(name, slot.classType, masterMap, classTypeRules, rules)) continue;
 
     var currentCount = (state.employeeShifts[name] || []).length;
     var maxShifts = getEmployeeMaxShifts_(rules);
@@ -826,13 +866,29 @@ function assignEmployee(nameOrEmp, slot, masterMap, state) {
  * Phase 3: For unfilled slots, suggest the best employee who didn't mark availability
  * who are still under their soft shift target.
  * Marks these as "suggested" (blue) -- not confirmed assignments.
+ *
+ * Slots are processed in (day, location, block, startTime) order so that any
+ * neighbor-continuity preference (added in rankSuggestionCandidates_) can
+ * propagate across a run of consecutive unfilled slots — e.g. if 8:00–9:00 is
+ * suggested for coach X because X is already at 7:00–8:00, then 9:00–10:00
+ * (also unfilled) will see X as the neighbor and keep him in the chain.
  */
 function suggestForUnfilled(slots, availability, masterMap, rules, state, optimizationMode) {
   optimizationMode = optimizationMode || state.optimizationMode || 'economical';
   var empNames = Object.keys(masterMap);
 
-  for (var s = 0; s < slots.length; s++) {
-    var slot = slots[s];
+  var ordered = slots.slice().sort(function(a, b) {
+    var dd = dayOrder_(a.day) - dayOrder_(b.day);
+    if (dd !== 0) return dd;
+    var ll = String(a.location).localeCompare(String(b.location));
+    if (ll !== 0) return ll;
+    var bo = blockOrder_(a.block) - blockOrder_(b.block);
+    if (bo !== 0) return bo;
+    return (a.startTime || 0) - (b.startTime || 0);
+  });
+
+  for (var s = 0; s < ordered.length; s++) {
+    var slot = ordered[s];
     var asgn = state.assigned[slot.slotId];
     if (!asgn || !asgn.unfilled) continue;
 
@@ -901,6 +957,20 @@ function suggestForUnfilled(slots, availability, masterMap, rules, state, optimi
 /**
  * Rank suggestion candidates for an unfilled slot.
  * Mode-aware: fair/balanced prefer under-target; economical prefers cost.
+ *
+ * Continuity preference (three levels, computed by computeNeighborLevel_):
+ *  2 = candidate is already on the SAME net at an adjacent training time
+ *      → strongly prefer (clean visual run on one net).
+ *  1 = candidate is on a different net at an adjacent time, AND that other
+ *      net is already filled for this time slot (the coach has nowhere else
+ *      to go — a net jump is the best we can do to avoid idle time).
+ *  0 = no adjacent training, OR adjacent only on a different net that ALSO
+ *      has an unfilled slot at this same time. In the latter case we defer
+ *      the candidate so they land on their own net later in the pass.
+ *
+ * The intent is to keep a coach in a run of consecutive trainings on one net
+ * (e.g. 7–8, 8–9, 9–10 all on Net1) instead of inserting a different coach
+ * for a single hour or making the coach hop between nets.
  */
 function rankSuggestionCandidates_(slot, empNames, masterMap, rules, state, availability, optimizationMode) {
   optimizationMode = optimizationMode || state.optimizationMode || 'economical';
@@ -912,6 +982,16 @@ function rankSuggestionCandidates_(slot, empNames, masterMap, rules, state, avai
 
     if (emp.locationRestriction && emp.locationRestriction !== slot.location) continue;
     if (hasTimeConflict(name, slot, null, state)) continue;
+    if (!coachEligibleForClassType_(name, slot.classType, masterMap, state._classTypeRules, rules)) continue;
+
+    // Rank 4 (reserve) is "filler of fillers": only suggest them in blue when
+    // they actually submitted some availability this week. A reserve coach
+    // who didn't fill the form at all (e.g. מיתר for a given week) should not
+    // appear as a system suggestion — they're off the roster for that week.
+    if (normalizeMentorRank_(emp.rank) >= CONFIG.ranks.max &&
+        !hasSubmittedAnyAvailability_(name, availability)) {
+      continue;
+    }
 
     var currentCount = (state.employeeShifts[name] || []).length;
     var maxShifts = getEmployeeMaxShifts_(rules);
@@ -922,15 +1002,21 @@ function rankSuggestionCandidates_(slot, empNames, masterMap, rules, state, avai
 
     var gapSoft = target - currentCount;
     var remainingCap = maxShifts - currentCount;
+    var neighbor = computeNeighborLevel_(name, slot, state);
 
     candidates.push({
       name: name,
       gapSoft: gapSoft,
-      remainingCap: remainingCap
+      remainingCap: remainingCap,
+      neighbor: neighbor
     });
   }
 
   candidates.sort(function(a, b) {
+    // Coaches already on an adjacent training come first so we keep them
+    // in a continuous run on one net (level 2) and avoid net jumps (level 1).
+    if (a.neighbor !== b.neighbor) return b.neighbor - a.neighbor;
+
     var aUnder = a.gapSoft > 0 ? 1 : 0;
     var bUnder = b.gapSoft > 0 ? 1 : 0;
     if (aUnder !== bUnder) return bUnder - aUnder;
@@ -940,6 +1026,80 @@ function rankSuggestionCandidates_(slot, empNames, masterMap, rules, state, avai
   });
 
   return candidates;
+}
+
+/**
+ * True iff the coach submitted ANY availability this week (at least one day
+ * has at least one range or block). Used to gate Rank 4 reserves out of the
+ * suggestion pool when they didn't fill the form at all.
+ */
+function hasSubmittedAnyAvailability_(name, availability) {
+  if (!availability || !availability[name]) return false;
+  var avail = availability[name];
+  var days = Object.keys(avail);
+  for (var i = 0; i < days.length; i++) {
+    if (avail[days[i]] && avail[days[i]].length > 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Three-level continuity score for placing `name` on `slot` (an unfilled slot):
+ *   2 — coach already on the SAME net at an adjacent time (clean same-net run).
+ *   1 — coach only on a DIFFERENT net at an adjacent time, AND that net is
+ *       already filled at slot's time (a net jump is the only way to keep the
+ *       coach in a continuous chunk).
+ *   0 — no adjacent training, OR an adjacent net also has an unfilled slot at
+ *       slot's exact time (defer the coach to that net instead).
+ *
+ * Adjacency uses a ≤30-minute time gap (to cover the 19:00 → 19:15 evening
+ * boundary) within the same day and the same block. The block check stops the
+ * 12:00 → 16:00 morning/evening gap from counting as "adjacent".
+ */
+function computeNeighborLevel_(name, slot, state) {
+  if (!slot || slot.startTime == null || slot.endTime == null) return 0;
+  var slotMap = state._slotMap || {};
+  var sameNet = false;
+  var crossNets = {};
+
+  var assignedIds = Object.keys(state.assigned);
+  for (var i = 0; i < assignedIds.length; i++) {
+    var a = state.assigned[assignedIds[i]];
+    if (!a || a.unfilled || a.managerSlot || a.name !== name) continue;
+    var other = slotMap[assignedIds[i]];
+    if (!other || other.startTime == null || other.endTime == null) continue;
+    if (other.day !== slot.day) continue;
+    if (other.block !== slot.block) continue;
+
+    var gapAfter = other.startTime - slot.endTime;   // other follows slot
+    var gapBefore = slot.startTime - other.endTime;  // other precedes slot
+    var adjacent = (gapAfter >= 0 && gapAfter <= 0.5) || (gapBefore >= 0 && gapBefore <= 0.5);
+    if (!adjacent) continue;
+
+    if (other.location === slot.location) {
+      sameNet = true;
+    } else {
+      crossNets[other.location] = true;
+    }
+  }
+
+  if (sameNet) return 2;
+  var crossNetList = Object.keys(crossNets);
+  if (crossNetList.length === 0) return 0;
+
+  // Cross-net only. If the coach's adjacent net ALSO has an unfilled slot at
+  // this exact time, defer — we want the coach to land there, not here.
+  for (var j = 0; j < assignedIds.length; j++) {
+    var aj = state.assigned[assignedIds[j]];
+    if (!aj || !aj.unfilled) continue;
+    var sj = slotMap[assignedIds[j]];
+    if (!sj || sj.startTime == null || sj.endTime == null) continue;
+    if (sj.day !== slot.day || sj.block !== slot.block) continue;
+    if (Math.abs(sj.startTime - slot.startTime) >= 0.02) continue;
+    if (Math.abs(sj.endTime - slot.endTime) >= 0.02) continue;
+    if (crossNets[sj.location]) return 0;
+  }
+  return 1;
 }
 
 /**

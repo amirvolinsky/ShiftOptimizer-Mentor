@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <base target="_top">
+  <meta charset="utf-8"/>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      direction: rtl;
+      text-align: right;
+      font-family: Arial, "Segoe UI", Helvetica, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      color: #202124;
+      background: #fff;
+    }
+    body { padding: 18px 22px 16px; }
+    body.is-busy { cursor: wait; }
+    h1 {
+      font-size: 17px;
+      font-weight: 600;
+      margin: 0 0 10px;
+      text-align: right;
+    }
+    .intro {
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      unicode-bidi: plaintext;
+      color: #444;
+      margin-bottom: 14px;
+    }
+    .counts {
+      border: 1px solid #e0e0e0;
+      border-radius: 6px;
+      padding: 8px 12px;
+      margin-bottom: 14px;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+    .count-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 6px 0;
+      border-bottom: 1px dashed #f0f0f0;
+    }
+    .count-row:last-child { border-bottom: none; }
+    .count-row label {
+      flex: 1;
+      min-width: 0;
+    }
+    .count-row .label-he {
+      font-weight: 600;
+    }
+    .count-row .label-id {
+      color: #888;
+      font-size: 12px;
+      margin-inline-start: 6px;
+    }
+    .count-row input {
+      width: 80px;
+      padding: 6px 8px;
+      font-size: 14px;
+      border: 1px solid #dadce0;
+      border-radius: 4px;
+      text-align: center;
+      direction: ltr;
+    }
+    .total-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 600;
+      padding: 6px 12px;
+      background: #f6f9f8;
+      border-radius: 6px;
+      margin-bottom: 6px;
+    }
+    .total-row .total-num {
+      font-size: 16px;
+      color: #2E7D6B;
+    }
+    .total-row.over {
+      background: #fce8e6;
+    }
+    .total-row.over .total-num {
+      color: #c5221f;
+    }
+    .capacity-hint {
+      font-size: 12px;
+      color: #5f6368;
+      margin: 0 4px 14px;
+      text-align: right;
+      unicode-bidi: plaintext;
+    }
+    .capacity-hint.over {
+      color: #c5221f;
+      font-weight: 600;
+    }
+    .actions {
+      margin-top: 6px;
+      padding-top: 14px;
+      border-top: 1px solid #e8eaed;
+      text-align: center;
+    }
+    button {
+      margin: 4px 6px;
+      padding: 9px 20px;
+      font-size: 14px;
+      cursor: pointer;
+      border-radius: 6px;
+      border: 1px solid #dadce0;
+      background: #fff;
+      color: #1a73e8;
+    }
+    button.primary {
+      background: #1a73e8;
+      color: #fff;
+      border-color: #1a73e8;
+    }
+    button:disabled {
+      opacity: 0.85;
+      cursor: not-allowed;
+    }
+    button.primary.is-busy {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      justify-content: center;
+    }
+    .spinner {
+      width: 15px;
+      height: 15px;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.65s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #err {
+      color: #c5221f;
+      margin-top: 10px;
+      white-space: pre-wrap;
+      text-align: right;
+      unicode-bidi: plaintext;
+    }
+    .body-text {
+      white-space: pre-wrap;
+      word-wrap: break-word;
+      unicode-bidi: plaintext;
+      text-align: right;
+      max-height: 420px;
+      overflow-y: auto;
+      display: none;
+    }
+    .body-text.visible { display: block; }
+  </style>
+</head>
+<body>
+  <h1 id="dlgTitle">🚀 הרץ שיבוץ שבועי</h1>
+
+  <div id="form">
+    <div class="intro">לפני הרצת השיבוץ — הזן את כמות האימונים השבוע לכל סוג כיתה. הערכים יישמרו ב-"<?= sheetName ?>" וישמשו כקלט לבניית הלו"ז.</div>
+
+    <div class="counts" id="countsBox">
+      <? for (var i = 0; i < classTypes.length; i++) { ?>
+        <div class="count-row">
+          <label>
+            <span class="label-he"><?= classTypes[i].he ?></span>
+            <span class="label-id"><?= classTypes[i].id ?></span>
+          </label>
+          <input type="number" min="0" step="1" inputmode="numeric"
+                 data-class-id="<?= classTypes[i].id ?>"
+                 value="<?= classTypes[i].count ?>">
+        </div>
+      <? } ?>
+    </div>
+
+    <div class="total-row" id="totalRow">
+      <span>סה"כ אימוני השבוע:</span>
+      <span class="total-num" id="totalNum">0</span>
+    </div>
+    <div class="capacity-hint" id="capacityHint">
+      קיבולת מקסימלית של ShiftTemplate: <b><?= capacity ?></b> אימונים בשבוע (יום × שעה × רשת). מה שלא משובץ — מסומן "אין אימון" באפור.
+    </div>
+  </div>
+
+  <div class="body-text" id="dlgBody"></div>
+
+  <div id="err"></div>
+
+  <div class="actions" id="actions">
+    <button type="button" id="btnOk" class="primary" onclick="onConfirm()">אישור והרץ שיבוץ</button>
+    <button type="button" id="btnCancel" onclick="google.script.host.close()">ביטול</button>
+  </div>
+
+  <script>
+    var inputs = document.querySelectorAll('input[data-class-id]');
+    var locked = false;
+    var CAPACITY = parseInt('<?= capacity ?>', 10) || 165;
+
+    function recalcTotal() {
+      var t = 0;
+      for (var i = 0; i < inputs.length; i++) {
+        var v = parseInt(inputs[i].value, 10);
+        if (!isNaN(v) && v > 0) t += v;
+      }
+      document.getElementById('totalNum').textContent = t;
+      var over = t > CAPACITY;
+      document.getElementById('totalRow').classList.toggle('over', over);
+      var hint = document.getElementById('capacityHint');
+      hint.classList.toggle('over', over);
+      if (over) {
+        hint.innerHTML = '⚠ סך האימונים (' + t + ') חורג מהקיבולת המקסימלית (' + CAPACITY + '). הפחת לפני הרצה.';
+      } else {
+        hint.innerHTML = 'קיבולת מקסימלית של ShiftTemplate: <b>' + CAPACITY +
+          '</b> אימונים בשבוע (יום × שעה × רשת). מה שלא משובץ — מסומן "אין אימון" באפור.';
+      }
+      document.getElementById('btnOk').disabled = (t === 0 || over || locked);
+      return { total: t, over: over };
+    }
+    for (var i = 0; i < inputs.length; i++) {
+      inputs[i].addEventListener('input', recalcTotal);
+    }
+    recalcTotal();
+
+    function setBusy(busy) {
+      var ok = document.getElementById('btnOk');
+      var cancel = document.getElementById('btnCancel');
+      document.body.classList.toggle('is-busy', busy);
+      ok.disabled = busy;
+      cancel.disabled = busy;
+      if (busy) {
+        ok.classList.add('is-busy');
+        ok.innerHTML = '<span class="spinner" aria-hidden="true"></span><span>מריץ שיבוץ…</span>';
+      } else {
+        ok.classList.remove('is-busy');
+        ok.textContent = 'אישור והרץ שיבוץ';
+      }
+    }
+
+    function showResult(result) {
+      setBusy(false);
+      locked = false;
+      var title = (result && result.title) ? result.title : '✅ הושלם';
+      var message = (result && result.message) ? result.message : 'השיבוץ הסתיים בהצלחה.';
+      document.getElementById('dlgTitle').textContent = title;
+      document.getElementById('form').style.display = 'none';
+      var body = document.getElementById('dlgBody');
+      body.textContent = message;
+      body.classList.add('visible');
+      document.getElementById('err').textContent = '';
+      document.getElementById('btnOk').style.display = 'none';
+      var cancel = document.getElementById('btnCancel');
+      cancel.textContent = 'סגור';
+      cancel.disabled = false;
+      cancel.classList.add('primary');
+      cancel.onclick = function () { google.script.host.close(); };
+    }
+
+    function onConfirm() {
+      if (locked) return;
+
+      var counts = {};
+      var anyInvalid = false;
+      for (var i = 0; i < inputs.length; i++) {
+        var id = inputs[i].dataset.classId;
+        var raw = inputs[i].value;
+        if (raw === '' || raw === null || raw === undefined) {
+          counts[id] = 0;
+          continue;
+        }
+        var n = parseInt(raw, 10);
+        if (isNaN(n) || n < 0) {
+          anyInvalid = true;
+          inputs[i].style.borderColor = '#c5221f';
+        } else {
+          counts[id] = n;
+          inputs[i].style.borderColor = '#dadce0';
+        }
+      }
+      if (anyInvalid) {
+        document.getElementById('err').textContent = 'נא להזין מספר שלם אי-שלילי בכל השדות (או להשאיר ריק לערך 0).';
+        return;
+      }
+
+      var totals = recalcTotal();
+      if (totals.total === 0) {
+        document.getElementById('err').textContent = 'הזן לפחות אימון אחד לפני הרצת השיבוץ.';
+        return;
+      }
+      if (totals.over) {
+        document.getElementById('err').textContent = 'סך האימונים (' + totals.total + ') חורג מהקיבולת (' + CAPACITY + '). הפחת ערכים לפני הרצה.';
+        return;
+      }
+
+      locked = true;
+      document.getElementById('err').textContent = '';
+      setBusy(true);
+
+      google.script.run
+        .withSuccessHandler(function (result) {
+          if (result && result.ok) {
+            showResult(result);
+            return;
+          }
+          google.script.host.close();
+        })
+        .withFailureHandler(function (err) {
+          locked = false;
+          setBusy(false);
+          var msg = (err && err.message) ? err.message : String(err);
+          document.getElementById('err').textContent = msg;
+        })
+        .runOptimizeWithClassCounts(counts);
+    }
+  </script>
+</body>
+</html>

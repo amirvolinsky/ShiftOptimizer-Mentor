@@ -6,7 +6,10 @@
  *   WeeklyMin | WeeklyMax — typical weekly shift target window (a "shift" =
  *                           morning OR evening half-day block). Both optional;
  *                           default to 0 / unlimited respectively.
- *   LocationRestriction    — optional, locks a coach to a specific net.
+ *   Gender                — 'M' / 'F'. Used by class-type eligibility rules
+ *                           (e.g. E classes are male-only). Defaults to 'M'
+ *                           when the column or cell is blank.
+ *   LocationRestriction   — optional, locks a coach to a specific net.
  */
 function loadMasterData() {
   var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.sheets.masterData);
@@ -31,12 +34,17 @@ function loadMasterData() {
     var weeklyMax = cols.weeklyMax >= 0 ? parseShiftTargetNumber_(data[i][cols.weeklyMax], null) : null;
     if (weeklyMax !== null && weeklyMax < weeklyMin) weeklyMax = weeklyMin;
 
+    var gender = cols.gender >= 0
+      ? normalizeMentorGender_(data[i][cols.gender])
+      : 'M';
+
     employees[name] = {
       name: name,
       rank: rank,
       locationRestriction: locationRestriction || '',
       weeklyMin: weeklyMin,
-      weeklyMax: weeklyMax
+      weeklyMax: weeklyMax,
+      gender: gender
     };
   }
 
@@ -55,7 +63,7 @@ function parseShiftTargetNumber_(val, fallback) {
 
 /**
  * @param {Array} headerRow
- * @returns {{name:number, rank:number, location:number, weeklyMin:number, weeklyMax:number}}
+ * @returns {{name:number, rank:number, location:number, weeklyMin:number, weeklyMax:number, gender:number}}
  */
 function mapMasterDataColumns_(headerRow) {
   var headers = [];
@@ -73,12 +81,13 @@ function mapMasterDataColumns_(headerRow) {
     rank: idx('Rank', 1),
     location: idx('LocationRestriction', -1),
     weeklyMin: idx('WeeklyMin', -1),
-    weeklyMax: idx('WeeklyMax', -1)
+    weeklyMax: idx('WeeklyMax', -1),
+    gender: idx('Gender', -1)
   };
 }
 
-/** Weekly shift cap (from Rules when not in basicMode). */
+/** Technical cap on training slots per coach per week (WeeklyMax is the real limit). */
 function getEmployeeMaxShifts_(rules) {
   if (isBasicMode_()) return 99;
-  return (rules && rules.max_shifts_per_week) || 6;
+  return 6;
 }
