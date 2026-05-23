@@ -297,6 +297,9 @@ function optimizeShiftsRunCore_() {
   var availability = responseData.availability;
   var notes = responseData.notes || {};
   var respondentCount = Object.keys(availability).length;
+  // Make the form-submitted weekly targets available to getShiftTarget for
+  // the rest of this run (and the schedule writer that follows).
+  setShiftTargetFormCache_(responseData.weeklyTargets || {});
 
   // Refresh the per-coach summary columns (hours / shifts) at the right edge
   // of the responses sheet so the staff can see what each coach offered.

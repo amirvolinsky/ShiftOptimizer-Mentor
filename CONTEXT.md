@@ -32,12 +32,13 @@ Code adapts to the sheet; do not rename form columns once employees use the form
 | Part | Content |
 |------|---------|
 | First page | `שם מאמן` (dropdown) |
+| First page | `כמות משמרות מבוקשת` — single-choice 1–6. Required. The optimizer uses this as the coach's weekly target (overrides `MasterData.WeeklyMax`) and applies the **+1 cap**: effective target = `min(submitted_target, submitted_days + 1)`. |
 | Section **ראשון-Domingo** | שאלה אחת (תיבות סימון): כותרת **ראשון-Domingo** … **חמישי-Quinta** |
 | | Morning: `7:00 עד 9:00` … `10:00 עד 12:00` + longer ranges · `לא זמין / Não disponível` |
 | | Evening: `16:00 עד 18:00` … `19:00 עד 21:15` + longer ranges (Sun–Thu only) |
 | | Per day: optional paragraph **הערה &lt;יום&gt;** (stored in sheet; UI later) |
 | Sections **שני** … **חמישי** | בוקר + ערב + לא זמין |
-| Section **שישי-Sexta** | **בוקר בלבד** (4 טווחי בוקר + לא זמין — בלי ערב) |
+| Section **שישי-Sexta** | **בוקר בלבד** (4 טווחי בוקר + לא זמין — בלי ערב; Friday morning is 7–11, no 11–12 slot) |
 
 **חשוב:** כותרת הסקשן לא נכנסת לגיליון — כותרת השאלה חייבת להיות `ראשון`, `שני`, וכו' (לא "בוקר" בלבד).
 
@@ -95,6 +96,32 @@ Two-layer model:
 - **Scheduled shift** = a contiguous run of 4 trainings (the canonical full shift) anchored at one of the rules below; coaches whose availability is shorter than 4 still get scheduled for whatever they have (2–3 trainings) under the old "min 2h" fallback. Coaches whose availability spans morning **and** evening on the same day may be assigned **both** blocks, but the existing "long day" warning fires on the cell.
 - Nets are anonymous parallel capacity in the same physical place. The sheet keeps `Net1`–`Net3` for readability in `Schedule`, but coaches decide the actual net on site.
 
+### Weekly shift target (per coach, per week)
+
+Two layers, resolved every run by `getShiftTarget` in `Optimizer.gs`:
+
+1. **Form value** — every coach picks `1`–`6` on the first page of the availability form (`כמות משמרות מבוקשת`). The value lands on the same column on the responses sheet and is parsed by `parseWeeklyTargetValue_` in `Responses.gs`. This is the **preferred** source.
+2. **`MasterData.WeeklyMax`** fallback when the form value is missing (e.g. legacy response, demo data without a target, or a coach who edited the row to clear it).
+3. **Dynamic fallback** (legacy): `Math.max(1, submittedDays - 1)`, capped at 5. Only used when neither of the above is set.
+
+After picking the raw value, the **+1 cap** is applied unconditionally:
+
+```
+effective_target = min(raw_target, submitted_days + 1)
+```
+
+Examples:
+
+| Submitted days | Form target | MasterData.WeeklyMax | Effective target |
+|----------------|-------------|----------------------|------------------|
+| 3              | 4           | —                    | 4                |
+| 3              | 6           | —                    | 4 (cap)          |
+| 2              | 5           | 5                    | 3 (cap)          |
+| 5              | 4           | 5                    | 4 (form wins)    |
+| 0 (didn't submit) | any      | any                  | 0 (never auto-scheduled) |
+
+The cap implements the staff rule "no coach gets more than one suggested 🔵 day beyond what they submitted". A coach who picked 2 days but answered "6" on the form is still scheduled for at most 3 days that week.
+
 ### Shift-length anchors (canonical full shift = 4 trainings)
 
 | Block | Anchor | Trainings | Span | Allowed on |
@@ -133,7 +160,7 @@ Menu **📝 בנה מחדש טופס Google** rebuilds the linked form (roster n
 |--------|---------|
 | Name | Hebrew display name |
 | Rank | 1–4 — `1` = best, `4` = reserve (fills gaps after 1–3); default `1`. |
-| WeeklyMin / WeeklyMax | Soft weekly shift target window. WeeklyMax is the upper bound used for the "יעד" column; Rank 1 still gets every shift they sign up for via `rank_1_unconditional`. |
+| WeeklyMin / WeeklyMax | Soft weekly shift target window. WeeklyMax is the upper bound used for the "יעד" column when the coach didn't submit a per-week target in the form; Rank 1 still gets every shift they sign up for via `rank_1_unconditional`. The form-submitted target (1–6 on the first page) takes priority over WeeklyMax when present. Either way, the final cap is `min(target, submitted_days + 1)`. |
 | Gender | `M` / `F`. Used by class-type eligibility (E classes are male-only per Mentor staff). Defaults to `M` when the cell or column is blank. |
 | LocationRestriction | _(optional column later)_ blank = any site |
 

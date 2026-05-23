@@ -435,7 +435,7 @@ var FAKE_MENTOR_ROSTER_ = [
  * Form: one section per day; one question (checkbox) with all time-range options.
  */
 function buildDefaultMentorFormHeaders_() {
-  var headers = ['Timestamp', 'שם מאמן'];
+  var headers = ['Timestamp', 'שם מאמן', MENTOR_WEEKLY_TARGET_HEADER_];
   for (var d = 0; d < MENTOR_WEEKDAYS_HE_.length; d++) {
     var day = MENTOR_WEEKDAYS_HE_[d];
     headers.push(mentorDayBilingualLabel_(day));
@@ -448,6 +448,17 @@ function buildDefaultMentorFormHeaders_() {
 function mentorDayNoteHeader_(dayHe) {
   return 'הערה ' + dayHe;
 }
+
+/**
+ * Header / form-question label for the per-coach weekly shift-target field.
+ * Lives right after the name column. Values 1–6 (integer choice in the form);
+ * empty when the coach didn't submit. The optimizer caps the effective target
+ * at submitted_days + 1, so a coach who picks 3 days but answers 6 here is
+ * still scheduled at most 4 days this week.
+ */
+var MENTOR_WEEKLY_TARGET_HEADER_ = 'כמות משמרות מבוקשת';
+var MENTOR_WEEKLY_TARGET_MIN_ = 1;
+var MENTOR_WEEKLY_TARGET_MAX_ = 6;
 
 /** Form + availability days: Sun–Fri (Friday morning only in form options). */
 var MENTOR_WEEKDAYS_HE_ = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי'];
@@ -578,7 +589,21 @@ function responsesHeadersUseSplitDayBlocks_(headers) {
 
 function responsesHeadersNeedDefaultMentorFormat_(headers) {
   return responsesHeadersUseLegacyTimeColumns_(headers)
-    || responsesHeadersUseSplitDayBlocks_(headers);
+    || responsesHeadersUseSplitDayBlocks_(headers)
+    || !responsesHeadersIncludeWeeklyTarget_(headers);
+}
+
+/**
+ * True when the existing headers already contain the weekly-target column.
+ * Used to force a re-seed of demo headers when an older sheet (built before
+ * the May 2026 target field) is detected.
+ */
+function responsesHeadersIncludeWeeklyTarget_(headers) {
+  for (var c = 0; c < headers.length; c++) {
+    var h = String(headers[c] || '').trim();
+    if (isWeeklyTargetResponseHeader_(h)) return true;
+  }
+  return false;
 }
 
 function setupDemoResponsesTab() {
@@ -675,6 +700,38 @@ function seedFakeMentorResponses_(ss) {
 function fillFakeMentorAvailabilityRow_(row, layout, seed, coachName) {
   var picks = pickFakeMentorWeek_(coachName, seed);
   applyMentorPicksToRow_(row, layout, picks, coachName, seed);
+  applyFakeWeeklyTargetToRow_(row, layout, picks, coachName, seed);
+}
+
+/**
+ * Write a sensible weekly-target value into the demo row's target column.
+ *
+ * Distribution rule (mirrors the runtime cap in getShiftTarget):
+ *   - 0 submitted days → leave the cell blank (coach didn't really submit).
+ *   - 1 day  → 1 or 2 (heavy on 1).
+ *   - 2 days → 1..3, centered on 2.
+ *   - 3 days → 2..4, centered on 3.
+ *   - 4 days → 3..5, centered on 4.
+ *   - 5 days → 4..6, centered on 5.
+ *   - Always clamped to [1..6] and to (submittedDays + 1).
+ */
+function applyFakeWeeklyTargetToRow_(row, layout, picks, coachName, seed) {
+  if (!layout || layout.weeklyTargetCol === undefined || layout.weeklyTargetCol < 0) return;
+  var distinctDays = {};
+  for (var i = 0; i < picks.length; i++) distinctDays[picks[i].dayIndex] = true;
+  var submittedDays = Object.keys(distinctDays).length;
+  if (submittedDays === 0) {
+    row[layout.weeklyTargetCol] = '';
+    return;
+  }
+  var rng = makeMentorFakeRng_(coachName + '|weeklyTarget', seed);
+  var offset = Math.floor(rng() * 3) - 1; // -1, 0, +1
+  var target = submittedDays + offset;
+  if (target < MENTOR_WEEKLY_TARGET_MIN_) target = MENTOR_WEEKLY_TARGET_MIN_;
+  if (target > MENTOR_WEEKLY_TARGET_MAX_) target = MENTOR_WEEKLY_TARGET_MAX_;
+  var cap = submittedDays + 1;
+  if (target > cap) target = cap;
+  row[layout.weeklyTargetCol] = target;
 }
 
 /**

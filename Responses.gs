@@ -45,6 +45,7 @@ function loadAvailability(optSheet) {
   var availability = {};
   var notes = {};
   var dayNotes = {};
+  var weeklyTargets = {};
   var names = Object.keys(latestByName);
 
   for (var n = 0; n < names.length; n++) {
@@ -83,6 +84,17 @@ function loadAvailability(optSheet) {
       }
     }
 
+    // Per-coach self-reported weekly shift target — kept in a separate map so
+    // the day-keyed `availability[name]` object stays clean for iteration.
+    // The optimizer reads it via the SHIFT_TARGET_FORM_CACHE_ stash.
+    if (layout.weeklyTargetCol !== undefined && layout.weeklyTargetCol >= 0) {
+      var rawTarget = row[layout.weeklyTargetCol];
+      var parsedTarget = parseWeeklyTargetValue_(rawTarget);
+      if (parsedTarget !== null) {
+        weeklyTargets[empName] = parsedTarget;
+      }
+    }
+
     if (layout.dayNoteColumns) {
       for (var dn = 0; dn < MENTOR_WEEKDAYS_HE_.length; dn++) {
         var noteDay = MENTOR_WEEKDAYS_HE_[dn];
@@ -96,7 +108,12 @@ function loadAvailability(optSheet) {
     }
   }
 
-  return { availability: availability, notes: notes, dayNotes: dayNotes };
+  return {
+    availability: availability,
+    notes: notes,
+    dayNotes: dayNotes,
+    weeklyTargets: weeklyTargets
+  };
 }
 
 /**
@@ -109,6 +126,7 @@ function detectResponsesLayout_(headers) {
   var dayNoteColumns = {};
   var nameCol = -1;
   var notesCol = -1;
+  var weeklyTargetCol = -1;
   var currentDay = null;
   var blockFieldCount = 0;
 
@@ -129,6 +147,10 @@ function detectResponsesLayout_(headers) {
     }
     if (header === 'הערות') {
       notesCol = c;
+      continue;
+    }
+    if (isWeeklyTargetResponseHeader_(header)) {
+      weeklyTargetCol = c;
       continue;
     }
 
@@ -218,10 +240,25 @@ function detectResponsesLayout_(headers) {
     mode: mode,
     nameCol: nameCol,
     notesCol: notesCol,
+    weeklyTargetCol: weeklyTargetCol,
     dayColumns: dayColumns,
     dayFields: dayFields,
     dayNoteColumns: dayNoteColumns
   };
+}
+
+/**
+ * True for the form-question / sheet-column header that stores the coach's
+ * self-reported weekly shift target. Matches the canonical Hebrew title plus
+ * a couple of close variants in case the form-builder UI mangled spacing.
+ */
+function isWeeklyTargetResponseHeader_(header) {
+  var h = String(header || '').trim();
+  if (!h) return false;
+  if (h === MENTOR_WEEKLY_TARGET_HEADER_) return true;
+  if (h.indexOf('משמרות מבוקש') >= 0) return true;
+  if (h.indexOf('כמות משמרות') >= 0 && h.indexOf('שבוע') >= 0) return true;
+  return false;
 }
 
 /** Maps "הערה ראשון" / "הערה ראשון-Domingo" → Hebrew day key. */
@@ -233,6 +270,23 @@ function matchMentorDayNoteHeader_(header) {
     if (h === mentorDayNoteHeader_(day) || h.indexOf(day) >= 0) return day;
   }
   return null;
+}
+
+/**
+ * Coerce a raw form/sheet value to an integer weekly-target in the
+ * [MENTOR_WEEKLY_TARGET_MIN_, MENTOR_WEEKLY_TARGET_MAX_] range. Returns null
+ * when the cell is empty, non-numeric, or out of range — the optimizer then
+ * falls back to MasterData.WeeklyMax.
+ */
+function parseWeeklyTargetValue_(raw) {
+  if (raw === null || raw === undefined) return null;
+  var s = String(raw).trim();
+  if (!s) return null;
+  var n = parseInt(s.replace(/[^\d-]/g, ''), 10);
+  if (isNaN(n)) return null;
+  if (n < MENTOR_WEEKLY_TARGET_MIN_) return null;
+  if (n > MENTOR_WEEKLY_TARGET_MAX_) n = MENTOR_WEEKLY_TARGET_MAX_;
+  return n;
 }
 
 function isNameResponseHeader_(header) {

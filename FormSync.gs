@@ -64,6 +64,21 @@ function rebuildMentorGoogleForm_(form) {
   }
   nameItem.setChoices(nameChoices);
 
+  // Weekly shift-target question (1–6). The optimizer prefers this value over
+  // MasterData.WeeklyMax when present, and caps the effective target at
+  // submitted_days + 1 so coaches who pick the high option but submit few days
+  // are still bounded.
+  var targetItem = form.addMultipleChoiceItem();
+  targetItem
+    .setTitle(MENTOR_WEEKLY_TARGET_HEADER_)
+    .setHelpText('כמה משמרות (בוקר/ערב) תרצה לקבל בשבוע הקרוב? המערכת תיקח עד +1 מעבר למספר הימים שסימנת.')
+    .setRequired(true);
+  var targetChoices = [];
+  for (var tVal = MENTOR_WEEKLY_TARGET_MIN_; tVal <= MENTOR_WEEKLY_TARGET_MAX_; tVal++) {
+    targetChoices.push(targetItem.createChoice(String(tVal)));
+  }
+  targetItem.setChoices(targetChoices);
+
   for (var d = 0; d < MENTOR_WEEKDAYS_HE_.length; d++) {
     var dayHe = MENTOR_WEEKDAYS_HE_[d];
     var dayLabel = mentorDayBilingualLabel_(dayHe);

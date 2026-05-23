@@ -1126,6 +1126,9 @@ function logHistoryFromSheet_() {
   var masterMap = loadMasterData();
   var responseData = loadAvailability();
   var availability = responseData.availability;
+  // History/share path should also honor form-submitted targets when
+  // computing the snapshot.
+  setShiftTargetFormCache_(responseData.weeklyTargets || {});
   var slots = loadShiftTemplates();
   var sheetData = sheet.getDataRange().getValues();
 
@@ -2003,6 +2006,8 @@ function refreshScheduleFromSheet_() {
   var responseData = loadAvailability();
   var availability = responseData.availability;
   var notes = responseData.notes || {};
+  // Refresh path also needs the form-target cache for getShiftTarget.
+  setShiftTargetFormCache_(responseData.weeklyTargets || {});
   var data = sheet.getDataRange().getValues();
   var slotMap = buildSlotMap_(slots);
   var warnings = [];

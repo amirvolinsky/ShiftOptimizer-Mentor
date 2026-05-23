@@ -22,40 +22,85 @@
  */
 var SHIFT_TARGET_RULES_CACHE_ = null;
 /**
+ * Per-coach form-submitted target. Populated by optimizeWeek (and the
+ * schedule-refresh / fairness paths) from loadAvailability().weeklyTargets.
+ * Lookup is by coach name → integer in [1..6]. Missing entries mean the
+ * coach didn't submit a target this week.
+ */
+var SHIFT_TARGET_FORM_CACHE_ = null;
+
+/**
+ * Cache the form-submitted weekly targets for the current run. Called from
+ * the optimizer and the refresh-from-sheet paths so getShiftTarget() can
+ * prefer the coach's own number over MasterData.WeeklyMax. Pass null to
+ * clear, e.g. between tests.
+ */
+function setShiftTargetFormCache_(weeklyTargets) {
+  SHIFT_TARGET_FORM_CACHE_ = weeklyTargets || null;
+}
+
+/**
  * Returns the upper bound of the coach's weekly shift target — the number the
  * fairness column ("יעד") and "✅ / ⚠ מעל היעד" badges compare against.
  *
- * Priority: explicit `WeeklyMax` from MasterData, else dynamic from availability.
+ * Priority of the raw target:
+ *   1. Form value from this week's response (1–6), if the coach submitted one.
+ *   2. Explicit `WeeklyMax` from MasterData.
+ *   3. Dynamic from submitted availability (legacy fallback).
+ *
+ * After picking the raw target we enforce the **+1 cap**: a coach can never be
+ * scheduled for more than `submittedDays + 1` distinct days (= at most one 🔵
+ * suggestion day beyond their submitted availability). The cap is applied
+ * universally, even when MasterData says otherwise — the staff agreed in May
+ * 2026 that no coach should ever land 2+ days outside what they submitted.
  */
 function getShiftTarget(name, masterMap, availability, rules) {
   var emp = masterMap[name];
   if (!emp) return 0;
-
-  if (emp.weeklyMax !== null && emp.weeklyMax !== undefined) {
-    return emp.weeklyMax;
-  }
 
   if (!rules) {
     if (!SHIFT_TARGET_RULES_CACHE_) SHIFT_TARGET_RULES_CACHE_ = loadRules();
     rules = SHIFT_TARGET_RULES_CACHE_;
   }
 
-  if (!availability || !availability[name]) return 0;
+  var submittedDays = countCoachSubmittedDays_(name, availability);
+  // Coach who didn't submit anything is never auto-scheduled.
+  if (submittedDays === 0) return 0;
 
+  // Pick the raw target in priority order: form value, MasterData, dynamic.
+  var formTarget = (SHIFT_TARGET_FORM_CACHE_ && SHIFT_TARGET_FORM_CACHE_[name] !== undefined)
+    ? SHIFT_TARGET_FORM_CACHE_[name]
+    : null;
+
+  var rawTarget;
+  if (formTarget !== null) {
+    rawTarget = formTarget;
+  } else if (emp.weeklyMax !== null && emp.weeklyMax !== undefined) {
+    rawTarget = emp.weeklyMax;
+  } else if (isBasicMode_()) {
+    rawTarget = Math.max(1, submittedDays);
+  } else {
+    rawTarget = Math.min(Math.max(1, submittedDays - 1), 5);
+  }
+
+  // +1 cap: never more than one day beyond submitted availability.
+  var cap = submittedDays + 1;
+  return Math.min(rawTarget, cap);
+}
+
+/** Count distinct days the coach marked any availability range for. */
+function countCoachSubmittedDays_(name, availability) {
+  if (!availability || !availability[name]) return 0;
   var avail = availability[name];
-  var daysWithAvail = 0;
+  var count = 0;
   var days = Object.keys(avail);
   for (var d = 0; d < days.length; d++) {
-    var dayRanges = avail[days[d]];
-    if (dayRanges && dayRanges.length > 0) daysWithAvail++;
+    var key = days[d];
+    if (key.charAt(0) === '_') continue; // skip reserved keys like __weeklyTarget
+    var dayRanges = avail[key];
+    if (dayRanges && dayRanges.length > 0) count++;
   }
-
-  if (isBasicMode_()) {
-    return Math.max(1, daysWithAvail);
-  }
-
-  var dyn = Math.max(1, daysWithAvail - 1);
-  return Math.min(dyn, 5);
+  return count;
 }
 
 /**
