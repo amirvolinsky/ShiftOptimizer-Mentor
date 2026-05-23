@@ -29,6 +29,54 @@ function rtlUiText_(s) {
 }
 
 /**
+ * Simple onEdit trigger — runs automatically (no auth) on every cell edit.
+ * We only act on single-cell edits in the Schedule sheet where the staff
+ * picked something from the dropdown:
+ *   - Picked "אין אימון" → apply the inactive grey style in place. The
+ *     dropdown stays so they can flip back to a coach later.
+ *   - Picked anything else after the cell WAS "אין אימון" → clean up the
+ *     grey style (default white) so the new coach name reads correctly.
+ *     A full refresh (🔄 רענן לוח) is still needed to recompute hover
+ *     notes and conflict colors.
+ *
+ * Keep this function tiny and tolerant — simple triggers swallow errors
+ * silently in the user's UI, so we wrap everything in try/catch and log
+ * to the script console for debugging.
+ */
+function onEdit(e) {
+  try {
+    if (!e || !e.range) return;
+    var sheet = e.range.getSheet();
+    if (!CONFIG || !CONFIG.sheets || sheet.getName() !== CONFIG.sheets.schedule) return;
+    if (e.range.getNumRows() !== 1 || e.range.getNumColumns() !== 1) return;
+
+    var newVal = e.value == null ? '' : String(e.value).trim();
+    var oldVal = e.oldValue == null ? '' : String(e.oldValue).trim();
+
+    var INACTIVE = (typeof SCHEDULE_INACTIVE_LABEL_HE_ !== 'undefined')
+      ? SCHEDULE_INACTIVE_LABEL_HE_
+      : 'אין אימון';
+
+    if (newVal === INACTIVE) {
+      applyInactiveCellStyle_(e.range);
+      return;
+    }
+
+    if (oldVal === INACTIVE && newVal !== INACTIVE && newVal !== '') {
+      e.range
+        .setBackground(null)
+        .setFontColor(null)
+        .setFontWeight('normal');
+      e.range.setNote(
+        'ערך זה הוחלף ידנית. הרץ "🔄 רענן לוח" כדי לעדכן צבעים והערות.'
+      );
+    }
+  } catch (err) {
+    Logger.log('onEdit failed: ' + err + (err && err.stack ? '\n' + err.stack : ''));
+  }
+}
+
+/**
  * Simple onOpen cannot call showModalDialog (limited auth). This installable on-open trigger
  * runs showGuideImpl_ with full auth so the RTL guide can appear every time the spreadsheet opens.
  * Must match the string passed to ScriptApp.newTrigger.
@@ -316,8 +364,11 @@ function optimizeShiftsRunCore_() {
 
   // Distribute the staff-entered weekly class counts across the capacity
   // grid: tag the active slots with a classType, mark the rest inactive.
+  // Passing `availability` lets buildSlotFillPriority_ pick a supply-aware
+  // Net 3 anchor per day — e.g. anchor at 08:00 on Sun morn (where only
+  // יובל has a 7-X start and he's already on Net 1) instead of 07:00.
   var weeklyCounts = loadWeeklyClassCountsFromSheet_();
-  var distribution = distributeClassesIntoSlots_(allSlots, weeklyCounts);
+  var distribution = distributeClassesIntoSlots_(allSlots, weeklyCounts, availability);
   var activeSlots = distribution.activeSlots;
   if (activeSlots.length === 0) {
     throw new Error(

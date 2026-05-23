@@ -156,6 +156,13 @@ function optimizeWeek(slots, availability, masterMap, rules) {
 
   assignContinuousShiftBlocks_(slots, availability, masterMap, rules, state);
 
+  // Fairness floor: every Rank 3+ coach who submitted availability gets at
+  // least one shift, even if it means swapping with a more-shifts coach.
+  // Per staff May 23 2026 — see enforceMinimumOneShiftForLowerRanks_.
+  if (rules && rules.enforce_min_shift_rank3plus !== false) {
+    enforceMinimumOneShiftForLowerRanks_(slots, availability, masterMap, rules, state);
+  }
+
   // Any remaining training slot is genuinely unfilled; suggestion phase may add blue fallback suggestions.
   for (var s = 0; s < slots.length; s++) {
     if (!state.assigned[slots[s].slotId]) {
@@ -269,56 +276,219 @@ function slotTimeKey_(slot) {
 }
 
 function assignShiftBlock_(group, availability, masterMap, rules, state) {
-  var candidates = buildShiftBlockCandidates_(group, availability, masterMap, rules, state);
-
-  // Read configurable rule toggles from the Rules sheet (defaults: all on).
+  // Read configurable rule toggles once (same for every pass).
   var rank1Unconditional   = rules.rank_1_unconditional   !== false;
   var rankPriorityEnabled  = rules.rank_priority_enabled  !== false;
   var softCapWeeklyMax     = rules.soft_cap_weekly_max    !== false;
   var avoidBackToBack      = rules.avoid_back_to_back     !== false;
 
-  candidates.sort(function(a, b) {
-    var aIsTop = a.rank === CONFIG.ranks.best;
-    var bIsTop = b.rank === CONFIG.ranks.best;
+  // Shift-vision multi-pass: place full 4-training shifts before
+  // 3-training, before 2-training. This trades training-cell coverage for
+  // shift completeness — better to have a net sit empty than to give two
+  // coaches fragmented 2-training shifts on it. Matches the staff rule
+  // "prefer fuller shifts; leave a net empty if needed".
+  var passLengths = [
+    MENTOR_FULL_SHIFT_TRAININGS_,                // 4
+    MENTOR_FULL_SHIFT_TRAININGS_ - 1,            // 3
+    MENTOR_MIN_SHIFT_TRAININGS_                  // 2
+  ];
 
-    // Rank 1 unconditional priority — they get every shift they submitted
-    // availability for, regardless of WeeklyMax. Off-by-toggle.
-    if (rank1Unconditional && aIsTop !== bIsTop) return aIsTop ? -1 : 1;
+  for (var p = 0; p < passLengths.length; p++) {
+    var passMin = passLengths[p];
+    var candidates = buildShiftBlockCandidates_(
+      group, availability, masterMap, rules, state, passMin
+    );
 
-    // Soft cap: at-max coaches go last. Rank-1 candidates skip this when
-    // rank_1_unconditional is on (handled above).
-    if (softCapWeeklyMax) {
-      var skipCap = rank1Unconditional && (aIsTop || bIsTop);
-      if (!skipCap) {
-        var aAtMax = a.gap <= 0;
-        var bAtMax = b.gap <= 0;
-        if (aAtMax !== bAtMax) return aAtMax ? 1 : -1;
+    candidates.sort(function(a, b) {
+      var aIsTop = a.rank === CONFIG.ranks.best;
+      var bIsTop = b.rank === CONFIG.ranks.best;
+
+      if (rank1Unconditional && aIsTop !== bIsTop) return aIsTop ? -1 : 1;
+
+      if (softCapWeeklyMax) {
+        var skipCap = rank1Unconditional && (aIsTop || bIsTop);
+        if (!skipCap) {
+          var aAtMax = a.gap <= 0;
+          var bAtMax = b.gap <= 0;
+          if (aAtMax !== bAtMax) return aAtMax ? 1 : -1;
+        }
+      }
+
+      if (rankPriorityEnabled && a.rank !== b.rank) return a.rank - b.rank;
+      if (avoidBackToBack && a.backToBack !== b.backToBack) return a.backToBack ? 1 : -1;
+      if (a.gap !== b.gap) return b.gap - a.gap;
+      if (a.length !== b.length) return b.length - a.length;
+      return a.name.localeCompare(b.name, 'he');
+    });
+
+    for (var i = 0; i < candidates.length; i++) {
+      var cand = candidates[i];
+      if (!canAssignMoreClasses_(cand.name, cand.length, rules, state)) continue;
+      if (candidateAlreadyHasAnyTime_(cand, state)) continue;
+
+      var assignedSlots = findBestContiguousAssignment_(
+        cand, state, masterMap, rules, {
+          minLength: passMin,
+          // Never split one coach across nets in a single block — staff want
+          // one tall cell per net, not 3h here + 1h there.
+          allowSpread: false
+        }
+      );
+      if (!assignedSlots) continue;
+
+      assignEmployeeToSlots_(cand.name, assignedSlots, masterMap, state);
+      if (cand.backToBack) {
+        state.warnings.push(
+          cand.name + ' — שובץ/ה במשמרת צמודה למרות דרגה ' + cand.rank + ' (' +
+          cand.day + ' ' + cand.block + ').'
+        );
       }
     }
+  }
+}
 
-    if (rankPriorityEnabled && a.rank !== b.rank) return a.rank - b.rank;
-    if (avoidBackToBack && a.backToBack !== b.backToBack) return a.backToBack ? 1 : -1;
-    if (a.gap !== b.gap) return b.gap - a.gap;
-    if (a.length !== b.length) return b.length - a.length;
-    return a.name.localeCompare(b.name, 'he');
+/**
+ * Fairness floor (May 23 2026 per staff): every Rank 3+ coach who submitted
+ * any availability this week must end up with at least one shift assigned —
+ * even if it means displacing another coach who already has ≥2 shifts.
+ *
+ * Algorithm: for each Rank 3+ coach with 0 shifts and any submitted day,
+ * walk every (day, block) they signed up for, look for an existing shift
+ * (contiguous run of same coach on same net) that this coach can fully
+ * cover by time + class-type eligibility, then swap.
+ *
+ * Victim rules — coach being displaced must:
+ *   - have ≥ 2 distinct (day, block) shifts (so they don't go to 0),
+ *   - NOT be on CONFIG.noSuggestCoaches (רון / מנש are protected),
+ *   - NOT be Rank 1 when rank_1_unconditional is on (default).
+ *
+ * Victim sort: (currentShifts − target) descending → over-target coaches
+ * first; then currentShifts descending; then rank descending (lower priority
+ * coach displaced first); then name.
+ *
+ * Kill switch: set `enforce_min_shift_rank3plus` to FALSE in the Rules sheet.
+ */
+function enforceMinimumOneShiftForLowerRanks_(slots, availability, masterMap, rules, state) {
+  var names = Object.keys(masterMap);
+  names.sort(function(a, b) {
+    var rA = normalizeMentorRank_(masterMap[a].rank);
+    var rB = normalizeMentorRank_(masterMap[b].rank);
+    if (rA !== rB) return rA - rB;
+    return a.localeCompare(b, 'he');
   });
 
-  for (var i = 0; i < candidates.length; i++) {
-    var cand = candidates[i];
-    if (!canAssignMoreClasses_(cand.name, cand.length, rules, state)) continue;
-    if (candidateAlreadyHasAnyTime_(cand, state)) continue;
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var emp = masterMap[name];
+    var rank = normalizeMentorRank_(emp.rank);
+    if (rank < 3) continue;
+    if (!hasSubmittedAnyAvailability_(name, availability)) continue;
+    if (countAssignedShifts_(name, state) > 0) continue;
 
-    var assignedSlots = findBestContiguousAssignment_(cand, state, masterMap, rules);
-    if (!assignedSlots) continue;
-
-    assignEmployeeToSlots_(cand.name, assignedSlots, masterMap, state);
-    if (cand.backToBack) {
+    var ok = tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules, state);
+    if (!ok) {
       state.warnings.push(
-        cand.name + ' — שובץ/ה במשמרת צמודה למרות דרגה ' + cand.rank + ' (' +
-        cand.day + ' ' + cand.block + ').'
+        '⚠️ ' + name + ' (דרג ' + rank + ') הגיש זמינות אך לא נמצא שיבוץ מינימלי. ' +
+        'לא נמצא מאמן זמין להחלפה (כולם מתחת ל-2 משמרות או מוגנים).'
       );
     }
   }
+}
+
+/**
+ * Try to give `name` a single shift by displacing a higher-count coach in
+ * one of the coach's submitted (day, block) units. Returns true on success.
+ */
+function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules, state) {
+  var groups = buildShiftGroups_(slots);
+  var rank1Unconditional = !rules || rules.rank_1_unconditional !== false;
+
+  for (var g = 0; g < groups.length; g++) {
+    var group = groups[g];
+    if (!availability[name] || !availability[name][group.day]) continue;
+    var ranges = availability[name][group.day];
+    if (!ranges || !ranges.length) continue;
+    if (typeof ranges[0] === 'string') continue;
+
+    var seenKey = {};
+    for (var r = 0; r < ranges.length; r++) {
+      var keys = timeKeysCoveredByRange_(group, ranges[r]);
+      keys = filterTimeKeysByClassEligibility_(group, keys, name, masterMap, state, rules);
+      for (var ki = 0; ki < keys.length; ki++) seenKey[keys[ki]] = true;
+    }
+
+    var keyCount = 0;
+    for (var kc in seenKey) if (seenKey.hasOwnProperty(kc)) keyCount++;
+    if (keyCount < MENTOR_MIN_SHIFT_TRAININGS_) continue;
+
+    // Group existing assignments in this (day, block) by (location, coach).
+    var existing = {};
+    for (var s = 0; s < group.slots.length; s++) {
+      var slot = group.slots[s];
+      var asgn = state.assigned[slot.slotId];
+      if (!asgn || !asgn.name || asgn.unfilled || asgn.managerSlot) continue;
+      var k = slot.location + '|' + asgn.name;
+      if (!existing[k]) existing[k] = { coach: asgn.name, loc: slot.location, slots: [] };
+      existing[k].slots.push(slot);
+    }
+
+    var victims = [];
+    var ekeys = Object.keys(existing);
+    for (var ek = 0; ek < ekeys.length; ek++) {
+      var v = existing[ekeys[ek]];
+      if (v.coach === name) continue;
+      if (isNoSuggestCoach_(v.coach)) continue;
+
+      var vRank = normalizeMentorRank_(masterMap[v.coach].rank);
+      if (rank1Unconditional && vRank === CONFIG.ranks.best) continue;
+
+      var vShifts = countAssignedShifts_(v.coach, state);
+      if (vShifts < 2) continue;
+
+      v.slots.sort(function(a, b) { return a.startTime - b.startTime; });
+      var canCover = true;
+      for (var vs = 0; vs < v.slots.length; vs++) {
+        if (!seenKey[slotTimeKey_(v.slots[vs])]) { canCover = false; break; }
+      }
+      if (!canCover) continue;
+
+      var vTarget = getShiftTarget(v.coach, masterMap, availability, rules);
+      victims.push({
+        coach: v.coach,
+        loc: v.loc,
+        slots: v.slots,
+        rank: vRank,
+        shifts: vShifts,
+        over: vShifts - vTarget
+      });
+    }
+
+    if (victims.length === 0) continue;
+
+    victims.sort(function(a, b) {
+      if (a.over !== b.over) return b.over - a.over;
+      if (a.shifts !== b.shifts) return b.shifts - a.shifts;
+      if (a.rank !== b.rank) return b.rank - a.rank;
+      return a.coach.localeCompare(b.coach, 'he');
+    });
+
+    var victim = victims[0];
+    for (var us = 0; us < victim.slots.length; us++) {
+      unassignSlot_(victim.slots[us].slotId, victim.slots[us], state);
+    }
+    for (var as = 0; as < victim.slots.length; as++) {
+      assignEmployee(name, victim.slots[as], masterMap, state);
+    }
+
+    state.warnings.push(
+      '🔁 ' + name + ' (דרג ' + emp.rank + ') הוחלף עם ' + victim.coach +
+      ' (דרג ' + victim.rank + ') ב-' + group.day + ' ' + group.block + ' ' +
+      (CONFIG.locationNames[victim.loc] || victim.loc) +
+      ' — הבטחת לפחות משמרת אחת לכל מאמן מדרג 3+ שהגיש זמינות.'
+    );
+    return true;
+  }
+  return false;
 }
 
 /** Canonical full-shift length in trainings (4 = 4 hours of footvolley). */
@@ -328,7 +498,12 @@ var MENTOR_FULL_SHIFT_TRAININGS_ = 4;
  *  "no 1-training assignments"). */
 var MENTOR_MIN_SHIFT_TRAININGS_ = 2;
 
-function buildShiftBlockCandidates_(group, availability, masterMap, rules, state) {
+function buildShiftBlockCandidates_(group, availability, masterMap, rules, state, minLength) {
+  // minLength is the floor on the coach's longest contiguous teachable run
+  // for this pass — pass 1 demands 4 (full shifts), pass 2 demands 3, pass 3
+  // demands 2. Callers that don't care fall back to the global minimum.
+  if (!minLength) minLength = MENTOR_MIN_SHIFT_TRAININGS_;
+
   var candidates = [];
   var names = Object.keys(masterMap);
   for (var n = 0; n < names.length; n++) {
@@ -348,12 +523,20 @@ function buildShiftBlockCandidates_(group, availability, masterMap, rules, state
       timeKeys = filterTimeKeysByClassEligibility_(group, timeKeys, name, masterMap, state, rules);
       if (!timeKeys.length) continue;
 
-      // Refuse to even propose a candidate whose longest contiguous teachable
-      // run is below the minimum shift length. This keeps the sort/queue
-      // clean and matches the staff rule "no 1-training shifts".
+      // Pass floor: longest contiguous teachable run must reach this pass's
+      // minimum, otherwise the coach won't be considered yet.
       var longestRun = computeLongestContiguousRun_(timeKeys);
-      if (longestRun < MENTOR_MIN_SHIFT_TRAININGS_) continue;
-      var effectiveLength = Math.min(longestRun, MENTOR_FULL_SHIFT_TRAININGS_);
+      var clampedRun = Math.min(longestRun, MENTOR_FULL_SHIFT_TRAININGS_);
+      if (clampedRun < minLength) continue;
+
+      // Strict 4h-rule (staff, May 23 2026): a coach who can deliver a full
+      // 4-training shift is ONLY allowed to land in pass 1. Passes 2 and 3
+      // exclude them, so a 4h+ coach gets exactly 4 trainings or nothing —
+      // they never fall back to a 3- or 2-training shorter shift.
+      if (minLength < MENTOR_FULL_SHIFT_TRAININGS_ &&
+          clampedRun >= MENTOR_FULL_SHIFT_TRAININGS_) continue;
+
+      var effectiveLength = clampedRun;
 
       candidates.push({
         name: name,
@@ -440,7 +623,9 @@ function filterTimeKeysByClassEligibility_(group, keys, coachName, masterMap, st
     var slotsAtTime = group.slotsByTime[keys[i]] || [];
     var canTeachAny = false;
     for (var s = 0; s < slotsAtTime.length; s++) {
-      if (coachEligibleForClassType_(coachName, slotsAtTime[s].classType, masterMap, classTypeRules, rules)) {
+      var sl = slotsAtTime[s];
+      if (state.assigned[sl.slotId]) continue;
+      if (coachEligibleForClassType_(coachName, sl.classType, masterMap, classTypeRules, rules)) {
         canTeachAny = true;
         break;
       }
@@ -479,25 +664,26 @@ function timeKeysCoveredByRange_(group, range) {
 
 function canAssignMoreClasses_(name, additionalCount, rules, state) {
   var maxShifts = getEmployeeMaxShifts_(rules);
-  var currentCount = (state.employeeShifts[name] || []).length;
-  return currentCount + additionalCount <= maxShifts;
+  // Count distinct (day, block) shifts, not individual training cells.
+  var currentCount = countAssignedShifts_(name, state);
+  return currentCount + 1 <= maxShifts;
 }
 
+/**
+ * True iff `candidate` already has any assignment in the same (day, block).
+ *
+ * A "shift" at Mentor is one anchor-aligned block of up to 4 trainings — the
+ * coach is either there for the whole block or not at all. Once they have
+ * any training in (day, block), they can't be considered for another
+ * candidate in the same block, EVEN on a different net: that would just be
+ * the same coach doing more hours in the same morning, which violates the
+ * 4-training full-shift cap (one shift = one block).
+ */
 function candidateAlreadyHasAnyTime_(candidate, state) {
   var shifts = state.employeeShifts[candidate.name] || [];
   for (var i = 0; i < shifts.length; i++) {
     if (shifts[i].day !== candidate.day) continue;
-    for (var t = 0; t < candidate.timeKeys.length; t++) {
-      var parts = candidate.timeKeys[t].split('|');
-      if (shiftTimesOverlap_(
-        shifts[i].startTime,
-        shifts[i].endTime,
-        parseFloat(parts[0]),
-        parseFloat(parts[1])
-      )) {
-        return true;
-      }
-    }
+    if (shifts[i].block === candidate.block) return true;
   }
   return false;
 }
@@ -515,20 +701,29 @@ function findSlotForLocationAtTime_(slotsAtTime, location) {
  * coach's submitted availability, capped at MENTOR_FULL_SHIFT_TRAININGS_
  * (4) and floored at MENTOR_MIN_SHIFT_TRAININGS_ (2).
  *
+ * `opts.minLength` raises the floor for this call — used by the multi-pass
+ * outer loop in assignShiftBlock_ to enforce "pass 1 = full shifts only,
+ * pass 2 = 3+, pass 3 = 2+". The cap stays at 4 regardless of pass.
+ *
  * Within a chosen window we first try same-net (sticky) placement on each
  * net in order, then fall back to a spread placement (different nets per
  * training) if no single net works for the whole window.
  *
- * Returns the assigned slot array (length 2–4) or null when no window
- * meeting the minimum can be filled.
+ * Returns the assigned slot array or null when no window meeting the
+ * pass's minimum can be filled.
  */
-function findBestContiguousAssignment_(candidate, state, masterMap, rules) {
+function findBestContiguousAssignment_(candidate, state, masterMap, rules, opts) {
+  opts = opts || {};
+  var capLen = MENTOR_FULL_SHIFT_TRAININGS_;
+  var minLen = opts.minLength || MENTOR_MIN_SHIFT_TRAININGS_;
+  if (minLen > capLen) minLen = capLen;
+  var allowSpread = opts.allowSpread === true;
+
   var keys = candidate.timeKeys;
-  if (!keys || keys.length < MENTOR_MIN_SHIFT_TRAININGS_) return null;
+  if (!keys || keys.length < minLen) return null;
 
   var runs = buildContiguousRuns_(keys);
-  var capLen = MENTOR_FULL_SHIFT_TRAININGS_;
-  var minLen = MENTOR_MIN_SHIFT_TRAININGS_;
+  var netOrder = rankStickyNetsForWindow_(candidate, state, masterMap, rules, capLen);
 
   for (var ri = 0; ri < runs.length; ri++) {
     var run = runs[ri];
@@ -538,24 +733,68 @@ function findBestContiguousAssignment_(candidate, state, masterMap, rules) {
 
     for (var L = startMaxLen; L >= minLen; L--) {
       for (var start = run.start; start + L - 1 <= run.end; start++) {
-        // Sticky pass — same net throughout the window.
-        for (var l = 0; l < CONFIG.locations.length; l++) {
+        // Sticky pass — same net throughout the window. Try nets where the
+        // coach can actually fill the most hours first (Net1 before Net2
+        // only when Net1 has more free eligible slots in this window).
+        for (var ni = 0; ni < netOrder.length; ni++) {
           var stickyOut = tryAssignmentOnNet_(
-            candidate, state, masterMap, rules, start, L, CONFIG.locations[l]
+            candidate, state, masterMap, rules, start, L, netOrder[ni]
           );
           if (stickyOut) return stickyOut;
         }
-        // Spread pass — different nets per training inside the window.
-        // Cheaper to read on the schedule when same-net isn't possible,
-        // because the window is still time-contiguous (no gaps).
-        var spreadOut = trySpreadAssignment_(
-          candidate, state, masterMap, rules, start, L
-        );
-        if (spreadOut) return spreadOut;
+        if (allowSpread) {
+          var spreadOut = trySpreadAssignment_(
+            candidate, state, masterMap, rules, start, L
+          );
+          if (spreadOut) return spreadOut;
+        }
       }
     }
   }
   return null;
+}
+
+/**
+ * Order nets for sticky placement: highest count of free+eligible slots in
+ * the coach's longest teachable window first. Prevents always defaulting to
+ * Net1 when Net2/Net3 is a better fit (e.g. תומר 8-11 on Net3).
+ */
+function rankStickyNetsForWindow_(candidate, state, masterMap, rules, capLen) {
+  var locs = (CONFIG.locations || []).slice();
+  if (!locs.length) return ['Net1', 'Net2', 'Net3'];
+
+  var keys = candidate.timeKeys || [];
+  if (!keys.length) return locs;
+
+  var runs = buildContiguousRuns_(keys);
+  var bestRun = runs[0];
+  var tryLen = Math.min(capLen, bestRun.end - bestRun.start + 1);
+  var tryStart = bestRun.start;
+
+  var scores = [];
+  for (var li = 0; li < locs.length; li++) {
+    var loc = locs[li];
+    var score = 0;
+    for (var t = tryStart; t < tryStart + tryLen; t++) {
+      var slot = findSlotForLocationAtTime_(
+        candidate.group.slotsByTime[keys[t]] || [], loc
+      );
+      if (!slot || state.assigned[slot.slotId]) continue;
+      if (hasTimeConflict(candidate.name, slot, null, state)) continue;
+      if (!coachEligibleForClassType_(candidate.name, slot.classType, masterMap, state._classTypeRules, rules)) continue;
+      score++;
+    }
+    scores.push({ loc: loc, score: score });
+  }
+
+  scores.sort(function(a, b) {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.loc.localeCompare(b.loc, 'he');
+  });
+
+  var out = [];
+  for (var s = 0; s < scores.length; s++) out.push(scores[s].loc);
+  return out;
 }
 
 /** Try to fill candidate.timeKeys[start..start+L-1] on a single net. */
@@ -1013,169 +1252,265 @@ function assignEmployee(nameOrEmp, slot, masterMap, state) {
 }
 
 /**
- * Phase 3: For unfilled slots, suggest the best employee who didn't mark availability
- * who are still under their soft shift target.
- * Marks these as "suggested" (blue) -- not confirmed assignments.
+ * Phase 3 (cluster-based suggester, May 23 2026): for each contiguous run
+ * of unfilled cells on the same (day, block, net), find a single coach
+ * who can take the entire run as a fresh 2–4 training shift, and assign
+ * them as a "💙 suggested" shift in one go.
  *
- * Slots are processed in (day, location, block, startTime) order so that any
- * neighbor-continuity preference (added in rankSuggestionCandidates_) can
- * propagate across a run of consecutive unfilled slots — e.g. if 8:00–9:00 is
- * suggested for coach X because X is already at 7:00–8:00, then 9:00–10:00
- * (also unfilled) will see X as the neighbor and keep him in the chain.
+ * Why cluster-based? Per-slot suggestions can place a coach on a single
+ * isolated cell (e.g. שירי alone at Wed 10–11), which violates the staff
+ * rule "no 1-training shifts". A cluster has length ≥ 2 by construction,
+ * so the suggestion always lands as a real shift. Singleton clusters
+ * (size 1) are skipped — the cell stays red, and the staff can see it
+ * needs a manual phone call.
+ *
+ * The suggested coach must:
+ *   - have NO existing shift in (day, block) — one shift per block per coach;
+ *   - be eligible for every class type in the cluster;
+ *   - be under the weekly cap; Rank 4 reserves additionally need to have
+ *     submitted some availability this week (otherwise they're off-roster).
+ * Among qualifying coaches we prefer (in order): under target → larger
+ * gap to target → lower rank → larger remaining cap → name.
  */
 function suggestForUnfilled(slots, availability, masterMap, rules, state, optimizationMode) {
   optimizationMode = optimizationMode || state.optimizationMode || 'economical';
   var empNames = Object.keys(masterMap);
 
-  var ordered = slots.slice().sort(function(a, b) {
+  var clusters = buildUnfilledClusters_(slots, state);
+  // Largest cluster first — it's the hardest to fill and we want it placed
+  // before nibbling at small ones; ties broken so weekdays-first is stable.
+  clusters.sort(function(a, b) {
+    if (b.slots.length !== a.slots.length) return b.slots.length - a.slots.length;
     var dd = dayOrder_(a.day) - dayOrder_(b.day);
     if (dd !== 0) return dd;
-    var ll = String(a.location).localeCompare(String(b.location));
-    if (ll !== 0) return ll;
-    var bo = blockOrder_(a.block) - blockOrder_(b.block);
-    if (bo !== 0) return bo;
-    return (a.startTime || 0) - (b.startTime || 0);
+    return (a.slots[0].startTime || 0) - (b.slots[0].startTime || 0);
   });
 
-  for (var s = 0; s < ordered.length; s++) {
-    var slot = ordered[s];
-    var asgn = state.assigned[slot.slotId];
-    if (!asgn || !asgn.unfilled) continue;
+  for (var c = 0; c < clusters.length; c++) {
+    var cluster = clusters[c];
+    // Singletons are intentionally not suggested (would create an isolated
+    // 1-training shift). Staff sees the red cell and acts on it manually.
+    if (cluster.slots.length < MENTOR_MIN_SHIFT_TRAININGS_) continue;
 
-    var ranked = rankSuggestionCandidates_(slot, empNames, masterMap, rules, state, availability, optimizationMode);
+    // Cap cluster size at 4 — never propose a 5+ training mega-shift even
+    // if there's a longer empty run. Take the first 4 cells (anchor-aligned).
+    var clusterSlots = cluster.slots.slice(0, MENTOR_FULL_SHIFT_TRAININGS_);
+    var trimmedCluster = {
+      day: cluster.day,
+      block: cluster.block,
+      location: cluster.location,
+      slots: clusterSlots
+    };
 
-    if (ranked.length > 0) {
-      var bestCandidate = ranked[0].name;
-      var emp = masterMap[bestCandidate];
-      if (!state.employeeShifts[bestCandidate]) {
-        state.employeeShifts[bestCandidate] = [];
-      }
+    var ranked = rankClusterSuggestionCandidates_(
+      trimmedCluster, empNames, masterMap, rules, state, availability
+    );
+    if (ranked.length === 0) continue;
+
+    var bestCandidate = ranked[0].name;
+    var emp = masterMap[bestCandidate];
+    if (!state.employeeShifts[bestCandidate]) {
+      state.employeeShifts[bestCandidate] = [];
+    }
+
+    // Build the suggestion note once, since the entire cluster shares it.
+    var availCount = countAvailableBlocks_(bestCandidate, availability, slots, emp);
+    var dynTarget = getShiftTarget(bestCandidate, masterMap, availability, rules);
+    var rangeHe = formatClusterTimeRangeHe_(clusterSlots);
+    var note = '💙 הצעת המערכת (לא שיבוץ מאושר)\n\n' +
+      bestCandidate + ' לא סימן/ה זמינות למשמרת הזו (' +
+      clusterSlots.length + ' אימונים רצופים, ' + rangeHe + ').\n' +
+      'יעד שבועי: ' + dynTarget + ' משמרות.\n' +
+      'הגיש/ה זמינות ל-' + availCount + ' משמרות.\n\n' +
+      'צריך לאשר מול ' + bestCandidate + '.';
+
+    if (ranked.length > 1) {
+      var alt = ranked[1];
+      var altAvail = countAvailableBlocks_(alt.name, availability, slots, masterMap[alt.name]);
+      var altCurrent = countAssignedShifts_(alt.name, state);
+      var altTarget = getShiftTarget(alt.name, masterMap, availability, rules);
+      note += '\n\n🔄 חלופה: ' + alt.name +
+        '\nיעד: ' + altTarget + ' משמרות' +
+        ', הגיש/ה ' + altAvail +
+        ', כרגע ' + altCurrent;
+    }
+
+    for (var k = 0; k < clusterSlots.length; k++) {
+      var slt = clusterSlots[k];
       state.employeeShifts[bestCandidate].push({
-        slotId: slot.slotId,
-        location: slot.location,
-        day: slot.day,
-        block: slot.block,
-        startTime: slot.startTime,
-        endTime: slot.endTime,
-        durationHours: slot.durationHours
+        slotId: slt.slotId,
+        location: slt.location,
+        day: slt.day,
+        block: slt.block,
+        startTime: slt.startTime,
+        endTime: slt.endTime,
+        durationHours: slt.durationHours
       });
-
-      var afterCount = countAssignedShifts_(bestCandidate, state);
-      var availCount = countAvailableBlocks_(bestCandidate, availability, slots, emp);
-      var dynTarget = getShiftTarget(bestCandidate, masterMap, availability, rules);
-
-      var note = '💙 הצעת המערכת (לא שיבוץ מאושר)\n\n' +
-        bestCandidate + ' לא סימן/ה זמינות למשמרת הזו.\n' +
-        'יעד שבועי: ' + dynTarget + ' משמרות.\n' +
-        'הגיש/ה זמינות ל-' + availCount + ' משמרות.\n' +
-        'סה"כ עם ההצעה: ' + afterCount + ' משמרות.\n\n' +
-        'צריך לאשר מול ' + bestCandidate + '.';
-
-      if (ranked.length > 1) {
-        var alt = ranked[1];
-        var altAvail = countAvailableBlocks_(alt.name, availability, slots, masterMap[alt.name]);
-        var altCurrent = countAssignedShifts_(alt.name, state);
-        var altTarget = getShiftTarget(alt.name, masterMap, availability, rules);
-        note += '\n\n🔄 חלופה: ' + alt.name +
-          '\nיעד: ' + altTarget + ' משמרות' +
-          ', הגיש/ה ' + altAvail +
-          ', כרגע ' + altCurrent;
-      }
-
-      state.assigned[slot.slotId] = {
+      state.assigned[slt.slotId] = {
         name: bestCandidate,
         rank: emp.rank,
         unfilled: false,
         suggested: true,
         note: note
       };
-
-      state.warnings.push(
-        formatSlotHebrew(slot.slotId) + ' — 💙 הצעת המערכת (לא שיבוץ מאושר): ' + bestCandidate + '.\n' +
-        '   💡 ' + bestCandidate + ' לא סימן/ה זמינות, יעד ' + dynTarget +
-        ', הגיש/ה ' + availCount + ', סה"כ עם ההצעה: ' + afterCount + '. צריך אישור.'
-      );
-    } else {
-      state.warnings.push(
-        formatSlotHebrew(slot.slotId) + ' — לא נמצא עובד זמין למשמרת הזו.\n' +
-        '   💡 כל העובדים כבר תפוסים, הגיעו למכסה, או לא סימנו זמינות.'
-      );
     }
+
+    state.warnings.push(
+      cluster.day + ' ' + cluster.block + ' ' + cluster.location + ' — 💙 הצעת המערכת: ' +
+      bestCandidate + ' (' + clusterSlots.length + ' אימונים, ' + rangeHe + '). צריך אישור.'
+    );
+  }
+
+  // Anything still unfilled after the cluster pass: emit a per-slot warning
+  // so the staff sees exactly which cells need a manual call.
+  for (var s = 0; s < slots.length; s++) {
+    var slot = slots[s];
+    var asgn = state.assigned[slot.slotId];
+    if (!asgn || !asgn.unfilled) continue;
+    state.warnings.push(
+      formatSlotHebrew(slot.slotId) + ' — לא נמצא עובד זמין למשמרת הזו.\n' +
+      '   💡 כל העובדים כבר תפוסים, הגיעו למכסה, או לא סימנו זמינות.'
+    );
   }
 }
 
 /**
- * Rank suggestion candidates for an unfilled slot.
- * Mode-aware: fair/balanced prefer under-target; economical prefers cost.
- *
- * Continuity preference (three levels, computed by computeNeighborLevel_):
- *  2 = candidate is already on the SAME net at an adjacent training time
- *      → strongly prefer (clean visual run on one net).
- *  1 = candidate is on a different net at an adjacent time, AND that other
- *      net is already filled for this time slot (the coach has nowhere else
- *      to go — a net jump is the best we can do to avoid idle time).
- *  0 = no adjacent training, OR adjacent only on a different net that ALSO
- *      has an unfilled slot at this same time. In the latter case we defer
- *      the candidate so they land on their own net later in the pass.
- *
- * The intent is to keep a coach in a run of consecutive trainings on one net
- * (e.g. 7–8, 8–9, 9–10 all on Net1) instead of inserting a different coach
- * for a single hour or making the coach hop between nets.
+ * Group all unfilled slots into contiguous runs per (day, block, location).
+ * Two slots are "contiguous" if their startTime/endTime are time-adjacent
+ * within ~30 minutes (so the 19:00 → 19:15 evening break still counts).
  */
-function rankSuggestionCandidates_(slot, empNames, masterMap, rules, state, availability, optimizationMode) {
-  optimizationMode = optimizationMode || state.optimizationMode || 'economical';
-  var candidates = [];
+function buildUnfilledClusters_(slots, state) {
+  var groups = {};
+  for (var i = 0; i < slots.length; i++) {
+    var slot = slots[i];
+    var asgn = state.assigned[slot.slotId];
+    if (!asgn || !asgn.unfilled) continue;
+    var key = slot.day + '|' + slot.block + '|' + slot.location;
+    (groups[key] = groups[key] || []).push(slot);
+  }
 
+  var clusters = [];
+  for (var k in groups) {
+    if (!groups.hasOwnProperty(k)) continue;
+    var arr = groups[k];
+    arr.sort(function(a, b) { return a.startTime - b.startTime; });
+
+    var current = [arr[0]];
+    for (var j = 1; j < arr.length; j++) {
+      var gap = arr[j].startTime - arr[j - 1].endTime;
+      if (gap >= -0.01 && gap <= 0.5) {
+        current.push(arr[j]);
+      } else {
+        clusters.push({
+          day: current[0].day,
+          block: current[0].block,
+          location: current[0].location,
+          slots: current
+        });
+        current = [arr[j]];
+      }
+    }
+    clusters.push({
+      day: current[0].day,
+      block: current[0].block,
+      location: current[0].location,
+      slots: current
+    });
+  }
+  return clusters;
+}
+
+/** "07:00–10:00" / "17:00–20:15" — for the suggestion hover note. */
+function formatClusterTimeRangeHe_(slots) {
+  if (!slots || !slots.length) return '';
+  var first = slots[0];
+  var last = slots[slots.length - 1];
+  return formatHourLabelHe_(first.startTime) + '–' + formatHourLabelHe_(last.endTime);
+}
+
+function formatHourLabelHe_(t) {
+  if (t == null) return '';
+  var h = Math.floor(t);
+  var m = Math.round((t - h) * 60);
+  if (m === 0) return (h < 10 ? '0' : '') + h + ':00';
+  return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m;
+}
+
+/**
+ * Like rankSuggestionCandidates_ but for a whole contiguous cluster of
+ * unfilled slots. The candidate must be eligible for EVERY class type in
+ * the cluster and free of time conflicts for every slot. Coaches who
+ * already have any shift on this (day, block) are excluded — one shift
+ * per block per coach is the canonical Mentor rule.
+ */
+function rankClusterSuggestionCandidates_(cluster, empNames, masterMap, rules, state, availability) {
+  var out = [];
   for (var e = 0; e < empNames.length; e++) {
     var name = empNames[e];
     var emp = masterMap[name];
 
-    if (emp.locationRestriction && emp.locationRestriction !== slot.location) continue;
-    if (hasTimeConflict(name, slot, null, state)) continue;
-    if (!coachEligibleForClassType_(name, slot.classType, masterMap, state._classTypeRules, rules)) continue;
+    if (emp.locationRestriction && emp.locationRestriction !== cluster.location) continue;
 
-    // Rank 4 (reserve) is "filler of fillers": only suggest them in blue when
-    // they actually submitted some availability this week. A reserve coach
-    // who didn't fill the form at all (e.g. מיתר for a given week) should not
-    // appear as a system suggestion — they're off the roster for that week.
+    // Per staff: senior coaches on this list only do the shifts they
+    // submitted in the form — never propose them for extra "outside
+    // availability" shifts (no 💙 suggestions). Edit the array in
+    // Config.gs (CONFIG.noSuggestCoaches) to add or remove names.
+    if (isNoSuggestCoach_(name)) continue;
+
     if (normalizeMentorRank_(emp.rank) >= CONFIG.ranks.max &&
-        !hasSubmittedAnyAvailability_(name, availability)) {
-      continue;
-    }
+        !hasSubmittedAnyAvailability_(name, availability)) continue;
 
-    var currentCount = (state.employeeShifts[name] || []).length;
+    var existing = state.employeeShifts[name] || [];
+    var alreadyInBlock = false;
+    for (var s = 0; s < existing.length; s++) {
+      if (existing[s].day === cluster.day && existing[s].block === cluster.block) {
+        alreadyInBlock = true;
+        break;
+      }
+    }
+    if (alreadyInBlock) continue;
+
+    var currentCount = existing.length;
     var maxShifts = getEmployeeMaxShifts_(rules);
-    if (currentCount >= maxShifts) continue;
+    if (currentCount + cluster.slots.length > maxShifts) continue;
 
     var target = getShiftTarget(name, masterMap, availability, rules);
     if (target <= 0) continue;
 
-    var gapSoft = target - currentCount;
-    var remainingCap = maxShifts - currentCount;
-    var neighbor = computeNeighborLevel_(name, slot, state);
+    var eligibleAll = true;
+    var conflict = false;
+    for (var c = 0; c < cluster.slots.length; c++) {
+      var slot = cluster.slots[c];
+      if (!coachEligibleForClassType_(name, slot.classType, masterMap, state._classTypeRules, rules)) {
+        eligibleAll = false;
+        break;
+      }
+      if (hasTimeConflict(name, slot, null, state)) {
+        conflict = true;
+        break;
+      }
+    }
+    if (!eligibleAll || conflict) continue;
 
-    candidates.push({
+    out.push({
       name: name,
-      gapSoft: gapSoft,
-      remainingCap: remainingCap,
-      neighbor: neighbor
+      rank: normalizeMentorRank_(emp.rank),
+      gapSoft: target - currentCount,
+      remainingCap: maxShifts - currentCount
     });
   }
 
-  candidates.sort(function(a, b) {
-    // Coaches already on an adjacent training come first so we keep them
-    // in a continuous run on one net (level 2) and avoid net jumps (level 1).
-    if (a.neighbor !== b.neighbor) return b.neighbor - a.neighbor;
-
+  out.sort(function(a, b) {
     var aUnder = a.gapSoft > 0 ? 1 : 0;
     var bUnder = b.gapSoft > 0 ? 1 : 0;
     if (aUnder !== bUnder) return bUnder - aUnder;
     if (aUnder && a.gapSoft !== b.gapSoft) return b.gapSoft - a.gapSoft;
+    if (a.rank !== b.rank) return a.rank - b.rank;
     if (a.remainingCap !== b.remainingCap) return b.remainingCap - a.remainingCap;
     return a.name.localeCompare(b.name, 'he');
   });
 
-  return candidates;
+  return out;
 }
 
 /**
@@ -1191,65 +1526,6 @@ function hasSubmittedAnyAvailability_(name, availability) {
     if (avail[days[i]] && avail[days[i]].length > 0) return true;
   }
   return false;
-}
-
-/**
- * Three-level continuity score for placing `name` on `slot` (an unfilled slot):
- *   2 — coach already on the SAME net at an adjacent time (clean same-net run).
- *   1 — coach only on a DIFFERENT net at an adjacent time, AND that net is
- *       already filled at slot's time (a net jump is the only way to keep the
- *       coach in a continuous chunk).
- *   0 — no adjacent training, OR an adjacent net also has an unfilled slot at
- *       slot's exact time (defer the coach to that net instead).
- *
- * Adjacency uses a ≤30-minute time gap (to cover the 19:00 → 19:15 evening
- * boundary) within the same day and the same block. The block check stops the
- * 12:00 → 16:00 morning/evening gap from counting as "adjacent".
- */
-function computeNeighborLevel_(name, slot, state) {
-  if (!slot || slot.startTime == null || slot.endTime == null) return 0;
-  var slotMap = state._slotMap || {};
-  var sameNet = false;
-  var crossNets = {};
-
-  var assignedIds = Object.keys(state.assigned);
-  for (var i = 0; i < assignedIds.length; i++) {
-    var a = state.assigned[assignedIds[i]];
-    if (!a || a.unfilled || a.managerSlot || a.name !== name) continue;
-    var other = slotMap[assignedIds[i]];
-    if (!other || other.startTime == null || other.endTime == null) continue;
-    if (other.day !== slot.day) continue;
-    if (other.block !== slot.block) continue;
-
-    var gapAfter = other.startTime - slot.endTime;   // other follows slot
-    var gapBefore = slot.startTime - other.endTime;  // other precedes slot
-    var adjacent = (gapAfter >= 0 && gapAfter <= 0.5) || (gapBefore >= 0 && gapBefore <= 0.5);
-    if (!adjacent) continue;
-
-    if (other.location === slot.location) {
-      sameNet = true;
-    } else {
-      crossNets[other.location] = true;
-    }
-  }
-
-  if (sameNet) return 2;
-  var crossNetList = Object.keys(crossNets);
-  if (crossNetList.length === 0) return 0;
-
-  // Cross-net only. If the coach's adjacent net ALSO has an unfilled slot at
-  // this exact time, defer — we want the coach to land there, not here.
-  for (var j = 0; j < assignedIds.length; j++) {
-    var aj = state.assigned[assignedIds[j]];
-    if (!aj || !aj.unfilled) continue;
-    var sj = slotMap[assignedIds[j]];
-    if (!sj || sj.startTime == null || sj.endTime == null) continue;
-    if (sj.day !== slot.day || sj.block !== slot.block) continue;
-    if (Math.abs(sj.startTime - slot.startTime) >= 0.02) continue;
-    if (Math.abs(sj.endTime - slot.endTime) >= 0.02) continue;
-    if (crossNets[sj.location]) return 0;
-  }
-  return 1;
 }
 
 /**

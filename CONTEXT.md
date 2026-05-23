@@ -144,10 +144,33 @@ Rules:
 - **Minimum 2 trainings.** Coaches whose longest contiguous teachable run is below 2 are skipped this week — no isolated 1-training shifts.
 - **Time-contiguous only.** The function refuses fragmented assignments (e.g. 8–9 + 10–11 with a 9–10 gap). It finds the contiguous runs in the candidate's `timeKeys`, tries the longest first, and within each window prefers same-net (sticky) before falling back to a spread placement across nets.
 
+**Shift-vision multi-pass (May 23 2026).** `assignShiftBlock_` runs three passes per (day, block) group:
+
+1. **Pass 1 — full shifts only.** Candidates whose longest contiguous teachable run reaches the 4-training cap enter; `findBestContiguousAssignment_` is forced to return a 4-training assignment or nothing. Rank-1 priority and the usual sort still apply *within* the pass.
+2. **Pass 2 — 3-training shifts.** Coaches whose longest run is < 4 (so they CAN'T fit a full shift) but ≥ 3. **A coach who could deliver 4 is excluded** — if pass 1 couldn't place them, they don't fall back to a 3-shift; they stay unassigned for this (day, block). This implements the staff rule: "if a coach gives 4+ hours, give them exactly 4 trainings or none".
+3. **Pass 3 — 2-training shifts.** Same exclusion for 4h+ coaches. 3h coaches that pass 2 couldn't place do get a 2-shift fallback here.
+
+Trade-off (deliberate, per staff): we'd rather have a net sit empty for a whole block than break a fuller shift into two-training fragments. So the schedule may show entire net columns of `אין אימון` on quiet mornings — that's intentional. The `WeeklyClasses` totals still drive how many slots are *opened* (via `distributeClassesIntoSlots_`); pass-based assignment then chooses *which* of those slots get a coach.
+
+**Anchor-first distribution (May 23 2026).** `buildSlotFillPriority_` now opens slots as full 4-training anchor blocks, one net at a time across the whole week:
+
+1. **Round 1 — Net1 for every (day, block) unit.** Morning Net1 anchors at 07:00 (7→11), evening Net1 at 17:00 (17→21:15).
+2. **Round 2 — Net2.** Morning Net2 anchors at 08:00 (8→12), evening Net2 at 16:00 (16→20:15). The two anchors overlap at 8–11 (morning) / 17–19:15 (evening), creating the natural peak window.
+3. **Round 3 — Net3.** Default anchors match Net1, but **per-day supply-aware** (see below). Falls back to Net1's anchors when both options have equal supply.
+
+Friday morning is single-anchor (no 11–12 cell), so all three nets anchor at 07:00.
+
+**Net 3 supply-aware anchor (May 23 2026).** Net 1 and Net 2 keep their fixed peak / mid anchors so the 8–11 (morning) and 17–19:15 (evening) overlap stay covered. Net 3 — the flex net — chooses its anchor per (day, block) by counting how many coaches can fully cover each 4-training window: switches to the mid anchor (08:00 / 16:00) when more coaches there have signed up than at the peak anchor. Equal supply keeps the default peak anchor (no unnecessary churn). Friday morning is exempt because no 11–12 slot exists — only the 07:00 anchor is valid. Implementation: `buildSlotFillPriority_(slots, availability)` in `ClassTypes.gs`, `countCoachesCoveringSlots_` helper. Example win: Sunday morning Net 3 used to anchor at 07 with supply = 1 (יובל, but he's on Net 1), wasting cell 7–8 as a red and forcing תומר אסף onto a 2-training shift; now Net 3 anchors at 08 with supply = 2, eliminating the red and letting תומר land a 3-training sticky shift on Net 3 8–11.
+
+Maximum anchor-aligned capacity = 11 units × 3 nets × 4 trainings = **132** classes/week (Friday evening doesn't exist at Mentor). The raw ShiftTemplate still has 162 cells; the extra 30 (Net1@11–12, Net2@7–8, etc.) only open if the user pins them manually via `ShiftTemplate.ClassType` or asks for >132 classes (tail fill).
+
+**Suggester contiguity guard (May 23 2026).** `rankSuggestionCandidates_` refuses to suggest a coach unless they already have a same-net adjacent assignment on this day+block (`neighbor === 2`) AND the resulting same-net run stays ≤ 4 trainings. So the suggester can only EXTEND an existing 2- or 3-training shift to a 3- or 4-training shift, never create an isolated 1-training cell. If no coach qualifies, the slot stays red unfilled — the staff can see it needs a manual phone call.
+
 Still TODO:
 
 - **Anchor preference.** The function picks the longest fittable window but doesn't yet *prefer* anchor-aligned windows (7→11 / 8→12 / 16→20:15 / 17→21:15) over other valid contiguous windows. In practice the anchor windows usually win because they're the longest, but it's not guaranteed.
 - **Re-considering coaches after their first run.** If a coach has two contiguous teachable runs (e.g. 7–9 and 10–12 because the middle hour was a class type they can't teach), only the longest is assigned today; the other run is left for someone else even though the coach is there.
+- **Supply-aware distribution.** Today `distributeClassesIntoSlots_` opens active slots without checking which hours actually have eligible-coach supply; restricted types (League / E) can land at hours where no eligible coach signed up — that becomes an empty red slot the multi-pass can't rescue.
 
 ---
 
@@ -252,7 +275,7 @@ Defaults seeded today (per Mentor staff 2026-05-21):
 | C | `*` | — | FALSE |
 | D | `*` | — | FALSE |
 | E | `Rank<=2,Gender=M` | 1 | TRUE |
-| League | `בבה,יובל כץ` | 1 | FALSE |
+| League | `Rank<=1,בבה,יובל כץ` | 1 | FALSE |
 
 Master kill switch: `class_type_eligibility_enabled` (Rules sheet). `FALSE` bypasses all class-type filtering.
 

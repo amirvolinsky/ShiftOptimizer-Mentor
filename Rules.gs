@@ -21,7 +21,8 @@ function getDefaultMentorRules_() {
     soft_cap_weekly_max: true,
     avoid_back_to_back: true,
     suggest_outside_availability: true,
-    class_type_eligibility_enabled: true
+    class_type_eligibility_enabled: true,
+    enforce_min_shift_rank3plus: true
   };
 }
 
@@ -51,7 +52,11 @@ function getMentorRuleDescriptions_() {
     class_type_eligibility_enabled:
       'לאכוף חוקי כשירות לסוגי כיתות (ילדים / הייטק / A–E / ליגה) לפי הטאב "ClassTypeRules". ' +
       'כשמשבצת ב-ShiftTemplate מתויגת בסוג כיתה, רק מאמנים שעומדים בחוק יוצעו לה. ' +
-      'משבצות ללא תיוג זמינות לכל מאמן. כבה כדי לעקוף את הסינון לחלוטין (מצב חירום).'
+      'משבצות ללא תיוג זמינות לכל מאמן. כבה כדי לעקוף את הסינון לחלוטין (מצב חירום).',
+    enforce_min_shift_rank3plus:
+      'להבטיח שכל מאמן בדרג 3 ומעלה שהגיש זמינות מקבל לפחות משמרת אחת. ' +
+      'אם לא נמצא לו מקום, המערכת מחליפה אותו עם מאמן אחר שיש לו ≥2 משמרות ' +
+      '(לא מדרג 1 ולא ברשימת noSuggestCoaches). כבה כדי להחזיר התנהגות לפי דרגה בלבד.'
   };
 }
 

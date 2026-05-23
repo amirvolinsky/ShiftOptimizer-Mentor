@@ -33,18 +33,92 @@ var SCHEDULE_INACTIVE_LABEL_HE_ = 'אין אימון';
 var UNIFIED_SCHEDULE_DAYS_ = ['ראשון', 'שני', 'שלישי', 'רביעי', 'חמישי', 'שישי'];
 
 /**
- * Render a capacity slot that has no class scheduled this week: light-grey
- * background, faint "אין אימון" label, no coach dropdown, no hover note.
+ * Apply the "אין אימון" inactive styling (light-grey bg, faint text, no
+ * hover note) without touching the cell's data validation. Used by both
+ * the initial render and by the onEdit_ live trigger when the staff picks
+ * "אין אימון" from the dropdown — onEdit_ wants to keep the dropdown so
+ * the staff can flip back to a coach name later.
  */
-function writeInactiveSlotCell_(cell) {
+function applyInactiveCellStyle_(cell) {
   cell.setValue(SCHEDULE_INACTIVE_LABEL_HE_)
     .setBackground(SCHEDULE_INACTIVE_BG_)
     .setFontColor(SCHEDULE_INACTIVE_FG_)
     .setFontWeight('normal');
   cell.setNote('');
-  // Strip any previous data validation (coach-name dropdown) — there's
-  // no coach to override here.
-  cell.setDataValidation(null);
+}
+
+/**
+ * Render a capacity slot that has no class scheduled this week: light-grey
+ * background, faint "אין אימון" label, faint hover note (empty), and a
+ * dropdown that includes "אין אימון" + the full coach list so the staff
+ * can switch it to a coach mid-week without re-running the optimizer.
+ */
+function writeInactiveSlotCell_(cell, slot, masterMap) {
+  applyInactiveCellStyle_(cell);
+  if (slot && masterMap) {
+    setOverrideDropdown_(cell, slot, masterMap);
+  } else {
+    cell.setDataValidation(null);
+  }
+}
+
+/**
+ * Render the schedule fill counter under the weekly grid.
+ *
+ * Counts every NON-grey ("אין אימון") cell as "פתוח לאיוש" (open), and
+ * every open cell that has a coach (any of green/orange/blue — including
+ * 💙 suggested) as "משובץ" (filled). Red unfilled cells are open but not
+ * filled, so they show up in the gap between the two counters.
+ *
+ * Layout: two cells wide — label on the right (RTL), big colored value on
+ * the left. The counter spans 4 grid columns visually but renders as two
+ * merged blocks so it survives column-width changes.
+ */
+function writeScheduleFillCounter_(sheet, row, slots, assignments) {
+  var open = 0;
+  var filled = 0;
+  for (var i = 0; i < slots.length; i++) {
+    var slot = slots[i];
+    if (slot.inactive) continue;
+    if (slot.block === 'מנהל') continue;
+    open++;
+    var asgn = assignments && assignments[slot.slotId];
+    if (asgn && !asgn.unfilled && asgn.name) filled++;
+  }
+
+  var unfilled = open - filled;
+  var pct = open > 0 ? Math.round((filled / open) * 100) : 0;
+  var fillColor = (unfilled === 0) ? '#C6EFCE'
+                 : (filled / Math.max(open, 1) >= 0.85) ? '#FFF2CC'
+                 : '#FFD9D9';
+
+  var labelText = 'סה"כ אימונים השבוע (לא כולל "אין אימון"):';
+  var valueText = filled + ' / ' + open +
+    '  •  ' + pct + '% שובצו  •  ' + unfilled + ' עדיין באדום';
+
+  // Use a 4-column-wide layout — column 1 holds the label, columns 2-5 the
+  // big value. We pick columns 1..5 so the counter visually anchors to
+  // the right edge (RTL) and doesn't drift if day columns change width.
+  var labelRange = sheet.getRange(row, 1, 1, 1);
+  var valueRange = sheet.getRange(row, 2, 1, 4);
+
+  labelRange.setValue(labelText)
+    .setBackground('#2E7D6B')
+    .setFontColor('#FFFFFF')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('right')
+    .setVerticalAlignment('middle');
+
+  valueRange.merge()
+    .setValue(valueText)
+    .setBackground(fillColor)
+    .setFontColor('#1F3A2E')
+    .setFontWeight('bold')
+    .setFontSize(13)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle');
+
+  sheet.setRowHeight(row, 30);
 }
 
 function writeSchedule(result, slots, masterMap, availability, notes, distribution) {
@@ -71,12 +145,15 @@ function writeSchedule(result, slots, masterMap, availability, notes, distributi
     sheet, result.assignments, slots, slotMap, masterMap, availability, consecutiveShifts, 1
   );
 
+  var counterRow = lastDataRow + 2;
+  writeScheduleFillCounter_(sheet, counterRow, slots, result.assignments);
+
   writeFairnessTable_(
-    sheet, result.employeeStats, masterMap, availability, slots, lastDataRow + 2, notes
+    sheet, result.employeeStats, masterMap, availability, slots, counterRow + 2, notes
   );
 
   sheet.setRightToLeft(true);
-  applyUnifiedScheduleLayout_(sheet, 1, lastDataRow);
+  applyUnifiedScheduleLayout_(sheet, 1, lastDataRow, buildOrderedTimeGrid_(slots));
   centerAllScheduleCells_(sheet);
 }
 
@@ -167,9 +244,10 @@ function writeUnifiedScheduleGrid_(sheet, assignments, slots, slotMap, masterMap
 
         // Slot exists in the template but no class is running this week
         // (auto-distribution skipped it). Render as a grey "אין אימון" cell
-        // — distinct from red unfilled, no coach, no override dropdown.
+        // — distinct from red unfilled, but with a dropdown so the staff
+        // can still swap it to a coach without re-running the optimizer.
         if (slot.inactive) {
-          writeInactiveSlotCell_(cell);
+          writeInactiveSlotCell_(cell, slot, masterMap);
           continue;
         }
 
@@ -190,12 +268,13 @@ function writeUnifiedScheduleGrid_(sheet, assignments, slots, slotMap, masterMap
  * Equal net column widths, narrower time column, and a thick left border on the
  * first column of each day block so Sun–Fri read as separate 3-column panels.
  */
-function applyUnifiedScheduleLayout_(sheet, headerRow, lastDataRow) {
+function applyUnifiedScheduleLayout_(sheet, headerRow, lastDataRow, timeGrid) {
   var perDayCols = CONFIG.locations.length;
   var netColStart = 2;
   var netColEnd = netColStart + UNIFIED_SCHEDULE_DAYS_.length * perDayCols - 1;
   var subHeaderRow = headerRow + 1;
   var numRows = Math.max(lastDataRow - headerRow + 1, 2);
+  var firstDataRow = subHeaderRow + 1;
 
   sheet.setColumnWidth(1, SCHEDULE_TIME_COL_WIDTH_);
   for (var c = netColStart; c <= netColEnd; c++) {
@@ -208,6 +287,26 @@ function applyUnifiedScheduleLayout_(sheet, headerRow, lastDataRow) {
       .setBorder(null, true, null, null, null, null, SCHEDULE_DAY_DIVIDER_COLOR_, SpreadsheetApp.BorderStyle.SOLID_MEDIUM);
     sheet.getRange(subHeaderRow, dayStartCol)
       .setBackground(SCHEDULE_DAY_EDGE_SUBHEADER_BG_);
+  }
+
+  // Horizontal divider between the morning and evening blocks — same green
+  // colour as the day dividers, drawn full-width across both the time column
+  // and every (day, net) cell so the morning/evening boundary is impossible
+  // to miss. The split is computed from the time grid (last 'בוקר' row),
+  // so it stays correct if Friday's blocks ever shift.
+  if (timeGrid && timeGrid.length) {
+    var lastMorningIdx = -1;
+    for (var i = 0; i < timeGrid.length; i++) {
+      if (timeGrid[i] && timeGrid[i].block === 'בוקר') lastMorningIdx = i;
+    }
+    if (lastMorningIdx >= 0 && lastMorningIdx < timeGrid.length - 1) {
+      var dividerRow = firstDataRow + lastMorningIdx;
+      sheet.getRange(dividerRow, 1, 1, netColEnd)
+        .setBorder(
+          null, null, true, null, null, null,
+          SCHEDULE_DAY_DIVIDER_COLOR_, SpreadsheetApp.BorderStyle.SOLID_MEDIUM
+        );
+    }
   }
 }
 
@@ -256,8 +355,12 @@ function writeScheduleAssignmentCell_(cell, slot, asgn, masterMap, availability,
 function setOverrideDropdown_(cell, slot, masterMap) {
   var dropdown = getOverrideCandidates_(slot, masterMap);
   if (!dropdown || dropdown.length === 0) return;
+  // Prepend the "אין אימון" sentinel so the staff can mark a cell as
+  // grey/inactive directly from the dropdown without re-running the
+  // optimizer. onEdit_() picks this up and applies the inactive styling.
+  var withInactive = [SCHEDULE_INACTIVE_LABEL_HE_].concat(dropdown);
   var rule = SpreadsheetApp.newDataValidation()
-    .requireValueInList(dropdown, true)
+    .requireValueInList(withInactive, true)
     .setAllowInvalid(true)
     .build();
   cell.setDataValidation(rule);
@@ -296,10 +399,14 @@ function buildSlotIndexByDayLocationTime_(slots) {
  * adjacent rows. Top-left cell value/color/note/validation are kept; other
  * cells in the run are absorbed by the merge.
  *
- * Merge is purely name-based across the whole day-net column, so a coach who
- * covers BOTH morning and evening of the same day shows up as one tall cell.
- * Intra-shift gaps (e.g. 19:00→19:15) and the 12:00→16:00 gap between blocks
- * are absorbed by the merge.
+ * Merge is name-based **within each block** (morning OR evening). A coach who
+ * covers BOTH morning and evening of the same day renders as TWO stacked tall
+ * cells with the same name, separated by the green morning/evening divider
+ * (drawn in applyUnifiedScheduleLayout_). Crossing the 12:00 → 16:00 boundary
+ * with a single merge would clobber the row-bottom border of the last morning
+ * row, hiding the divider on that (day, net) column — we explicitly break the
+ * run at the block change to keep the divider continuous. Intra-shift gaps
+ * (e.g. 19:00 → 19:15) inside one block are still absorbed.
  *
  * The merged cell keeps the top-left cell's background — green / blue / orange
  * are already set per-cell by writeScheduleAssignmentCell_() based on the
@@ -333,7 +440,12 @@ function mergeConsecutiveSameCoach_(sheet, firstDataRow, timeGrid, assignments, 
         var name = (!inactiveRowBreak && asgn && asgn.name && !asgn.unfilled && !asgn.managerSlot)
           ? asgn.name : null;
 
-        var continuous = (name !== null && name === runName && t > 0);
+        // Force a break at the morning → evening boundary so the green divider
+        // line drawn on the last morning row's bottom edge stays visible even
+        // when the same coach covers both blocks of the day.
+        var blockChanged = (t > 0 && timeGrid[t].block !== timeGrid[t - 1].block);
+
+        var continuous = (name !== null && name === runName && t > 0 && !blockChanged);
 
         if (continuous) {
           runEnd = t;
@@ -1974,7 +2086,7 @@ function reapplyUnifiedScheduleCellStyles_(
         // Preserve "אין אימון" cells across refresh — they were tagged on
         // the slot during readUnifiedScheduleAssignments_.
         if (slot.inactive) {
-          writeInactiveSlotCell_(sheet.getRange(row, col));
+          writeInactiveSlotCell_(sheet.getRange(row, col), slot, masterMap);
           continue;
         }
 
@@ -2033,7 +2145,12 @@ function refreshScheduleFromSheet_() {
   );
 
   var lastDataRow = 2 + timeGrid.length;
-  applyUnifiedScheduleLayout_(sheet, 1, lastDataRow);
+  applyUnifiedScheduleLayout_(sheet, 1, lastDataRow, timeGrid);
+
+  // Re-render the fill counter from the refreshed assignments. We deliberately
+  // recompute from scratch instead of trying to detect the previous counter
+  // row, so a manual edit that flips cells to "אין אימון" updates the score.
+  writeScheduleFillCounter_(sheet, lastDataRow + 2, slots, currentAssignments);
 
   var empStats = {};
   var allNames = Object.keys(masterMap);

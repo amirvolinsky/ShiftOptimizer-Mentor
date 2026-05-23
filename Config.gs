@@ -97,11 +97,32 @@ var CONFIG = {
     best: 1,
     min: 1,
     max: 4
-  }
+  },
+
+  /**
+   * Senior coaches who only ever do the shifts they submit on the form.
+   * They are NEVER offered as 💙 system suggestions for unfilled slots
+   * outside their submitted availability. Listed here by name (must match
+   * MasterData exactly). Edit this list as the staff policy changes.
+   */
+  noSuggestCoaches: ['רון', 'מנש']
 };
 
 function isBasicMode_() {
   return CONFIG.basicMode !== false;
+}
+
+/**
+ * True when `name` is on the CONFIG.noSuggestCoaches list. Used by the
+ * 💙 suggestion phase to skip senior coaches whose policy is "only the
+ * shifts they submit, nothing more".
+ */
+function isNoSuggestCoach_(name) {
+  var list = CONFIG.noSuggestCoaches || [];
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] === name) return true;
+  }
+  return false;
 }
 
 /** Clamp MasterData rank to Mentor 1–4 scale (1 = best, 4 = reserve). */
