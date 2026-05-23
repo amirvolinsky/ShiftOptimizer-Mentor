@@ -200,10 +200,14 @@ function buildMentorTrainingTemplateRows_() {
 
   for (var di = 0; di < MENTOR_WEEKDAYS_HE_.length; di++) {
     var day = MENTOR_WEEKDAYS_HE_[di];
+    var isFri = isMentorFriday_(day);
     for (var h = 0; h < morning.length; h++) {
+      // Friday morning ends at 11:00 — no 11–12 training on Fridays. The
+      // operational rule is "Friday morning = 7–11 (4 trainings) only".
+      if (isFri && morning[h][0] === 11) continue;
       rows.push(['*', day, 'בוקר', formatTemplateTime_(morning[h][0]), formatTemplateTime_(morning[h][1]), '']);
     }
-    if (!isMentorFriday_(day)) {
+    if (!isFri) {
       for (var h = 0; h < evening.length; h++) {
         rows.push(['*', day, 'ערב', formatTemplateTime_(evening[h][0]), formatTemplateTime_(evening[h][1]), '']);
       }

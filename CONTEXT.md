@@ -74,23 +74,44 @@ Legacy radio/checkbox form (בוקר / ערב / לא זמין per day) still sup
 
 ## ShiftTemplate (Mentor training)
 
-Sun–Fri (`ראשון`–`שישי`). **שישי:** בוקר only (no evening slots).
+Sun–Fri (`ראשון`–`שישי`). **שישי:** בוקר only, 7–11 (4 trainings) — no 11–12 on Friday, no Friday evening.
 
-| Block | Hours (1 coach each) |
-|-------|----------------------|
-| בוקר | 7–8, 8–9, 9–10, 10–11, 11–12 |
-| ערב | 16–17, 17–18, 18–19, 19:15–20:15, 20:15–21:15 |
+| Block | Hours (1 coach each) | Days |
+|-------|----------------------|------|
+| בוקר | 7–8, 8–9, 9–10, 10–11, 11–12 | Sun–Thu |
+| בוקר | 7–8, 8–9, 9–10, 10–11 | Friday only (no 11–12) |
+| ערב | 16–17, 17–18, 18–19, 19:15–20:15, 20:15–21:15 | Sun–Thu (no Friday evening) |
 
-The sheet stores one row per Day/Block/Time (≈55 rows) with `Location = '*'`. The loader expands `*` into one slot per `CONFIG.locations` entry (Net1/Net2/Net3), so the runtime model still has 3 parallel nets without 3× duplication in the sheet. Specific locations (`Net1`) and comma/pipe-separated lists (`Net1,Net2`) are also supported.
+Total capacity: **162** = (5 weekdays × 5 morning × 3 nets) + (5 weekdays × 5 evening × 3 nets) + (Friday × 4 morning × 3 nets) = 75 + 75 + 12.
+
+The sheet stores one row per Day/Block/Time with `Location = '*'`. The loader expands `*` into one slot per `CONFIG.locations` entry (Net1/Net2/Net3), so the runtime model still has 3 parallel nets without 3× duplication in the sheet. Specific locations (`Net1`) and comma/pipe-separated lists (`Net1,Net2`) are also supported.
 
 Menu: **📅 עדכן תבנית אימונים** reloads `ShiftTemplate` only.
 
 Two-layer model:
 
-- **Form availability** = shift window the coach can work (e.g. `7:00 עד 10:00`).
+- **Form availability** = window the coach is willing to work (e.g. `7:00 עד 10:00`, `7:00 עד 12:00`, `16:00 עד 21:15`).
 - **ShiftTemplate** = training layer inside the shift (hourly training slots on parallel nets).
-- Optimizer schedules the coach to the **continuous training slots fully inside** the submitted window.
+- **Scheduled shift** = a contiguous run of 4 trainings (the canonical full shift) anchored at one of the rules below; coaches whose availability is shorter than 4 still get scheduled for whatever they have (2–3 trainings) under the old "min 2h" fallback. Coaches whose availability spans morning **and** evening on the same day may be assigned **both** blocks, but the existing "long day" warning fires on the cell.
 - Nets are anonymous parallel capacity in the same physical place. The sheet keeps `Net1`–`Net3` for readability in `Schedule`, but coaches decide the actual net on site.
+
+### Shift-length anchors (canonical full shift = 4 trainings)
+
+| Block | Anchor | Trainings | Span | Allowed on |
+|-------|--------|-----------|------|------------|
+| בוקר | 07:00 | 7-8, 8-9, 9-10, 10-11 | 07:00–11:00 | Sun–Fri |
+| בוקר | 08:00 | 8-9, 9-10, 10-11, 11-12 | 08:00–12:00 | Sun–Thu only (no 11–12 on Friday) |
+| ערב | 16:00 | 16-17, 17-18, 18-19, 19:15-20:15 | 16:00–20:15 | Sun–Thu |
+| ערב | 17:00 | 17-18, 18-19, 19:15-20:15, 20:15-21:15 | 17:00–21:15 | Sun–Thu |
+
+Rules:
+
+1. A coach submitting **5h** availability (e.g. 07:00–12:00) gets exactly **4 trainings** — the optimizer picks anchor 7 or 8 based on which fits the class plan.
+2. Submitting **less than 4 trainings** (e.g. 9:00–12:00 = 3 trainings) is still accepted; the coach is scheduled for what they have. The result panel should surface this as "below full shift" (TODO).
+3. Submitting **morning + evening same day** is allowed; both blocks get assigned independently. The schedule colors the cells orange via the existing "יום עבודה ארוך במיוחד" note.
+4. Friday morning has only one anchor (7:00 → 7–11), because there's no 11–12 training to enable the 8:00 anchor.
+
+**Algorithm gap (still TODO, after the May 22 staff meeting).** Today the optimizer's shift-block builder (`buildShiftBlockCandidates_` in `Optimizer.gs`) places coaches into any contiguous run of slots inside their availability — it does **not** yet snap to the 7/8/16/17 anchors or cap at 4 trainings. So a coach who submitted 7–12 can still get scheduled for the full 5. Locking down the anchor rule belongs in the algorithm redesign together with the supply-aware class-type distribution.
 
 ---
 
@@ -244,6 +265,8 @@ Last column of `ShiftTemplate`. Blank cell = no class-type filter (anyone availa
 - **Fixed weekly classes** (~30 rows the staff will pin in `ShiftTemplate.ClassType`, e.g. "Childs always Sun 17:00 Net1"):
   - Pin mechanism already works end-to-end (`distributeClassesIntoSlots_` treats any tagged row as a fixed pin, subtracts it from the user's request, never moves it).
   - **Still to wire**: the `🚀 הרץ שיבוץ שבועי` dialog needs to read the current pin counts per class type and use them as the **floor** (and prefill) for each input. So if 8 B-rows are pinned in `ShiftTemplate`, the B input shows `8` with a small "🔒 8 קבועים" hint and the input can't drop below 8. Pending agreement on exact UX after staff meeting (May 22 2026).
+- **Shift-anchor enforcement.** Cap the optimizer's per-coach assignment at 4 trainings and snap the run to anchors 7/8/16/17 (see "Shift-length anchors" above). Today the optimizer still happily schedules a 5-training run when the coach gave 7–12.
+- **Supply-aware class-type distribution.** Today `distributeClassesIntoSlots_` chooses slots and types **without** looking at coach availability or eligibility, so League / E can land at hours where no eligible coach submitted — guaranteed red. Plan: build a per-(day, block, time) eligible-coach-supply map per class type, then place restricted types first into hours with the highest supply; flexible types fill what's left. Add a second pass that swaps an unfilled slot's class type with a placed one if that unblocks it.
 - Render the class type per cell on `Schedule` (color stripe / superscript) so the staff can read the live distribution at a glance.
 - Per-class warning when a manual edit puts a coach into a slot they can't teach.
 - Per-day / per-block manual override of the auto-distribution (today the algorithm is opaque — the only override is to pre-tag `ShiftTemplate.ClassType` rows).
