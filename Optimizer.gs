@@ -308,10 +308,7 @@ function assignShiftBlock_(group, availability, masterMap, rules, state) {
     if (!canAssignMoreClasses_(cand.name, cand.length, rules, state)) continue;
     if (candidateAlreadyHasAnyTime_(cand, state)) continue;
 
-    var assignedSlots = findStickyNetAssignment_(cand, state, masterMap, rules);
-    if (!assignedSlots) {
-      assignedSlots = findSpreadAssignment_(cand, state, masterMap, rules);
-    }
+    var assignedSlots = findBestContiguousAssignment_(cand, state, masterMap, rules);
     if (!assignedSlots) continue;
 
     assignEmployeeToSlots_(cand.name, assignedSlots, masterMap, state);
@@ -323,6 +320,13 @@ function assignShiftBlock_(group, availability, masterMap, rules, state) {
     }
   }
 }
+
+/** Canonical full-shift length in trainings (4 = 4 hours of footvolley). */
+var MENTOR_FULL_SHIFT_TRAININGS_ = 4;
+/** Hard floor on shift length — coaches whose longest contiguous teachable
+ *  run is below this are skipped this week (matches the staff rule
+ *  "no 1-training assignments"). */
+var MENTOR_MIN_SHIFT_TRAININGS_ = 2;
 
 function buildShiftBlockCandidates_(group, availability, masterMap, rules, state) {
   var candidates = [];
@@ -343,6 +347,14 @@ function buildShiftBlockCandidates_(group, availability, masterMap, rules, state
       // for class types like E with allowSplit: true).
       timeKeys = filterTimeKeysByClassEligibility_(group, timeKeys, name, masterMap, state, rules);
       if (!timeKeys.length) continue;
+
+      // Refuse to even propose a candidate whose longest contiguous teachable
+      // run is below the minimum shift length. This keeps the sort/queue
+      // clean and matches the staff rule "no 1-training shifts".
+      var longestRun = computeLongestContiguousRun_(timeKeys);
+      if (longestRun < MENTOR_MIN_SHIFT_TRAININGS_) continue;
+      var effectiveLength = Math.min(longestRun, MENTOR_FULL_SHIFT_TRAININGS_);
+
       candidates.push({
         name: name,
         rank: normalizeMentorRank_(emp.rank),
@@ -350,9 +362,11 @@ function buildShiftBlockCandidates_(group, availability, masterMap, rules, state
         block: group.block,
         rangeIndex: r,
         timeKeys: timeKeys,
-        length: timeKeys.length,
+        // length used for sort priority — caps at the canonical 4 so a
+        // 5-hour submission doesn't outrank a 4-hour submission unfairly.
+        length: effectiveLength,
         // gap = WeeklyMax − number of distinct (day, block) shifts already assigned.
-        // One full 5-training morning still counts as ONE shift here.
+        // One full 4-training morning still counts as ONE shift here.
         gap: getShiftTarget(name, masterMap, availability, rules) - countAssignedShifts_(name, state),
         backToBack: wouldCreateBackToBackShift_(name, group.day, group.block, emp, state),
         group: group
@@ -360,6 +374,54 @@ function buildShiftBlockCandidates_(group, availability, masterMap, rules, state
     }
   }
   return candidates;
+}
+
+/** True when keyB starts within 30 min of keyA's end (handles the 19:00→19:15 break). */
+function timeKeysAdjacent_(keyA, keyB) {
+  var a = String(keyA).split('|');
+  var b = String(keyB).split('|');
+  if (a.length < 2 || b.length < 2) return false;
+  var aEnd = parseFloat(a[1]);
+  var bStart = parseFloat(b[0]);
+  if (isNaN(aEnd) || isNaN(bStart)) return false;
+  return (bStart - aEnd) <= 0.5 && (bStart - aEnd) >= -0.01;
+}
+
+/** Length of the longest sub-array of timeKeys where each consecutive pair is adjacent. */
+function computeLongestContiguousRun_(timeKeys) {
+  if (!timeKeys || !timeKeys.length) return 0;
+  var best = 1;
+  var current = 1;
+  for (var i = 1; i < timeKeys.length; i++) {
+    if (timeKeysAdjacent_(timeKeys[i - 1], timeKeys[i])) {
+      current++;
+      if (current > best) best = current;
+    } else {
+      current = 1;
+    }
+  }
+  return best;
+}
+
+/**
+ * All contiguous runs of timeKeys as { start, end } indices into the array,
+ * sorted by descending length. Used by findBestContiguousAssignment_ to try
+ * the longest contiguous teachable window first before falling back to
+ * shorter ones.
+ */
+function buildContiguousRuns_(timeKeys) {
+  var runs = [];
+  if (!timeKeys || !timeKeys.length) return runs;
+  var runStart = 0;
+  for (var i = 1; i < timeKeys.length; i++) {
+    if (!timeKeysAdjacent_(timeKeys[i - 1], timeKeys[i])) {
+      runs.push({ start: runStart, end: i - 1 });
+      runStart = i;
+    }
+  }
+  runs.push({ start: runStart, end: timeKeys.length - 1 });
+  runs.sort(function(a, b) { return (b.end - b.start) - (a.end - a.start); });
+  return runs;
 }
 
 /**
@@ -440,28 +502,6 @@ function candidateAlreadyHasAnyTime_(candidate, state) {
   return false;
 }
 
-function findStickyNetAssignment_(candidate, state, masterMap, rules) {
-  for (var l = 0; l < CONFIG.locations.length; l++) {
-    var location = CONFIG.locations[l];
-    var out = [];
-    var ok = true;
-    for (var t = 0; t < candidate.timeKeys.length; t++) {
-      var slot = findSlotForLocationAtTime_(candidate.group.slotsByTime[candidate.timeKeys[t]], location);
-      if (!slot || state.assigned[slot.slotId] || hasTimeConflict(candidate.name, slot, null, state)) {
-        ok = false;
-        break;
-      }
-      if (!coachEligibleForClassType_(candidate.name, slot.classType, masterMap, state._classTypeRules, rules)) {
-        ok = false;
-        break;
-      }
-      out.push(slot);
-    }
-    if (ok) return out;
-  }
-  return null;
-}
-
 function findSlotForLocationAtTime_(slotsAtTime, location) {
   for (var i = 0; i < slotsAtTime.length; i++) {
     if (slotsAtTime[i].location === location) return slotsAtTime[i];
@@ -469,9 +509,74 @@ function findSlotForLocationAtTime_(slotsAtTime, location) {
   return null;
 }
 
-function findSpreadAssignment_(candidate, state, masterMap, rules) {
+/**
+ * Pick the best contiguous shift for `candidate`. "Best" means longest
+ * contiguous (time-adjacent) window of teachable, free slots inside the
+ * coach's submitted availability, capped at MENTOR_FULL_SHIFT_TRAININGS_
+ * (4) and floored at MENTOR_MIN_SHIFT_TRAININGS_ (2).
+ *
+ * Within a chosen window we first try same-net (sticky) placement on each
+ * net in order, then fall back to a spread placement (different nets per
+ * training) if no single net works for the whole window.
+ *
+ * Returns the assigned slot array (length 2–4) or null when no window
+ * meeting the minimum can be filled.
+ */
+function findBestContiguousAssignment_(candidate, state, masterMap, rules) {
+  var keys = candidate.timeKeys;
+  if (!keys || keys.length < MENTOR_MIN_SHIFT_TRAININGS_) return null;
+
+  var runs = buildContiguousRuns_(keys);
+  var capLen = MENTOR_FULL_SHIFT_TRAININGS_;
+  var minLen = MENTOR_MIN_SHIFT_TRAININGS_;
+
+  for (var ri = 0; ri < runs.length; ri++) {
+    var run = runs[ri];
+    var runLen = run.end - run.start + 1;
+    if (runLen < minLen) continue;
+    var startMaxLen = Math.min(capLen, runLen);
+
+    for (var L = startMaxLen; L >= minLen; L--) {
+      for (var start = run.start; start + L - 1 <= run.end; start++) {
+        // Sticky pass — same net throughout the window.
+        for (var l = 0; l < CONFIG.locations.length; l++) {
+          var stickyOut = tryAssignmentOnNet_(
+            candidate, state, masterMap, rules, start, L, CONFIG.locations[l]
+          );
+          if (stickyOut) return stickyOut;
+        }
+        // Spread pass — different nets per training inside the window.
+        // Cheaper to read on the schedule when same-net isn't possible,
+        // because the window is still time-contiguous (no gaps).
+        var spreadOut = trySpreadAssignment_(
+          candidate, state, masterMap, rules, start, L
+        );
+        if (spreadOut) return spreadOut;
+      }
+    }
+  }
+  return null;
+}
+
+/** Try to fill candidate.timeKeys[start..start+L-1] on a single net. */
+function tryAssignmentOnNet_(candidate, state, masterMap, rules, start, L, location) {
   var out = [];
-  for (var t = 0; t < candidate.timeKeys.length; t++) {
+  for (var t = start; t < start + L; t++) {
+    var slot = findSlotForLocationAtTime_(
+      candidate.group.slotsByTime[candidate.timeKeys[t]] || [], location
+    );
+    if (!slot || state.assigned[slot.slotId]) return null;
+    if (hasTimeConflict(candidate.name, slot, null, state)) return null;
+    if (!coachEligibleForClassType_(candidate.name, slot.classType, masterMap, state._classTypeRules, rules)) return null;
+    out.push(slot);
+  }
+  return out;
+}
+
+/** Try to fill candidate.timeKeys[start..start+L-1] allowing net switches. */
+function trySpreadAssignment_(candidate, state, masterMap, rules, start, L) {
+  var out = [];
+  for (var t = start; t < start + L; t++) {
     var slotsAtTime = candidate.group.slotsByTime[candidate.timeKeys[t]] || [];
     var picked = null;
     for (var s = 0; s < slotsAtTime.length; s++) {

@@ -138,7 +138,16 @@ Rules:
 3. Submitting **morning + evening same day** is allowed; both blocks get assigned independently. The schedule colors the cells orange via the existing "יום עבודה ארוך במיוחד" note.
 4. Friday morning has only one anchor (7:00 → 7–11), because there's no 11–12 training to enable the 8:00 anchor.
 
-**Algorithm gap (still TODO, after the May 22 staff meeting).** Today the optimizer's shift-block builder (`buildShiftBlockCandidates_` in `Optimizer.gs`) places coaches into any contiguous run of slots inside their availability — it does **not** yet snap to the 7/8/16/17 anchors or cap at 4 trainings. So a coach who submitted 7–12 can still get scheduled for the full 5. Locking down the anchor rule belongs in the algorithm redesign together with the supply-aware class-type distribution.
+**Implementation (May 23 2026).** `findBestContiguousAssignment_` in `Optimizer.gs` enforces:
+
+- **Cap at 4 trainings.** Longer availability windows still produce at most a 4-training assignment.
+- **Minimum 2 trainings.** Coaches whose longest contiguous teachable run is below 2 are skipped this week — no isolated 1-training shifts.
+- **Time-contiguous only.** The function refuses fragmented assignments (e.g. 8–9 + 10–11 with a 9–10 gap). It finds the contiguous runs in the candidate's `timeKeys`, tries the longest first, and within each window prefers same-net (sticky) before falling back to a spread placement across nets.
+
+Still TODO:
+
+- **Anchor preference.** The function picks the longest fittable window but doesn't yet *prefer* anchor-aligned windows (7→11 / 8→12 / 16→20:15 / 17→21:15) over other valid contiguous windows. In practice the anchor windows usually win because they're the longest, but it's not guaranteed.
+- **Re-considering coaches after their first run.** If a coach has two contiguous teachable runs (e.g. 7–9 and 10–12 because the middle hour was a class type they can't teach), only the longest is assigned today; the other run is left for someone else even though the coach is there.
 
 ---
 
@@ -284,7 +293,7 @@ Last column of `ShiftTemplate`. Blank cell = no class-type filter (anyone availa
 ### Behavior in the optimizer
 
 - `assignContinuousShiftBlocks_` drops timeKeys where the coach can't teach any of the parallel-net classes at that time. The shift is naturally truncated to the teachable subset and the rest falls to another eligible coach in the same pass (gives "split within a shift" for free for E).
-- `getEligibleCandidates`, `findStickyNetAssignment_`, `findSpreadAssignment_`, and `rankSuggestionCandidates_` all consult `coachEligibleForClassType_` before adding a candidate.
+- `getEligibleCandidates`, `findBestContiguousAssignment_` (sticky + spread inside one window), and `rankSuggestionCandidates_` all consult `coachEligibleForClassType_` before adding a candidate.
 - The hover tooltip on the Schedule sheet shows `🚫 לא מוסמך/ת לאמן <classType>` for filtered-out coaches.
 
 ### Pending (next round)
