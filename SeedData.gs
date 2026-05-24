@@ -560,9 +560,9 @@ var MENTOR_WEEKLY_SHIFT_TARGETS_ = {
   'לילוש':     { min: 1, max: 2 },
   'סהר כהן':   { min: 1, max: 2 },
   'מיתר':      { min: 0, max: 1 },
-  'תומר אסף':  { min: 1, max: 2 },
+  'תומר אסף':  { min: 1, max: 1 },
   'טומי':      { min: 1, max: 2 },
-  'טל נחמיאס': { min: 0, max: 1 },
+  'טל נחמיאס': { min: 0, max: 0 },
   'ינון שוב':  { min: 0, max: 1 }
 };
 var MENTOR_DEFAULT_WEEKLY_TARGET_ = { min: 1, max: 2 };
@@ -715,8 +715,18 @@ function fillFakeMentorAvailabilityRow_(row, layout, seed, coachName) {
  *   - 5 days → 4..6, centered on 5.
  *   - Always clamped to [1..6] and to (submittedDays + 1).
  */
+var FAKE_MENTOR_FIXED_WEEKLY_TARGET_ = {
+  'דורון':    1,
+  'תומר אסף': 1
+};
+
 function applyFakeWeeklyTargetToRow_(row, layout, picks, coachName, seed) {
   if (!layout || layout.weeklyTargetCol === undefined || layout.weeklyTargetCol < 0) return;
+  if (FAKE_MENTOR_FIXED_WEEKLY_TARGET_.hasOwnProperty(coachName)) {
+    var forced = FAKE_MENTOR_FIXED_WEEKLY_TARGET_[coachName];
+    row[layout.weeklyTargetCol] = (forced > 0) ? forced : '';
+    return;
+  }
   var distinctDays = {};
   for (var i = 0; i < picks.length; i++) distinctDays[picks[i].dayIndex] = true;
   var submittedDays = Object.keys(distinctDays).length;
@@ -763,7 +773,7 @@ function getCoachRankForDemo_(coachName) {
  * regardless of their rank-typical pattern. Demo pins them to exactly 3 or 4
  * picks total and skips the Friday bonus so the cap is hard, not approximate.
  */
-var FAKE_MENTOR_HARD_CAP_3_TO_4_ = ['יובל כץ', 'תומר אסף'];
+var FAKE_MENTOR_HARD_CAP_3_TO_4_ = ['יובל כץ'];
 
 function isMentorHardCap3To4_(coachName) {
   for (var i = 0; i < FAKE_MENTOR_HARD_CAP_3_TO_4_.length; i++) {
@@ -802,8 +812,11 @@ var FAKE_MENTOR_EVENING_BLOCK_PROB_ = 0.4;
  * 3=רביעי, 4=חמישי, 5=שישי.
  */
 var FAKE_MENTOR_FIXED_PICKS_ = {
-  'רון': [{ dayIndex: 1, block: 'morning' }],   // Monday morning, always & only
-  'מנש': [{ dayIndex: 3, block: 'evening' }]    // Wednesday evening, always & only
+  'רון':       [{ dayIndex: 1, block: 'morning' }],   // Monday morning, always & only
+  'מנש':       [{ dayIndex: 3, block: 'evening' }],    // Wednesday evening, always & only
+  'דורון':     [{ dayIndex: 1, block: 'evening' }, { dayIndex: 5, block: 'morning' }],
+  'תומר אסף':  [{ dayIndex: 0, block: 'morning' }, { dayIndex: 2, block: 'morning' }],
+  'טל נחמיאס': []
 };
 
 /**

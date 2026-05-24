@@ -732,6 +732,7 @@ function getCurrentWeekLabel_() {
 
 var AVAIL_SUMMARY_HOURS_HEADER_ = 'שעות זמינות';
 var AVAIL_SUMMARY_SHIFTS_HEADER_ = 'משמרות זמינות';
+var AVAIL_SUMMARY_TOTAL_LABEL_ = 'סה"כ';
 
 /**
  * Append/refresh two summary columns at the right edge of a responses sheet:
@@ -762,6 +763,18 @@ function updateAvailabilitySummary_(sheet, availability) {
   }
   if (nameCol === -1) return;
 
+  // Keep the totals row idempotent. On form-bound sheets, a later form
+  // response can arrive below the previous totals row; remove that old row
+  // before recomputing the per-response summaries.
+  for (var tr = lastRow; tr >= 2; tr--) {
+    var maybeTotal = String(sheet.getRange(tr, nameCol).getValue() || '').trim();
+    if (maybeTotal === AVAIL_SUMMARY_TOTAL_LABEL_) {
+      sheet.deleteRow(tr);
+    }
+  }
+  lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
   if (hoursCol === -1) {
     hoursCol = sheet.getLastColumn() + 1;
     sheet.getRange(1, hoursCol).setValue(AVAIL_SUMMARY_HOURS_HEADER_)
@@ -776,14 +789,28 @@ function updateAvailabilitySummary_(sheet, availability) {
   var nameValues = sheet.getRange(2, nameCol, lastRow - 1, 1).getValues();
   var hoursValues = [];
   var shiftsValues = [];
+  var totalHours = 0;
+  var totalShifts = 0;
   for (var r = 0; r < nameValues.length; r++) {
     var name = String(nameValues[r][0] || '').trim();
     var stats = computeAvailabilityStats_(name ? availability[name] : null);
     hoursValues.push([stats.hours]);
     shiftsValues.push([stats.shifts]);
+    totalHours += stats.hours;
+    totalShifts += stats.shifts;
   }
   sheet.getRange(2, hoursCol, hoursValues.length, 1).setValues(hoursValues);
   sheet.getRange(2, shiftsCol, shiftsValues.length, 1).setValues(shiftsValues);
+
+  var totalsRow = lastRow + 1;
+  sheet.getRange(totalsRow, nameCol).setValue(AVAIL_SUMMARY_TOTAL_LABEL_)
+    .setFontWeight('bold').setHorizontalAlignment('right');
+  sheet.getRange(totalsRow, hoursCol).setValue(Math.round(totalHours * 100) / 100)
+    .setFontWeight('bold');
+  sheet.getRange(totalsRow, shiftsCol).setValue(totalShifts)
+    .setFontWeight('bold');
+  sheet.getRange(totalsRow, 1, 1, sheet.getLastColumn()).setBackground('#F1F8E9');
+
   sheet.autoResizeColumn(hoursCol);
   sheet.autoResizeColumn(shiftsCol);
 }
