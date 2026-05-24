@@ -724,13 +724,16 @@ function applyFakeWeeklyTargetToRow_(row, layout, picks, coachName, seed) {
     row[layout.weeklyTargetCol] = '';
     return;
   }
+  // Demo realism (staff rule, May 23 2026): a coach never asks for MORE
+  // shifts than they offered. The requested target is either equal to
+  // submitted days or one less — never above. Floored at MIN (1) so a 1-day
+  // submission still records a real request, and capped at MAX (6).
   var rng = makeMentorFakeRng_(coachName + '|weeklyTarget', seed);
-  var offset = Math.floor(rng() * 3) - 1; // -1, 0, +1
+  var offset = rng() < 0.5 ? -1 : 0;
   var target = submittedDays + offset;
   if (target < MENTOR_WEEKLY_TARGET_MIN_) target = MENTOR_WEEKLY_TARGET_MIN_;
+  if (target > submittedDays) target = submittedDays;
   if (target > MENTOR_WEEKLY_TARGET_MAX_) target = MENTOR_WEEKLY_TARGET_MAX_;
-  var cap = submittedDays + 1;
-  if (target > cap) target = cap;
   row[layout.weeklyTargetCol] = target;
 }
 
@@ -790,6 +793,20 @@ function pickFakeWeeklyPickCount_(rank, coachName, rng) {
 var FAKE_MENTOR_EVENING_BLOCK_PROB_ = 0.4;
 
 /**
+ * Hard-coded (day, block) picks for specific coaches whose real-life
+ * availability is known and never changes. The seeder returns these
+ * exactly, bypassing the rank-based random pick logic — so demo runs
+ * stay consistent for staff-side scenarios that depend on these coaches.
+ *
+ * Day indices follow MENTOR_WEEKDAYS_HE_: 0=ראשון, 1=שני, 2=שלישי,
+ * 3=רביעי, 4=חמישי, 5=שישי.
+ */
+var FAKE_MENTOR_FIXED_PICKS_ = {
+  'רון': [{ dayIndex: 1, block: 'morning' }],   // Monday morning, always & only
+  'מנש': [{ dayIndex: 3, block: 'evening' }]    // Wednesday evening, always & only
+};
+
+/**
  * Decide the (day, block) picks for one fake coach for the week.
  *
  * Real-world pattern (per Mentor staff): a coach almost never gives the same
@@ -797,11 +814,24 @@ var FAKE_MENTOR_EVENING_BLOCK_PROB_ = 0.4;
  * then assigns at most one block per day (morning ~60% / evening ~40% for
  * weekdays). Friday is morning-only.
  *
+ * Coaches listed in FAKE_MENTOR_FIXED_PICKS_ skip the random logic entirely.
+ *
  * Deterministic by coachName+seed.
  *
  * @returns {Array<{dayIndex:number, block:'morning'|'evening'}>}
  */
 function pickFakeMentorWeek_(coachName, seed) {
+  if (FAKE_MENTOR_FIXED_PICKS_[coachName]) {
+    // Return a fresh copy so downstream mutators (sorts etc.) can't pollute
+    // the const table across coaches sharing the same array reference.
+    var fixed = FAKE_MENTOR_FIXED_PICKS_[coachName];
+    var out = [];
+    for (var k = 0; k < fixed.length; k++) {
+      out.push({ dayIndex: fixed[k].dayIndex, block: fixed[k].block });
+    }
+    return out;
+  }
+
   var rank = getCoachRankForDemo_(coachName);
   var rng = makeMentorFakeRng_(coachName + '|count', seed);
   var n = pickFakeWeeklyPickCount_(rank, coachName, rng);
@@ -889,34 +919,66 @@ function writeFakeMentorDayCell_(row, col, blocks, coachName, seed, dayIndex) {
 }
 
 /**
- * Probability that a fake submission uses the full half-day window
- * (7:00–12:00 / 16:00–21:15). The remainder lands on one of the partial
- * windows from MENTOR_MORNING_LABELS_ / MENTOR_EVENING_LABELS_ so the demo
- * exercises the partial-coverage path the optimizer has to handle in real
- * life (coaches who can only do 8:00–10:00, 17:00–19:00, etc.).
+ * Per-duration weights for fake form labels. Real-world Mentor pattern:
+ * 3h / 4h / 5h windows are all common (≈30% each), 2h windows are rare
+ * (~5%), and anything shorter never happens. The optimizer is expected
+ * to handle a 5h submission by scheduling a 4-training anchor inside it.
  *
- * Tuned low (~0.4) because in practice most coaches submit partial 2–4h
- * windows; a full 5-hour half-day is the exception, not the rule.
+ * The 5h label appears only once in MENTOR_*_LABELS_ while 4h appears
+ * twice and 3h three times, so per-label weights are biased upward for
+ * 5h to keep the total per-duration probabilities roughly equal.
  */
-var FAKE_MENTOR_FULL_WINDOW_PROB_ = 0.4;
+function fakeLabelDurationHours_(label) {
+  var m = String(label).match(/(\d{1,2}):(\d{2})\s*עד\s*(\d{1,2}):(\d{2})/);
+  if (!m) return 0;
+  var start = parseInt(m[1], 10) + parseInt(m[2], 10) / 60;
+  var end = parseInt(m[3], 10) + parseInt(m[4], 10) / 60;
+  return Math.max(0, end - start);
+}
 
+function fakeLabelWeight_(label) {
+  var d = fakeLabelDurationHours_(label);
+  if (d >= 4.5) return 60;    // 5h windows — most common
+  if (d >= 3.5) return 30;    // 4h windows — most common (2 labels per block)
+  if (d >= 2.5) return 3;     // 3h windows — rare per staff
+  if (d >= 1.5) return 1.5;   // 2h windows — very rare
+  return 0;                   // ≤1h → never picked
+}
+
+/**
+ * Pick a fake submission label using duration-weighted random choice.
+ *
+ * Target distribution (per Mentor staff "real coaches submit 4 or 5
+ * hours most of the time; 3h is rare, 2h is very rare"):
+ *   5h  → ~45%   4h → ~45%   3h → ~5%   2h → ~5%
+ *
+ * Deterministic by (coachName, seed, dayIndex, blockTag).
+ */
 function pickFakeMentorLabel_(labels, coachName, seed, dayIndex, blockTag) {
-  var fullLabel = blockTag === 'morning'
-    ? FAKE_MENTOR_FULL_MORNING_LABEL_
-    : FAKE_MENTOR_FULL_EVENING_LABEL_;
-
-  var coinRng = makeMentorFakeRng_(coachName + '|label|coin|' + blockTag + '|' + dayIndex, seed);
-  if (coinRng() < FAKE_MENTOR_FULL_WINDOW_PROB_) return fullLabel;
-
-  var partial = [];
+  var pool = [];
+  var totalWeight = 0;
   for (var i = 0; i < labels.length; i++) {
-    if (labels[i] !== fullLabel) partial.push(labels[i]);
+    var w = fakeLabelWeight_(labels[i]);
+    if (w <= 0) continue;
+    pool.push({ label: labels[i], weight: w });
+    totalWeight += w;
   }
-  if (!partial.length) return fullLabel;
+  if (!pool.length || totalWeight <= 0) {
+    return blockTag === 'morning'
+      ? FAKE_MENTOR_FULL_MORNING_LABEL_
+      : FAKE_MENTOR_FULL_EVENING_LABEL_;
+  }
 
   var pickRng = makeMentorFakeRng_(coachName + '|label|pick|' + blockTag + '|' + dayIndex, seed);
-  return partial[Math.floor(pickRng() * partial.length)];
+  var r = pickRng() * totalWeight;
+  var acc = 0;
+  for (var j = 0; j < pool.length; j++) {
+    acc += pool[j].weight;
+    if (r < acc) return pool[j].label;
+  }
+  return pool[pool.length - 1].label;
 }
+
 
 /** In-place Fisher-Yates shuffle using a deterministic PRNG. */
 function shuffleMentorPairsInPlace_(arr, rng) {

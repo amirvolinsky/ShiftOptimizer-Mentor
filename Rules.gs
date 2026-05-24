@@ -22,7 +22,8 @@ function getDefaultMentorRules_() {
     avoid_back_to_back: true,
     suggest_outside_availability: true,
     class_type_eligibility_enabled: true,
-    enforce_min_shift_rank3plus: true
+    enforce_min_shift_rank3plus: true,
+    protect_under_target_rank12: true
   };
 }
 
@@ -56,7 +57,11 @@ function getMentorRuleDescriptions_() {
     enforce_min_shift_rank3plus:
       'להבטיח שכל מאמן בדרג 3 ומעלה שהגיש זמינות מקבל לפחות משמרת אחת. ' +
       'אם לא נמצא לו מקום, המערכת מחליפה אותו עם מאמן אחר שיש לו ≥2 משמרות ' +
-      '(לא מדרג 1 ולא ברשימת noSuggestCoaches). כבה כדי להחזיר התנהגות לפי דרגה בלבד.'
+      '(לא מדרג 1 ולא ברשימת noSuggestCoaches). כבה כדי להחזיר התנהגות לפי דרגה בלבד.',
+    protect_under_target_rank12:
+      'מניעת רצפת דרג 3+ מלקיחת משבצת פנויה כשמאמן דרג 1-2 שעדיין מתחת ליעד השבועי ' +
+      'יכול לאייש אותה. אחרי השלב המוגן, המערכת משבצת דרג 1-2 למשבצות שנשארו פנויות, ' +
+      'ואז מנסה שוב דרג 3+ ללא הגנה (מינימום משמרת אחת). כבה כדי להחזיר התנהגות קודמת.'
   };
 }
 

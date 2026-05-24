@@ -152,15 +152,27 @@ Rules:
 
 Trade-off (deliberate, per staff): we'd rather have a net sit empty for a whole block than break a fuller shift into two-training fragments. So the schedule may show entire net columns of `אין אימון` on quiet mornings — that's intentional. The `WeeklyClasses` totals still drive how many slots are *opened* (via `distributeClassesIntoSlots_`); pass-based assignment then chooses *which* of those slots get a coach.
 
-**Anchor-first distribution (May 23 2026).** `buildSlotFillPriority_` now opens slots as full 4-training anchor blocks, one net at a time across the whole week:
+**Post-pass fairness (May 23 2026).** After the main 3-pass assignment, in order:
 
-1. **Round 1 — Net1 for every (day, block) unit.** Morning Net1 anchors at 07:00 (7→11), evening Net1 at 17:00 (17→21:15).
-2. **Round 2 — Net2.** Morning Net2 anchors at 08:00 (8→12), evening Net2 at 16:00 (16→20:15). The two anchors overlap at 8–11 (morning) / 17–19:15 (evening), creating the natural peak window.
-3. **Round 3 — Net3.** Default anchors match Net1, but **per-day supply-aware** (see below). Falls back to Net1's anchors when both options have equal supply.
+1. **Stage A — Rank 3+ floor (guarded).** `enforce_min_shift_rank3plus` with `protect_under_target_rank12` (default TRUE): will not place into or swap for a contiguous run if an under-target Rank 1–2 coach is eligible for that same run (time + class-type + not already in that day/block).
+2. **Under-target Rank 1–2 placement.** Coaches rank 1–2 with `assigned < target` may fill still-unassigned runs via `placeUnderTargetRank12IntoUnassignedRuns_`.
+3. **Stage B — Rank 3+ floor (unguarded fallback).** Any Rank 3+ coach still at 0 shifts retries without the guard — preserves “every Rank 3+ with availability gets ≥1 shift”.
+4. Suggester (unchanged).
 
-Friday morning is single-anchor (no 11–12 cell), so all three nets anchor at 07:00.
+Kill switches: `enforce_min_shift_rank3plus`, `protect_under_target_rank12` on the Rules sheet.
 
-**Net 3 supply-aware anchor (May 23 2026).** Net 1 and Net 2 keep their fixed peak / mid anchors so the 8–11 (morning) and 17–19:15 (evening) overlap stay covered. Net 3 — the flex net — chooses its anchor per (day, block) by counting how many coaches can fully cover each 4-training window: switches to the mid anchor (08:00 / 16:00) when more coaches there have signed up than at the peak anchor. Equal supply keeps the default peak anchor (no unnecessary churn). Friday morning is exempt because no 11–12 slot exists — only the 07:00 anchor is valid. Implementation: `buildSlotFillPriority_(slots, availability)` in `ClassTypes.gs`, `countCoachesCoveringSlots_` helper. Example win: Sunday morning Net 3 used to anchor at 07 with supply = 1 (יובל, but he's on Net 1), wasting cell 7–8 as a red and forcing תומר אסף onto a 2-training shift; now Net 3 anchors at 08 with supply = 2, eliminating the red and letting תומר land a 3-training sticky shift on Net 3 8–11.
+**Fairness table יעד (May 23 2026).** The **יעד** column shows the coach’s single form number (`כמות משמרות מבוקשת` from `SHIFT_TARGET_FORM_CACHE_`, else capped `getShiftTarget`). **סטטוס** compares **קיבל** to that number only: `ביעד =)` when equal; `כמעט ביעד` when one below; `מתחת ליעד` / `מעל היעד` otherwise. MasterData WeeklyMin–WeeklyMax range is no longer shown in יעד.
+
+**Anchor-first distribution (May 23 2026).** `buildSlotFillPriority_` opens slots as full 4-training anchor blocks (3 on Friday morning), one net at a time across the whole week:
+
+1. **Round 1 — Net1** for every (day, block) unit, then **Round 2 — Net2**, then **Round 3 — Net3**.
+2. **Default anchors** (`MENTOR_NET_ANCHORS_` in `ClassTypes.gs`): morning 7 / 8 / 7, evening 17 / 16 / 17 — used as tie-breakers when supply is equal.
+3. **Staff rule — morning only:** at least **one** net per (day, morning) must start at **07:00**. Other nets may start at 07:00 or 08:00 (or all at the same hour); 2–3 nets starting together is fine.
+4. **Evening:** no required start hour. Every net may anchor at **16:00** or **17:00** independently; multiple nets at 16:00 is fine.
+
+**Supply-aware anchors (May 23 2026).** When `availability` is passed, each net picks its anchor per (day, block) from the block’s candidate hours — morning **{07:00, 08:00}**, evening **{16:00, 17:00}** — by counting coaches who can fully cover that window (`countCoachesCoveringSlots_`). Higher supply wins; equal supply keeps the default from `MENTOR_NET_ANCHORS_` for that net. After all nets choose, the morning **≥1 at 07:00** rule runs: if every net picked 08:00, the net with the smallest loss (largest supply(7)−supply(8)) is forced back to 07:00. Friday morning still allows an 08:00 partial block (3 cells, no 11–12). Implementation: `precomputeUnitAnchorHours_`, `pickSupplyAwareAnchorHour_`, `enforceAtLeastOneMorningSevenAm_` in `ClassTypes.gs`.
+
+**Example wins:** Sunday morning Net 3 anchors at 08 when supply there beats 07 (תומר 8–11). Sunday evening Net 1 anchors at **16:00** when בבה + לילוש both submitted 16:00–20:15 (supply 2 vs 0 at 17:00–21:15), so both get a real shift instead of one net empty + a blue suggestion.
 
 Maximum anchor-aligned capacity = 11 units × 3 nets × 4 trainings = **132** classes/week (Friday evening doesn't exist at Mentor). The raw ShiftTemplate still has 162 cells; the extra 30 (Net1@11–12, Net2@7–8, etc.) only open if the user pins them manually via `ShiftTemplate.ClassType` or asks for >132 classes (tail fill).
 
@@ -192,7 +204,7 @@ Menu **📝 בנה מחדש טופס Google** rebuilds the linked form (roster n
 |--------|---------|
 | Name | Hebrew display name |
 | Rank | 1–4 — `1` = best, `4` = reserve (fills gaps after 1–3); default `1`. |
-| WeeklyMin / WeeklyMax | Soft weekly shift target window. WeeklyMax is the upper bound used for the "יעד" column when the coach didn't submit a per-week target in the form; Rank 1 still gets every shift they sign up for via `rank_1_unconditional`. The form-submitted target (1–6 on the first page) takes priority over WeeklyMax when present. Either way, the final cap is `min(target, submitted_days + 1)`. |
+| WeeklyMin / WeeklyMax | MasterData soft bounds. Optimizer cap uses form target first (`getShiftTarget`). Fairness **יעד** column shows only the form number (`getFormShiftTarget_`). WeeklyMin is not used for status anymore. Rank 1 still gets every shift they sign up for via `rank_1_unconditional`. Final optimizer cap is `min(target, submitted_days + 1)`. |
 | Gender | `M` / `F`. Used by class-type eligibility (E classes are male-only per Mentor staff). Defaults to `M` when the cell or column is blank. |
 | LocationRestriction | _(optional column later)_ blank = any site |
 

@@ -416,6 +416,109 @@ function pickAnchorBlockSlots_(index, day, block, loc, anchorHour) {
 }
 
 /**
+ * Candidate anchor start hours for supply comparison on a (day, block).
+ * @param {string} anchorKey  'בוקר' | 'בוקר_שישי' | 'ערב'
+ * @returns {number[]}
+ */
+function getAnchorCandidateHours_(anchorKey) {
+  if (anchorKey === 'ערב') return [16, 17];
+  return [7, 8];
+}
+
+/**
+ * Pick the anchor hour for one net on one (day, block) unit by coach supply.
+ * Tie → `MENTOR_NET_ANCHORS_` default for that net. 3-cell blocks count on
+ * Friday morning (no 11–12) when evaluating the 08:00 window.
+ */
+function pickSupplyAwareAnchorHour_(unit, netIdx, loc, byKey, availability) {
+  var anchorKey = unit.block;
+  if (unit.day === 'שישי' && unit.block === 'בוקר') anchorKey = 'בוקר_שישי';
+  var anchors = MENTOR_NET_ANCHORS_[anchorKey];
+  if (!anchors) return null;
+  var defaultHour = anchors[netIdx];
+  if (defaultHour == null) return null;
+  if (!availability) return defaultHour;
+
+  var candidates = getAnchorCandidateHours_(anchorKey);
+  var bestHour = defaultHour;
+  var bestSupply = -1;
+
+  for (var c = 0; c < candidates.length; c++) {
+    var hour = candidates[c];
+    var block = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, hour);
+    // 3-cell partial blocks count (Friday 8→11; shorter windows skipped).
+    if (block.length < 3) continue;
+    var supply = countCoachesCoveringSlots_(unit.day, block, availability);
+    if (supply > bestSupply || (supply === bestSupply && hour === defaultHour)) {
+      bestSupply = supply;
+      bestHour = hour;
+    }
+  }
+  return bestHour;
+}
+
+/**
+ * Staff rule: every morning (day, block) must have ≥1 net anchored at 07:00.
+ * If supply-aware picks left all nets at 08:00, force the net with the
+ * largest supply(7)−supply(8) (smallest loss) back to 07:00.
+ */
+function enforceAtLeastOneMorningSevenAm_(unit, anchorHoursByNet, locOrder, byKey, availability) {
+  if (unit.block !== 'בוקר') return;
+  var netCount = locOrder.length;
+  var hasSeven = false;
+  for (var i = 0; i < netCount; i++) {
+    if (anchorHoursByNet[i] === 7) {
+      hasSeven = true;
+      break;
+    }
+  }
+  if (hasSeven) return;
+
+  var bestNet = -1;
+  var bestGap = -Infinity;
+  for (var n = 0; n < netCount; n++) {
+    var loc = locOrder[n];
+    var block7 = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, 7);
+    if (block7.length < 3) continue;
+    var block8 = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, 8);
+    var s7 = countCoachesCoveringSlots_(unit.day, block7, availability);
+    var s8 = (block8.length >= 3)
+      ? countCoachesCoveringSlots_(unit.day, block8, availability)
+      : 0;
+    var gap = s7 - s8;
+    if (gap > bestGap) {
+      bestGap = gap;
+      bestNet = n;
+    }
+  }
+  if (bestNet >= 0) anchorHoursByNet[bestNet] = 7;
+}
+
+/**
+ * For each (day, block) unit, compute supply-aware anchor hour per net and
+ * apply the morning ≥1-at-07:00 constraint.
+ * @returns {Object<string, number[]>}  key day|block → [hour per net index]
+ */
+function precomputeUnitAnchorHours_(units, locOrder, byKey, availability) {
+  var out = {};
+  for (var u = 0; u < units.length; u++) {
+    var unit = units[u];
+    var uKey = unit.day + '|' + unit.block;
+    var hours = [];
+    for (var netIdx = 0; netIdx < locOrder.length; netIdx++) {
+      hours[netIdx] = pickSupplyAwareAnchorHour_(
+        unit, netIdx, locOrder[netIdx], byKey, availability
+      );
+    }
+    if (unit.block === 'בוקר') {
+      enforceAtLeastOneMorningSevenAm_(unit, hours, locOrder, byKey, availability);
+    }
+    out[uKey] = hours;
+  }
+  return out;
+}
+
+/**
  * Build the ordered list of capacity slots in fill priority. Order is:
  *
  *   Round 1 (open one net per unit): Sun-morn Net1 → Sun-even Net1 → … → Fri-morn Net1
@@ -428,22 +531,19 @@ function pickAnchorBlockSlots_(index, day, block, loc, anchorHour) {
  * that doesn't fit in anchor blocks still has somewhere to land instead
  * of being silently dropped.
  *
- * **Supply-aware Net 3 anchor (May 23 2026).** Net 1 and Net 2 keep their
- * fixed anchors (Net 1 = peak hour, Net 2 = mid hour) so the peak window
- * stays covered. Net 3 — the flex net — picks the anchor with the most
- * available-coach supply for that specific day, switching from the peak
- * anchor (7 morning / 17 evening) to the mid anchor (8 / 16) on days
- * where the mid window has more coaches who can cover a full 4-training
- * block. This prevents wasting Net 3 slots on hours where no coach
- * submitted (e.g. Sun morn Net 3 at 7–8 when only יובל has a 7-X start
- * and he's already on Net 1). Friday morning has only one anchor (7),
- * so the switch is skipped there.
+ * **Supply-aware anchors (May 23 2026).** Every net picks its anchor per
+ * (day, block) from the candidate hours for that block (morning 7|8,
+ * evening 16|17) by counting coaches who can fully cover the window.
+ * Tie → keep `MENTOR_NET_ANCHORS_` default for that net. Morning only:
+ * after all nets choose, if none anchored at 07:00, force the net with
+ * the smallest supply loss (largest supply(7)−supply(8)) back to 07:00.
+ * Evening has no required anchor — multiple nets may start at 16:00.
  *
  * @param {Array} slots          Output of loadShiftTemplates() — already expanded per net.
  * @param {Object} [availability] Optional `loadAvailability().availability` map.
- *                                When provided, Net 3 picks anchor by supply;
- *                                when omitted (legacy / capacity calc), Net 3
- *                                uses the fixed anchor like Net 1 and Net 2.
+ *                                When provided, all nets pick anchor by supply;
+ *                                when omitted (legacy / capacity calc), fixed
+ *                                anchors from `MENTOR_NET_ANCHORS_` only.
  * @returns {Array}              The same slot objects re-ordered.
  */
 function buildSlotFillPriority_(slots, availability) {
@@ -468,6 +568,10 @@ function buildSlotFillPriority_(slots, availability) {
   var seen = {};
   var NET3_IDX_ = 2;
 
+  var unitAnchorHours = availability
+    ? precomputeUnitAnchorHours_(units, locOrder, byKey, availability)
+    : null;
+
   for (var netIdx = 0; netIdx < locOrder.length; netIdx++) {
     // Net 3: open (day, block) units with the most coach supply first so the
     // limited tail of weekly class slots (e.g. 3 cells when total=91) land on
@@ -490,26 +594,10 @@ function buildSlotFillPriority_(slots, availability) {
       if (anchorHour == null) continue;
       var loc = locOrder[netIdx];
 
-      // Net 2 + Net 3 only: prefer the alternate anchor when more coaches
-      // can cover that window. Net 1 stays fixed at the peak anchor so the
-      // earliest/latest hours (7-X morning, 17-X evening) always have at
-      // least one net covering them. Friday morning uses 8 as the partial
-      // alt anchor (3-training window — there's no 11–12 cell) which
-      // unblocks days like Friday where only 1 coach has a 7-X start.
-      if (availability && netIdx >= 1) {
-        var altAnchorHour = anchors[1];
-        if (anchorKey === 'בוקר_שישי') altAnchorHour = 8;
-        if (altAnchorHour != null && altAnchorHour !== anchorHour) {
-          var defaultBlock = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, anchorHour);
-          var altBlock = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, altAnchorHour);
-          // 3-cell partial alt block is acceptable (Friday's 8-11 case).
-          if (altBlock.length >= 3) {
-            var defaultSupply = countCoachesCoveringSlots_(unit.day, defaultBlock, availability);
-            var altSupply = countCoachesCoveringSlots_(unit.day, altBlock, availability);
-            if (altSupply > defaultSupply) {
-              anchorHour = altAnchorHour;
-            }
-          }
+      if (unitAnchorHours) {
+        var uKey = unit.day + '|' + unit.block;
+        if (unitAnchorHours[uKey] && unitAnchorHours[uKey][netIdx] != null) {
+          anchorHour = unitAnchorHours[uKey][netIdx];
         }
       }
 
@@ -543,7 +631,7 @@ function buildSlotFillPriority_(slots, availability) {
  * Count how many coaches in `availability` can cover EVERY slot in `slots`
  * on the given `day` — i.e. coaches whose submitted ranges contain each
  * slot's [startTime, endTime] fully. Used by buildSlotFillPriority_'s
- * supply-aware Net 3 anchor selection. Legacy block-mode availability
+ * supply-aware anchor selection. Legacy block-mode availability
  * (string values like 'בוקר') is skipped because we need precise times.
  *
  * @param {string} day        Hebrew day name ('ראשון' / 'שני' / …).
@@ -579,26 +667,9 @@ function countCoachesCoveringSlots_(day, slots, availability) {
  */
 function unitCoachSupply_(unit, netIdx, locOrder, byKey, availability) {
   if (!unit || !availability) return 0;
-  var anchorKey = unit.block;
-  if (unit.day === 'שישי' && unit.block === 'בוקר') anchorKey = 'בוקר_שישי';
-  var anchors = MENTOR_NET_ANCHORS_[anchorKey];
-  if (!anchors) return 0;
-  var anchorHour = anchors[netIdx];
-  if (anchorHour == null) return 0;
   var loc = locOrder[netIdx];
-  if (netIdx >= 1) {
-    var altHour = anchors[1];
-    if (anchorKey === 'בוקר_שישי') altHour = 8;
-    if (altHour != null && altHour !== anchorHour) {
-      var defBlock = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, anchorHour);
-      var altBlock = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, altHour);
-      if (altBlock.length >= 3) {
-        var defS = countCoachesCoveringSlots_(unit.day, defBlock, availability);
-        var altS = countCoachesCoveringSlots_(unit.day, altBlock, availability);
-        if (altS > defS) anchorHour = altHour;
-      }
-    }
-  }
+  var anchorHour = pickSupplyAwareAnchorHour_(unit, netIdx, loc, byKey, availability);
+  if (anchorHour == null) return 0;
   var block = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, anchorHour);
   return countCoachesCoveringSlots_(unit.day, block, availability);
 }

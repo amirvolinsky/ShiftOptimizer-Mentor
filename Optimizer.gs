@@ -114,6 +114,18 @@ function getShiftTargetMin_(name, masterMap) {
 }
 
 /**
+ * Display target for the fairness table "יעד" column: the coach's form
+ * submission (כמות משמרות מבוקשת) when present, else capped getShiftTarget.
+ */
+function getFormShiftTarget_(name, masterMap, availability, rules) {
+  if (SHIFT_TARGET_FORM_CACHE_ && SHIFT_TARGET_FORM_CACHE_[name] !== undefined) {
+    var ft = SHIFT_TARGET_FORM_CACHE_[name];
+    if (ft !== null && ft !== undefined && !isNaN(ft)) return ft;
+  }
+  return getShiftTarget(name, masterMap, availability, rules);
+}
+
+/**
  * Main entry point. Optimizes the entire week across all locations.
  *
  * @param {Object[]} slots - From loadShiftTemplates()
@@ -367,8 +379,30 @@ function assignShiftBlock_(group, availability, masterMap, rules, state) {
  * coach displaced first); then name.
  *
  * Kill switch: set `enforce_min_shift_rank3plus` to FALSE in the Rules sheet.
+ * `protect_under_target_rank12` (default TRUE) prevents this pass from taking
+ * a run that an under-target Rank 1-2 coach could fill; see placeUnderTargetRank12IntoUnassignedRuns_.
  */
 function enforceMinimumOneShiftForLowerRanks_(slots, availability, masterMap, rules, state) {
+  var protectR12 = !rules || rules.protect_under_target_rank12 !== false;
+
+  // Stage A — Rank 3+ with guard (don't steal from under-target R1-2).
+  placeRank3PlusFairnessFloor_(slots, availability, masterMap, rules, state, protectR12, false);
+
+  // Under-target Rank 1-2 pick up runs the guard left open.
+  if (protectR12) {
+    placeUnderTargetRank12IntoUnassignedRuns_(slots, availability, masterMap, rules, state);
+  }
+
+  // Stage B — Rank 3+ still at 0 shifts: unguarded fallback (min-1 guarantee).
+  placeRank3PlusFairnessFloor_(slots, availability, masterMap, rules, state, false, true);
+}
+
+/**
+ * Rank 3+ fairness floor loop. When `guardUnderTargetR12` is true, skips runs
+ * where an under-target Rank 1-2 coach is eligible. Warnings only when
+ * `warnIfStillZero` is true (Stage B).
+ */
+function placeRank3PlusFairnessFloor_(slots, availability, masterMap, rules, state, guardUnderTargetR12, warnIfStillZero) {
   var names = Object.keys(masterMap);
   names.sort(function(a, b) {
     var rA = normalizeMentorRank_(masterMap[a].rank);
@@ -385,21 +419,179 @@ function enforceMinimumOneShiftForLowerRanks_(slots, availability, masterMap, ru
     if (!hasSubmittedAnyAvailability_(name, availability)) continue;
     if (countAssignedShifts_(name, state) > 0) continue;
 
-    var ok = tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules, state);
-    if (!ok) {
+    var placed = tryPlaceInUnassignedRun_(
+      name, emp, slots, availability, masterMap, rules, state, guardUnderTargetR12
+    );
+    if (!placed) {
+      placed = tryGiveOneShiftBySwap_(
+        name, emp, slots, availability, masterMap, rules, state, guardUnderTargetR12
+      );
+    }
+    if (!placed && warnIfStillZero) {
       state.warnings.push(
         '⚠️ ' + name + ' (דרג ' + rank + ') הגיש זמינות אך לא נמצא שיבוץ מינימלי. ' +
-        'לא נמצא מאמן זמין להחלפה (כולם מתחת ל-2 משמרות או מוגנים).'
+        'אין משבצות פנויות בזמינות שלו/ה ולא נמצא מאמן להחלפה.'
       );
     }
   }
 }
 
 /**
+ * After the guarded Rank 3+ pass, place under-target Rank 1-2 coaches into
+ * still-unassigned contiguous runs they can teach.
+ */
+function placeUnderTargetRank12IntoUnassignedRuns_(slots, availability, masterMap, rules, state) {
+  var names = Object.keys(masterMap);
+  names.sort(function(a, b) {
+    var rA = normalizeMentorRank_(masterMap[a].rank);
+    var rB = normalizeMentorRank_(masterMap[b].rank);
+    if (rA !== rB) return rA - rB;
+    var gapA = getShiftTarget(a, masterMap, availability, rules) - countAssignedShifts_(a, state);
+    var gapB = getShiftTarget(b, masterMap, availability, rules) - countAssignedShifts_(b, state);
+    if (gapA !== gapB) return gapB - gapA;
+    return a.localeCompare(b, 'he');
+  });
+
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var emp = masterMap[name];
+    var rank = normalizeMentorRank_(emp.rank);
+    if (rank > 2) continue;
+    if (!hasSubmittedAnyAvailability_(name, availability)) continue;
+    var target = getShiftTarget(name, masterMap, availability, rules);
+    if (countAssignedShifts_(name, state) >= target) continue;
+
+    tryPlaceInUnassignedRun_(
+      name, emp, slots, availability, masterMap, rules, state, false
+    );
+  }
+}
+
+/**
+ * True when some Rank 1-2 coach is still under weekly target and could take
+ * `runSlots` on this (day, block) by time + class-type + no existing shift there.
+ */
+function isUnderTargetRank12EligibleForRun_(runSlots, group, availability, masterMap, rules, state) {
+  if (!runSlots || !runSlots.length || !group) return false;
+  if (rules && rules.protect_under_target_rank12 === false) return false;
+
+  var classTypeRules = state && state._classTypeRules;
+  var day = group.day;
+  var block = group.block;
+  var coachNames = Object.keys(masterMap);
+
+  for (var i = 0; i < coachNames.length; i++) {
+    var coachName = coachNames[i];
+    var emp = masterMap[coachName];
+    var rank = normalizeMentorRank_(emp.rank);
+    if (rank > 2) continue;
+
+    var target = getShiftTarget(coachName, masterMap, availability, rules);
+    if (countAssignedShifts_(coachName, state) >= target) continue;
+
+    if (!availability[coachName] || !availability[coachName][day]) continue;
+    var ranges = availability[coachName][day];
+    if (!ranges || !ranges.length || typeof ranges[0] === 'string') continue;
+
+    var cand = { name: coachName, day: day, block: block };
+    if (candidateAlreadyHasAnyTime_(cand, state)) continue;
+
+    var coversAll = true;
+    for (var s = 0; s < runSlots.length; s++) {
+      var slot = runSlots[s];
+      if (!slotCoveredByMentorRanges_(slot, ranges)) {
+        coversAll = false;
+        break;
+      }
+      if (!coachEligibleForClassType_(coachName, slot.classType, masterMap, classTypeRules, rules)) {
+        coversAll = false;
+        break;
+      }
+    }
+    if (coversAll) return true;
+  }
+  return false;
+}
+
+/**
+ * Step 1 of the fairness floor: try to place `name` into a contiguous run
+ * of UNASSIGNED slots they can teach (≥2 cells, ≤4 cells, single net).
+ * This handles e.g. לילוש who is "4-capable" on Sun eve (covers 4 hours of
+ * the 5-hour evening window) but the 4-or-nothing rule excluded her from
+ * passes 2/3 even though Net 1 has 3 unassigned cells matching her window.
+ */
+function tryPlaceInUnassignedRun_(name, emp, slots, availability, masterMap, rules, state, guardUnderTargetR12) {
+  var groups = buildShiftGroups_(slots);
+  var classTypeRules = state && state._classTypeRules;
+
+  for (var g = 0; g < groups.length; g++) {
+    var group = groups[g];
+    if (!availability[name] || !availability[name][group.day]) continue;
+    var ranges = availability[name][group.day];
+    if (!ranges || !ranges.length || typeof ranges[0] === 'string') continue;
+
+    for (var r = 0; r < ranges.length; r++) {
+      var timeKeys = timeKeysCoveredByRange_(group, ranges[r]);
+      // Keep only time keys with at least one UNASSIGNED slot the coach
+      // is eligible for. Different from filterTimeKeysByClassEligibility_
+      // because we also require unassigned (the main filter already skips
+      // assigned, but spelling it out keeps this code self-contained).
+      var kept = [];
+      for (var ki = 0; ki < timeKeys.length; ki++) {
+        var k = timeKeys[ki];
+        var slotsAtTime = group.slotsByTime[k] || [];
+        for (var ss = 0; ss < slotsAtTime.length; ss++) {
+          var sl = slotsAtTime[ss];
+          if (state.assigned[sl.slotId]) continue;
+          if (coachEligibleForClassType_(name, sl.classType, masterMap, classTypeRules, rules)) {
+            kept.push(k);
+            break;
+          }
+        }
+      }
+      if (kept.length < MENTOR_MIN_SHIFT_TRAININGS_) continue;
+
+      var cand = {
+        name: name,
+        rank: normalizeMentorRank_(emp.rank),
+        day: group.day,
+        block: group.block,
+        timeKeys: kept,
+        group: group
+      };
+      var assignedSlots = findBestContiguousAssignment_(cand, state, masterMap, rules, {
+        minLength: MENTOR_MIN_SHIFT_TRAININGS_,
+        allowSpread: false
+      });
+      if (!assignedSlots) continue;
+
+      if (guardUnderTargetR12 &&
+          isUnderTargetRank12EligibleForRun_(assignedSlots, group, availability, masterMap, rules, state)) {
+        continue;
+      }
+
+      assignEmployeeToSlots_(name, assignedSlots, masterMap, state);
+      var rankN = normalizeMentorRank_(emp.rank);
+      var msgPrefix = rankN >= 3 ? '🆘 ' : '📌 ';
+      var msgSuffix = rankN >= 3
+        ? ' — הבטחת לפחות משמרת אחת למאמן מדרג 3+ שהגיש זמינות.'
+        : ' — השלמת יעד דרג 1-2 במשבצות פנויות.';
+      state.warnings.push(
+        msgPrefix + name + ' (דרג ' + emp.rank + ') שובץ במשבצות פנויות ב-' +
+        group.day + ' ' + group.block +
+        ' (' + assignedSlots.length + ' אימונים)' + msgSuffix
+      );
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Try to give `name` a single shift by displacing a higher-count coach in
  * one of the coach's submitted (day, block) units. Returns true on success.
  */
-function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules, state) {
+function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules, state, guardUnderTargetR12) {
   var groups = buildShiftGroups_(slots);
   var rank1Unconditional = !rules || rules.rank_1_unconditional !== false;
 
@@ -410,11 +602,26 @@ function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules
     if (!ranges || !ranges.length) continue;
     if (typeof ranges[0] === 'string') continue;
 
+    // Build seenKey = time keys this coach can teach in this group. Unlike
+    // the main-pass filter, we DO NOT skip already-assigned slots — the
+    // whole point of this pass is to displace an existing assignment.
     var seenKey = {};
+    var classTypeRules = state && state._classTypeRules;
     for (var r = 0; r < ranges.length; r++) {
-      var keys = timeKeysCoveredByRange_(group, ranges[r]);
-      keys = filterTimeKeysByClassEligibility_(group, keys, name, masterMap, state, rules);
-      for (var ki = 0; ki < keys.length; ki++) seenKey[keys[ki]] = true;
+      var keysInRange = timeKeysCoveredByRange_(group, ranges[r]);
+      for (var ki = 0; ki < keysInRange.length; ki++) {
+        var tk = keysInRange[ki];
+        if (seenKey[tk]) continue;
+        var slotsAtTime = group.slotsByTime[tk] || [];
+        var canTeach = false;
+        for (var ss = 0; ss < slotsAtTime.length; ss++) {
+          if (coachEligibleForClassType_(name, slotsAtTime[ss].classType, masterMap, classTypeRules, rules)) {
+            canTeach = true;
+            break;
+          }
+        }
+        if (canTeach) seenKey[tk] = true;
+      }
     }
 
     var keyCount = 0;
@@ -448,7 +655,15 @@ function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules
       v.slots.sort(function(a, b) { return a.startTime - b.startTime; });
       var canCover = true;
       for (var vs = 0; vs < v.slots.length; vs++) {
-        if (!seenKey[slotTimeKey_(v.slots[vs])]) { canCover = false; break; }
+        var vslot = v.slots[vs];
+        // Time-window: coach must have submitted availability covering this slot.
+        if (!seenKey[slotTimeKey_(vslot)]) { canCover = false; break; }
+        // Class-type: coach must be eligible for THIS specific slot, not
+        // just some other slot at the same time.
+        if (!coachEligibleForClassType_(name, vslot.classType, masterMap, classTypeRules, rules)) {
+          canCover = false;
+          break;
+        }
       }
       if (!canCover) continue;
 
@@ -473,6 +688,11 @@ function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules
     });
 
     var victim = victims[0];
+    if (guardUnderTargetR12 &&
+        isUnderTargetRank12EligibleForRun_(victim.slots, group, availability, masterMap, rules, state)) {
+      continue;
+    }
+
     for (var us = 0; us < victim.slots.length; us++) {
       unassignSlot_(victim.slots[us].slotId, victim.slots[us], state);
     }

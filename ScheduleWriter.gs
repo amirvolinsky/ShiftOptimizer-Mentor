@@ -630,8 +630,7 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
     var emp = masterMap[names[i]];
     if (!emp) continue;
 
-    var targetMax = stat.shiftTarget || getShiftTarget(names[i], masterMap, availability);
-    var targetMin = getShiftTargetMin_(names[i], masterMap);
+    var formTarget = getFormShiftTarget_(names[i], masterMap, availability);
     var received = stat.shiftsCount || 0;
     var availableCount = countAvailableSlots_(names[i], availability, slots, emp);
     var availableDays = countAvailableDays_(names[i], availability);
@@ -639,24 +638,22 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
     var satisfaction = '';
     if (availableDays === 0) {
       satisfaction = 'לא הגיש זמינות';
-    } else if (targetMax > 0 && received > targetMax) {
+    } else if (formTarget > 0 && received > formTarget) {
       satisfaction = 'מעל היעד';
-    } else if (received >= availableDays && targetMin > 0 && received < targetMin) {
-      satisfaction = 'קיבל מקסימום אפשרי';
-    } else if (targetMin > 0 && received < targetMin) {
-      satisfaction = 'מתחת ליעד';
-    } else if (targetMax > 0 && received >= targetMin && received <= targetMax) {
+    } else if (formTarget > 0 && received === formTarget) {
       satisfaction = 'ביעד =)';
-    } else if (received >= availableDays) {
-      satisfaction = 'קיבל מקסימום אפשרי';
-    } else if (targetMax > 0 && received >= targetMax - 1) {
-      satisfaction = 'כמעט מלא';
+    } else if (formTarget > 0 && received === formTarget - 1) {
+      satisfaction = 'כמעט ביעד';
+    } else if (formTarget > 0 && received < formTarget - 1) {
+      satisfaction = 'מתחת ליעד';
+    } else if (formTarget === 0 && availableDays > 0) {
+      satisfaction = '';
     } else {
       satisfaction = 'קיבל פחות =(';
     }
 
     var dist = getBlockDistribution_(names[i], employeeStats);
-    var targetDisplay = formatShiftTargetRange_(targetMin, targetMax);
+    var targetDisplay = formTarget > 0 ? String(formTarget) : '';
 
     sheet.getRange(row, 1).setValue(stat.name);
     sheet.getRange(row, 2).setValue(rankToHebrew(stat.rank));
@@ -669,11 +666,9 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
     sheet.getRange(row, 9).setValue(satisfaction);
 
     var satCell = sheet.getRange(row, 9);
-    if (satisfaction === 'ביעד =)' || satisfaction === 'קיבל מקסימום אפשרי') {
+    if (satisfaction === 'ביעד =)') {
       satCell.setBackground('#C6EFCE').setFontColor('#006100');
-    } else if (satisfaction === 'מעל היעד') {
-      satCell.setBackground('#FFEB9C').setFontColor('#9C6500');
-    } else if (satisfaction === 'כמעט מלא') {
+    } else if (satisfaction === 'מעל היעד' || satisfaction === 'כמעט ביעד') {
       satCell.setBackground('#FFEB9C').setFontColor('#9C6500');
     } else if (satisfaction === 'מתחת ליעד') {
       satCell.setBackground('#FFC7CE').setFontColor('#9C0006');

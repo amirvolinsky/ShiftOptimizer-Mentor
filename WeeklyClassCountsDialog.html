@@ -183,7 +183,7 @@
       <span class="total-num" id="totalNum">0</span>
     </div>
     <div class="capacity-hint" id="capacityHint">
-      קיבולת מקסימלית של ShiftTemplate: <b><?= capacity ?></b> אימונים בשבוע (יום × שעה × רשת). מה שלא משובץ — מסומן "אין אימון" באפור.
+      קיבולת מקסימלית: <b><?= capacity ?></b> אימונים בשבוע — בהתאם לכלל המשמרת המלאה (4 אימונים רצופים, רשת אחת ביום מתחילה ב-07:00). מה שלא משובץ — מסומן "אין אימון" באפור.
     </div>
   </div>
 
@@ -199,7 +199,7 @@
   <script>
     var inputs = document.querySelectorAll('input[data-class-id]');
     var locked = false;
-    var CAPACITY = parseInt('<?= capacity ?>', 10) || 165;
+    var CAPACITY = parseInt('<?= capacity ?>', 10) || 132;
 
     function recalcTotal() {
       var t = 0;
@@ -215,8 +215,8 @@
       if (over) {
         hint.innerHTML = '⚠ סך האימונים (' + t + ') חורג מהקיבולת המקסימלית (' + CAPACITY + '). הפחת לפני הרצה.';
       } else {
-        hint.innerHTML = 'קיבולת מקסימלית של ShiftTemplate: <b>' + CAPACITY +
-          '</b> אימונים בשבוע (יום × שעה × רשת). מה שלא משובץ — מסומן "אין אימון" באפור.';
+        hint.innerHTML = 'קיבולת מקסימלית: <b>' + CAPACITY +
+          '</b> אימונים בשבוע — בהתאם לכלל המשמרת המלאה (4 אימונים רצופים, רשת אחת ביום מתחילה ב-07:00). מה שלא משובץ — מסומן "אין אימון" באפור.';
       }
       document.getElementById('btnOk').disabled = (t === 0 || over || locked);
       return { total: t, over: over };
