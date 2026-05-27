@@ -17,7 +17,7 @@ var CONFIG = {
   sheets: {
     masterData:    'MasterData',
     /** Linked Google Form tab — live submissions only; never overwritten by test seeders */
-    responses:     'Form Responses 1',
+    responses:     'Form Responses 2',
     /** Copy of form headers + demo rows for optimizer testing */
     responsesDemo: 'Form Responses Demo',
     shiftTemplate: 'ShiftTemplate',
@@ -82,9 +82,9 @@ var CONFIG = {
 
   /**
    * Development: keep true — reads Form Responses Demo (פייק), not the live form tab.
-   * Go-live: set false — reads Form Responses 1 (טופס אמיתי).
+   * Go-live: set false — reads Form Responses 2 (טופס אמיתי).
    */
-  useDemoResponses: true,
+  useDemoResponses: false,
 
   /**
    * Mentor availability form (edit URL in browser; script uses ID only).
