@@ -387,7 +387,7 @@ function optimizeShiftsRunCore_() {
   }
 
   var rules = loadRules();
-  var result = optimizeWeek(activeSlots, availability, masterMap, rules);
+  var result = optimizeWeek(activeSlots, availability, masterMap, rules, allSlots);
 
   // Surface any distribution warnings (e.g. requested > capacity) up to the
   // user as part of the post-run summary.
@@ -436,6 +436,9 @@ function buildOptimizerSummaryMessage_(d) {
       if (pCount > 0) parts.push(classTypeHebrew_(pid) + ': ' + pCount);
     }
     if (parts.length) msg += '• פילוח לפי סוג: ' + parts.join(' · ') + '\n';
+    if (d.distribution.residualSingleOpened) {
+      msg += '• נפתח אימון יחיד נוסף כדי לשמור על הסה"כ שביקשת (אי-זוגי).\n';
+    }
   } else {
     msg += '• סה"כ אימונים לשיבוץ: ' + slots.length + '\n';
   }
@@ -449,6 +452,12 @@ function buildOptimizerSummaryMessage_(d) {
   msg += '• אימונים שמולאו: ' + filledCount + '/' + slots.length;
   if (unfilledCount > 0) msg += ' (' + unfilledCount + ' לא מולאו ❌)';
   msg += '\n\n';
+
+  if (result.globalReviewLog && result.globalReviewLog.length > 0) {
+    var lastReview = result.globalReviewLog[result.globalReviewLog.length - 1];
+    msg += '• מעבר שיפור גלובלי: ' + (result.globalReviewLog.length - 1) +
+      ' איטרציות, ציון סופי ' + (lastReview.score ? lastReview.score.total : '') + '\n';
+  }
 
   if (result.warnings.length > 0) {
     msg += '\n⚠️ נקודות לתשומת לב (' + result.warnings.length + '):\n';

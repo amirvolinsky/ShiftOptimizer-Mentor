@@ -506,8 +506,15 @@ function mentorNotAvailableLabel_() {
 function isMentorNotAvailableText_(text) {
   var s = String(text || '').trim();
   if (!s) return true;
-  if (/^לא\s*זמין/i.test(s)) return true;
-  if (/n[aã]o\s*dispon[ií]vel/i.test(s)) return true;
+  // Whole-string anchors are critical: a coach can tick "לא זמין /
+  // Não disponível" together with real time ranges in the same Google Forms
+  // checkbox question, producing cells like
+  //   "7:00 עד 10:00, לא זמין / Não disponível".
+  // The per-part filter (after a comma split) drops the "not available"
+  // token correctly; we just need to make sure we do NOT short-circuit the
+  // whole cell as "not available" when other tokens are present.
+  if (/^לא\s*זמין(\s*\/\s*n[aã]o\s*dispon[ií]vel)?$/i.test(s)) return true;
+  if (/^n[aã]o\s*dispon[ií]vel$/i.test(s)) return true;
   return false;
 }
 

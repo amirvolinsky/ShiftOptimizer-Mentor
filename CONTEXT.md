@@ -161,6 +161,12 @@ Trade-off (deliberate, per staff): we'd rather have a net sit empty for a whole 
 
 Kill switches: `enforce_min_shift_rank3plus`, `protect_under_target_rank12` on the Rules sheet.
 
+**Rank 1 hard target repair (May 27 2026).** `rank_1_unconditional` now means more than candidate sorting. After the lower-rank fairness floor, `enforceRank1TargetByDisplacement_` keeps trying legal unassigned-run placements and swaps until each Rank 1 coach hits their form target, or no legal move exists by availability / class-type / no-overlap rules. It may displace Rank 2-4 coaches that already have at least 2 shifts, but never displaces another Rank 1.
+
+**Global review pass (May 27 2026).** Real form data exposed a weakness in the original per-(day, block) greedy flow: once a block was assigned, later blocks could not ask it for a better swap. After Rank 1 displacement, `globalScheduleReview_` in `Optimizer.gs` scores the full week and iterates small repairs until the score no longer improves. The score prioritizes: Rank 1 under target, Rank 2 under target, Rank 3+ with zero shifts, red cells, then total target gap. Operators currently fill red clusters with under-target coaches and try legal swaps for under-target coaches. Kill switch and weights live in `Rules`: `global_review_enabled`, `global_review_max_iterations`, `global_review_rank1_weight`, `global_review_rank2_weight`, `global_review_rank3_zero_weight`, `global_review_red_weight`, `global_review_gap_weight`.
+
+**OptimizerLog tab (May 27 2026).** Each run writes a hidden `OptimizerLog` sheet with per-pass candidate outcomes and global-review iteration scores. Use it to diagnose why a specific coach was skipped without reading Apps Script logs.
+
 **Fairness table יעד (May 23 2026).** The **יעד** column shows the coach’s single form number (`כמות משמרות מבוקשת` from `SHIFT_TARGET_FORM_CACHE_`, else capped `getShiftTarget`). **סטטוס** compares **קיבל** to that number only: `ביעד =)` when equal; `כמעט ביעד` when one below; `מתחת ליעד` / `מעל היעד` otherwise. MasterData WeeklyMin–WeeklyMax range is no longer shown in יעד.
 
 **Anchor-first distribution (May 23 2026).** `buildSlotFillPriority_` opens slots as full 4-training anchor blocks (3 on Friday morning), one net at a time across the whole week:
@@ -177,6 +183,8 @@ Kill switches: `enforce_min_shift_rank3plus`, `protect_under_target_rank12` on t
 Maximum anchor-aligned capacity = 11 units × 3 nets × 4 trainings = **132** classes/week (Friday evening doesn't exist at Mentor). The raw ShiftTemplate still has 162 cells; the extra 30 (Net1@11–12, Net2@7–8, etc.) only open if the user pins them manually via `ShiftTemplate.ClassType` or asks for >132 classes (tail fill).
 
 **Suggester contiguity guard (May 23 2026).** `rankSuggestionCandidates_` refuses to suggest a coach unless they already have a same-net adjacent assignment on this day+block (`neighbor === 2`) AND the resulting same-net run stays ≤ 4 trainings. So the suggester can only EXTEND an existing 2- or 3-training shift to a 3- or 4-training shift, never create an isolated 1-training cell. If no coach qualifies, the slot stays red unfilled — the staff can see it needs a manual phone call.
+
+**Odd weekly totals (May 27 2026).** `capPriorityToCompleteOpenings_` no longer silently drops a single leftover class (e.g. 101 → 100). It opens one residual active slot and adds a warning; the global review / singleton-extension logic then tries to attach that class to an existing legal shift, including a fifth training when availability allows.
 
 Still TODO:
 

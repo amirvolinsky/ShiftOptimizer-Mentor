@@ -319,12 +319,10 @@ function loadClassTypeRules_() {
  * - `class_type_eligibility_enabled` rule FALSE → true (master kill switch).
  */
 function coachEligibleForClassType_(coachName, classTypeId, masterMap, classTypeRules, rules) {
-  if (rules && rules.class_type_eligibility_enabled === false) return true;
-  var id = normalizeClassTypeId_(classTypeId);
-  if (!id) return true;
-  var spec = classTypeRules && classTypeRules[id];
-  if (!spec || typeof spec.isEligible !== 'function') return true;
-  return spec.isEligible(coachName, masterMap);
+  // Current Mentor mode is shifts-first: every coach may teach every class type.
+  // Keep the function as the single switch point so class-type rules can be
+  // restored later without touching the optimizer.
+  return true;
 }
 
 /**
@@ -361,9 +359,13 @@ var MENTOR_ANCHOR_BLOCK_TRAININGS_ = 4;
  * anchor at 07:00 — there's no other anchor to choose.
  */
 var MENTOR_NET_ANCHORS_ = {
-  'בוקר':       [7, 8, 7],     // Sun–Thu: Net1 = 7→11, Net2 = 8→12, Net3 = 7→11
-  'בוקר_שישי':  [7, 7, 7],     // Fri:     all nets 7→11 (only anchor available)
-  'ערב':        [17, 16, 17]   // Sun–Thu: Net1 = 17→21:15, Net2 = 16→20:15, Net3 = 17→21:15
+  'בוקר':       [7, 8, 7],            // Sun–Thu: Net1 = 7→11, Net2 = 8→12, Net3 = 7→11
+  // Friday morning: only Net 1 opens (7→11). Net 2 / Net 3 are deliberately
+  // closed on Friday — historically there aren't enough Friday-morning
+  // coaches, so the staff want at most one Friday net. The freed weekly
+  // class count is redistributed to Sun–Thu by the priority builder.
+  'בוקר_שישי':  [7, null, null],
+  'ערב':        [17, 16, 17]          // Sun–Thu: Net1 = 17→21:15, Net2 = 16→20:15, Net3 = 17→21:15
 };
 
 /**
@@ -461,8 +463,18 @@ function pickSupplyAwareAnchorHour_(unit, netIdx, loc, byKey, availability) {
  * Staff rule: every morning (day, block) must have ≥1 net anchored at 07:00.
  * If supply-aware picks left all nets at 08:00, force the net with the
  * largest supply(7)−supply(8) (smallest loss) back to 07:00.
+ *
+ * **Relaxation (May 27 2026).** If forcing 07:00 would open a structurally
+ * empty net — that is, the best-candidate net has 0 coaches who cover the
+ * 07:00 window — we skip the force. Opening an empty 4-cell red block in
+ * the name of "one 7am net per morning" costs the schedule more (fairness
+ * + red count) than dropping the 7am availability for that single day.
+ * Similarly, when 07:00 supply is much smaller than 08:00 supply (loss of
+ * `morning_seven_am_anchor_supply_gap` or more coaches; default 2), we
+ * prefer to keep all nets at 08:00. Both behaviours are guarded by
+ * `Rules` so they can be tuned without code changes.
  */
-function enforceAtLeastOneMorningSevenAm_(unit, anchorHoursByNet, locOrder, byKey, availability) {
+function enforceAtLeastOneMorningSevenAm_(unit, anchorHoursByNet, locOrder, byKey, availability, rules) {
   if (unit.block !== 'בוקר') return;
   var netCount = locOrder.length;
   var hasSeven = false;
@@ -474,9 +486,19 @@ function enforceAtLeastOneMorningSevenAm_(unit, anchorHoursByNet, locOrder, byKe
   }
   if (hasSeven) return;
 
+  var allowZeroSupplyForce = !!(rules && rules.force_morning_seven_am_even_if_empty === true);
+  var supplyGapCap = (rules && typeof rules.morning_seven_am_anchor_supply_gap === 'number')
+    ? rules.morning_seven_am_anchor_supply_gap
+    : 2;
+
   var bestNet = -1;
   var bestGap = -Infinity;
+  var bestS7 = 0;
+  var bestS8 = 0;
   for (var n = 0; n < netCount; n++) {
+    // Skip nets that are intentionally closed for this (day, block) — e.g.
+    // Friday morning Net 2 / Net 3 (MENTOR_NET_ANCHORS_['בוקר_שישי']).
+    if (anchorHoursByNet[n] == null) continue;
     var loc = locOrder[n];
     var block7 = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, 7);
     if (block7.length < 3) continue;
@@ -489,17 +511,61 @@ function enforceAtLeastOneMorningSevenAm_(unit, anchorHoursByNet, locOrder, byKe
     if (gap > bestGap) {
       bestGap = gap;
       bestNet = n;
+      bestS7 = s7;
+      bestS8 = s8;
     }
   }
-  if (bestNet >= 0) anchorHoursByNet[bestNet] = 7;
+  if (bestNet < 0) return;
+  if (!allowZeroSupplyForce && bestS7 === 0 && bestS8 > 0) return;
+  if (!allowZeroSupplyForce && bestS8 - bestS7 >= supplyGapCap && bestS8 > 0) return;
+  anchorHoursByNet[bestNet] = 7;
+}
+
+/**
+ * Symmetrical staff rule for evenings (Sun–Thu): every evening unit must
+ * have ≥1 net anchored at 17:00 so the 20:15-21:15 training exists. If
+ * supply-aware picks left all nets at 16:00, force the net with the
+ * largest supply(17)−supply(16) (smallest loss) back to 17:00.
+ */
+function enforceAtLeastOneEvening1700_(unit, anchorHoursByNet, locOrder, byKey, availability) {
+  if (unit.block !== 'ערב') return;
+  var netCount = locOrder.length;
+  var has17 = false;
+  for (var i = 0; i < netCount; i++) {
+    if (anchorHoursByNet[i] === 17) {
+      has17 = true;
+      break;
+    }
+  }
+  if (has17) return;
+
+  var bestNet = -1;
+  var bestGap = -Infinity;
+  for (var n = 0; n < netCount; n++) {
+    if (anchorHoursByNet[n] == null) continue; // Skip closed nets.
+    var loc = locOrder[n];
+    var block17 = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, 17);
+    if (block17.length < 3) continue;
+    var block16 = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, 16);
+    var s17 = countCoachesCoveringSlots_(unit.day, block17, availability);
+    var s16 = (block16.length >= 3)
+      ? countCoachesCoveringSlots_(unit.day, block16, availability)
+      : 0;
+    var gap = s17 - s16;
+    if (gap > bestGap) {
+      bestGap = gap;
+      bestNet = n;
+    }
+  }
+  if (bestNet >= 0) anchorHoursByNet[bestNet] = 17;
 }
 
 /**
  * For each (day, block) unit, compute supply-aware anchor hour per net and
- * apply the morning ≥1-at-07:00 constraint.
+ * apply the morning ≥1-at-07:00 / evening ≥1-at-17:00 constraints.
  * @returns {Object<string, number[]>}  key day|block → [hour per net index]
  */
-function precomputeUnitAnchorHours_(units, locOrder, byKey, availability) {
+function precomputeUnitAnchorHours_(units, locOrder, byKey, availability, rules) {
   var out = {};
   for (var u = 0; u < units.length; u++) {
     var unit = units[u];
@@ -511,7 +577,16 @@ function precomputeUnitAnchorHours_(units, locOrder, byKey, availability) {
       );
     }
     if (unit.block === 'בוקר') {
-      enforceAtLeastOneMorningSevenAm_(unit, hours, locOrder, byKey, availability);
+      enforceAtLeastOneMorningSevenAm_(unit, hours, locOrder, byKey, availability, rules);
+    } else if (unit.block === 'ערב') {
+      enforceAtLeastOneEvening1700_(unit, hours, locOrder, byKey, availability);
+    }
+    // Hard rule: Friday morning Net 1 must always anchor at 07:00, regardless
+    // of supply. Staff requirement — Friday morning training starts at 7am or
+    // not at all. The cluster may end up red if no coach is available, that's
+    // OK; the daily structure must show a 7am slot.
+    if (unit.day === 'שישי' && unit.block === 'בוקר') {
+      hours[0] = 7;
     }
     out[uKey] = hours;
   }
@@ -546,7 +621,7 @@ function precomputeUnitAnchorHours_(units, locOrder, byKey, availability) {
  *                                anchors from `MENTOR_NET_ANCHORS_` only.
  * @returns {Array}              The same slot objects re-ordered.
  */
-function buildSlotFillPriority_(slots, availability) {
+function buildSlotFillPriority_(slots, availability, masterMap, rules) {
   var locOrder = (CONFIG.locations || []).slice();
   if (!locOrder.length) locOrder = ['Net1', 'Net2', 'Net3'];
 
@@ -566,19 +641,21 @@ function buildSlotFillPriority_(slots, availability) {
   var units = buildUnitOrder_();
   var ordered = [];
   var seen = {};
-  var NET3_IDX_ = 2;
 
   var unitAnchorHours = availability
-    ? precomputeUnitAnchorHours_(units, locOrder, byKey, availability)
+    ? precomputeUnitAnchorHours_(units, locOrder, byKey, availability, rules)
     : null;
 
   for (var netIdx = 0; netIdx < locOrder.length; netIdx++) {
-    // Net 3: open (day, block) units with the most coach supply first so the
-    // limited tail of weekly class slots (e.g. 3 cells when total=91) land on
-    // Mon morn before Sun morn when Mon has more coaches.
+    // Open units with the best real coach pressure first. This keeps the class
+    // budget pointed at places where under-target coaches can actually work,
+    // instead of blindly lighting Net 1/2 everywhere before looking at Net 3.
     var unitsThisNet = units.slice();
-    if (availability && netIdx === NET3_IDX_) {
+    if (availability) {
       unitsThisNet.sort(function(a, b) {
+        var scoreDiff = unitOpeningPressure_(b, netIdx, locOrder, byKey, availability, masterMap, rules) -
+          unitOpeningPressure_(a, netIdx, locOrder, byKey, availability, masterMap, rules);
+        if (scoreDiff !== 0) return scoreDiff;
         return unitCoachSupply_(b, netIdx, locOrder, byKey, availability) -
           unitCoachSupply_(a, netIdx, locOrder, byKey, availability);
       });
@@ -615,9 +692,15 @@ function buildSlotFillPriority_(slots, availability) {
   // in original order so over-request still has somewhere to land. Coaches
   // assigned to these will not form anchor-aligned shifts on their own,
   // but that's the user's call (asked for more than 132).
+  //
+  // Exception: Friday morning Net 2 / Net 3 are intentionally closed (see
+  // MENTOR_NET_ANCHORS_['בוקר_שישי']). Skip them here too so they never
+  // receive a class type — those weekly classes are pushed to Sun–Thu
+  // instead.
   for (var i = 0; i < slots.length; i++) {
     var slI = slots[i];
     if (slI.block === 'מנהל') continue;
+    if (slI.day === 'שישי' && slI.block === 'בוקר' && slI.location !== locOrder[0]) continue;
     if (!seen[slI.slotId]) {
       seen[slI.slotId] = true;
       ordered.push(slI);
@@ -625,6 +708,184 @@ function buildSlotFillPriority_(slots, availability) {
   }
 
   return ordered;
+}
+
+function coachSupplyForOpening_(opening, availability) {
+  if (!availability || !opening || !opening.length) return opening ? opening.length : 0;
+  return countCoachesCoveringSlots_(opening[0].day, opening, availability);
+}
+
+/**
+ * Keep class placement aligned to real shift openings instead of letting the
+ * weekly count light up isolated cells. Full 4-training openings are preferred;
+ * if only two trainings remain, allow a 2-training half-shift only when at
+ * least one coach can cover those two cells.
+ */
+function capPriorityToCompleteOpenings_(orderedSlots, remainingCount, availability, rules) {
+  if (!orderedSlots || !orderedSlots.length || remainingCount <= 0) return [];
+  if (!availability) return orderedSlots.slice(0, remainingCount);
+
+  var locOrder = (CONFIG.locations || []).slice();
+  if (!locOrder.length) locOrder = ['Net1', 'Net2', 'Net3'];
+
+  var dropUnfillableResidual = !rules || rules.drop_unfillable_residual_class !== false;
+
+  var out = [];
+  var skipped = [];
+  var idx = 0;
+  while (idx < orderedSlots.length && remainingCount > 0) {
+    var first = orderedSlots[idx];
+    var opening = [first];
+    idx++;
+    while (idx < orderedSlots.length && opening.length < MENTOR_ANCHOR_BLOCK_TRAININGS_) {
+      var next = orderedSlots[idx];
+      if (next.day !== first.day || next.block !== first.block || next.location !== first.location) break;
+      opening.push(next);
+      idx++;
+    }
+
+    var netIdx = locOrder.indexOf(first.location);
+    var fullOpening = opening.slice(0, Math.min(opening.length, MENTOR_ANCHOR_BLOCK_TRAININGS_));
+    var isFridayMorningNet1 = first.day === 'שישי' && first.block === 'בוקר' && netIdx === 0;
+    if (remainingCount === 1 && opening.length >= 1) {
+      var singleOpening = opening.slice(0, 1);
+      var singleCell = singleOpening[0];
+      var extendsExisting = dropUnfillableResidual
+        ? slotIsAdjacentToOpenedBlock_(singleCell, out)
+        : true;
+      if (extendsExisting && coachSupplyForOpening_(singleOpening, availability) > 0) {
+        out = out.concat(singleOpening);
+        remainingCount -= singleOpening.length;
+      } else {
+        skipped.push(singleOpening);
+      }
+      continue;
+    }
+
+    // Always keep Net 1 and Net 2 openings (Round 1/2) so the schedule surface
+    // remains stable even when no one submitted availability for that unit
+    // (e.g. Friday morning Net 1). Net 3 remains supply-aware.
+    if (netIdx === 0 || netIdx === 1) {
+      var placed12 = false;
+      if (remainingCount >= MENTOR_ANCHOR_BLOCK_TRAININGS_ &&
+          fullOpening.length >= MENTOR_ANCHOR_BLOCK_TRAININGS_) {
+        // Friday morning Net 1 opens unconditionally — staff rule. If supply
+        // is 0 the cluster will be red, that's accepted.
+        if (isFridayMorningNet1 || coachSupplyForOpening_(fullOpening, availability) > 0) {
+          out = out.concat(fullOpening);
+          remainingCount -= fullOpening.length;
+          placed12 = true;
+        }
+      }
+      if (!placed12 && remainingCount >= 3 && opening.length >= 3) {
+        var threeCellOpening12 = pickThreeCellOpening_(opening, availability);
+        if (threeCellOpening12) {
+          out = out.concat(threeCellOpening12);
+          remainingCount -= 3;
+          placed12 = true;
+        }
+      }
+      if (!placed12 && fullOpening.length >= MENTOR_ANCHOR_BLOCK_TRAININGS_) {
+        skipped.push(fullOpening);
+      }
+      continue;
+    }
+
+    var placedNet3 = false;
+    if (remainingCount >= MENTOR_ANCHOR_BLOCK_TRAININGS_ &&
+        fullOpening.length >= MENTOR_ANCHOR_BLOCK_TRAININGS_ &&
+        coachSupplyForOpening_(fullOpening, availability) > 0) {
+      out = out.concat(fullOpening);
+      remainingCount -= fullOpening.length;
+      placedNet3 = true;
+    }
+    // 3-cell fallback for Net 3 too — better a clean 3-training shift than
+    // a 2-cell half-shift sitting on top of "אין אימון" cells.
+    if (!placedNet3 && remainingCount >= 3 && opening.length >= 3) {
+      var threeCellOpening3 = pickThreeCellOpening_(opening, availability);
+      if (threeCellOpening3) {
+        out = out.concat(threeCellOpening3);
+        remainingCount -= 3;
+        placedNet3 = true;
+      }
+    }
+    if (placedNet3) continue;
+    if (fullOpening.length >= MENTOR_ANCHOR_BLOCK_TRAININGS_) {
+      skipped.push(fullOpening);
+    }
+
+    if (remainingCount >= 2 && opening.length >= 2) {
+      var halfOpening = opening.slice(0, 2);
+      if (coachSupplyForOpening_(halfOpening, availability) > 0) {
+        out = out.concat(halfOpening);
+        remainingCount -= halfOpening.length;
+      } else {
+        skipped.push(halfOpening);
+      }
+    }
+  }
+
+  for (var sk = 0; sk < skipped.length && remainingCount > 0; sk++) {
+    var fallback = skipped[sk];
+    if (!fallback || !fallback.length) continue;
+    var take = Math.min(fallback.length, remainingCount);
+    if (take === 1 && remainingCount > 1) continue;
+    // Residual single-cell rule applies to the fallback path too — if the
+    // last 1 cell can't extend an existing opening, we drop it instead of
+    // creating an unfillable orphan.
+    if (take === 1 && dropUnfillableResidual &&
+        !slotIsAdjacentToOpenedBlock_(fallback[0], out)) {
+      continue;
+    }
+    out = out.concat(fallback.slice(0, take));
+    remainingCount -= take;
+  }
+  return out;
+}
+
+/**
+ * Helper for the residual single-cell rule: is `slot` adjacent (within
+ * 0.5 hour gap) to any cell already in `out` on the same (day, block,
+ * location), AND would that block stay ≤ 4 cells after adding `slot`?
+ * Coaches can only teach up to 4 contiguous cells, so extending a block
+ * that's already 4 cells just creates an unfillable 5th cell. With the
+ * 3-cell opening fallback in place, the residual now naturally lands on
+ * a 3-cell shift and promotes it to 4 cells.
+ */
+function slotIsAdjacentToOpenedBlock_(slot, out) {
+  if (!slot || !out || !out.length) return false;
+  var sameBlockCount = 0;
+  var anyAdjacent = false;
+  for (var i = 0; i < out.length; i++) {
+    var o = out[i];
+    if (o.day !== slot.day || o.block !== slot.block || o.location !== slot.location) continue;
+    sameBlockCount++;
+    if (Math.abs(o.endTime - slot.startTime) <= 0.5) anyAdjacent = true;
+    else if (Math.abs(slot.endTime - o.startTime) <= 0.5) anyAdjacent = true;
+  }
+  // Already a full 4-cell block — adding the residual would create a 5th
+  // cell that no single coach can absorb. Drop it.
+  if (sameBlockCount >= MENTOR_ANCHOR_BLOCK_TRAININGS_) return false;
+  return anyAdjacent;
+}
+
+/**
+ * Pick a 3-cell sub-window inside a 4-cell `opening` that has ≥1 coach
+ * covering all 3 cells. Tries the first-3 and last-3 windows in priority
+ * order (first-3 is the anchor-aligned start; last-3 picks up coaches
+ * available only later in the block). Returns the chosen array of 3
+ * slots, or null if neither window has a coach.
+ */
+function pickThreeCellOpening_(opening, availability) {
+  if (!opening || opening.length < 3) return null;
+  var windows = [];
+  windows.push(opening.slice(0, 3));
+  if (opening.length >= 4) windows.push(opening.slice(1, 4));
+  for (var i = 0; i < windows.length; i++) {
+    var w = windows[i];
+    if (w.length === 3 && coachSupplyForOpening_(w, availability) > 0) return w;
+  }
+  return null;
 }
 
 /**
@@ -672,6 +933,45 @@ function unitCoachSupply_(unit, netIdx, locOrder, byKey, availability) {
   if (anchorHour == null) return 0;
   var block = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, anchorHour);
   return countCoachesCoveringSlots_(unit.day, block, availability);
+}
+
+function unitOpeningPressure_(unit, netIdx, locOrder, byKey, availability, masterMap, rules) {
+  if (!unit || !availability || !masterMap) return unitCoachSupply_(unit, netIdx, locOrder, byKey, availability);
+  var loc = locOrder[netIdx];
+  var anchorHour = pickSupplyAwareAnchorHour_(unit, netIdx, loc, byKey, availability);
+  if (anchorHour == null) return 0;
+  var block = pickAnchorBlockSlots_(byKey, unit.day, unit.block, loc, anchorHour);
+  if (!block || !block.length) return 0;
+
+  var score = 0;
+  var names = Object.keys(masterMap);
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var emp = masterMap[name];
+    if (!emp || !availability[name] || !availability[name][unit.day]) continue;
+    var ranges = availability[name][unit.day];
+    if (!ranges || !ranges.length || typeof ranges[0] === 'string') continue;
+    if (emp.locationRestriction && emp.locationRestriction !== loc) continue;
+
+    var covered = 0;
+    for (var s = 0; s < block.length; s++) {
+      if (slotCoveredByMentorRanges_(block[s], ranges)) covered++;
+    }
+    if (covered < MENTOR_MIN_SHIFT_TRAININGS_) continue;
+
+    var rank = normalizeMentorRank_(emp.rank);
+    var target = getShiftTarget(name, masterMap, availability, rules);
+    if (rank === CONFIG.ranks.best && target > 0) {
+      score += 1000 + covered * 10;
+    } else if (rank >= 3 && target > 0) {
+      score += 200 + covered * 5;
+    } else if (target > 0) {
+      score += 100 + covered * 5;
+    } else {
+      score += covered;
+    }
+  }
+  return score;
 }
 
 /** Class types that need explicit eligible coaches on the slot before placement. */
@@ -825,14 +1125,42 @@ function distributeClassesIntoSlots_(slots, weeklyCounts, availability) {
     if (remaining.hasOwnProperty(rk)) sumRemaining += remaining[rk];
   }
 
+  var classTypeRules = loadClassTypeRules_();
+  var masterMap = loadMasterData();
+  var rules = loadRules();
+
   // Walk the auto-fill slots in priority order.
-  var priorityOrdered = buildSlotFillPriority_(slots, availability);
+  var priorityOrdered = buildSlotFillPriority_(slots, availability, masterMap, rules);
   var unpinned = [];
   for (var u = 0; u < priorityOrdered.length; u++) {
     if (!priorityOrdered[u].classType) unpinned.push(priorityOrdered[u]);
   }
+  unpinned = capPriorityToCompleteOpenings_(unpinned, sumRemaining, availability, rules);
+  var residualSingleOpened = availability && sumRemaining > 0 && (sumRemaining % 2) === 1 &&
+    unpinned.length === sumRemaining;
+  if (residualSingleOpened) {
+    warnings.push(
+      'הכמות השבועית אי-זוגית (' + requestedTotal +
+      '), לכן נפתח אימון יחיד נוסף כדי להגיע בדיוק למספר שביקשת. ' +
+      'מעבר השיפור הגלובלי ינסה לצרף אותו למשמרת קיימת.'
+    );
+  }
 
-  if (sumRemaining > unpinned.length) {
+  // If the residual rule dropped the leftover single, the count placed
+  // will be lower than requested. Warn the user explicitly instead of
+  // failing silently.
+  var residualDropped = availability && sumRemaining > unpinned.length &&
+    (sumRemaining - unpinned.length) === 1 &&
+    (!rules || rules.drop_unfillable_residual_class !== false);
+  if (residualDropped) {
+    warnings.push(
+      'נשאר שיעור בודד בלתי-משובץ (תא יחיד שאף מאמן לא יכול ללמד) — לא נפתח כדי למנוע ' +
+      'תא אדום יתום. סה"כ אימונים השבוע: ' + (requestedTotal - 1) + ' במקום ' + requestedTotal +
+      '. ניתן לכבות את הכלל ב-Rules → drop_unfillable_residual_class = FALSE.'
+    );
+  }
+
+  if (sumRemaining > unpinned.length && !residualDropped) {
     warnings.push(
       'הכמות השבועית (' + requestedTotal + ') חורגת מהקיבולת הפנויה (' +
       (unpinned.length + (slots.length - unpinned.length)) +
@@ -842,9 +1170,6 @@ function distributeClassesIntoSlots_(slots, weeklyCounts, availability) {
 
   // Class-type placement: restricted types (League, E) only on slots where
   // a submitted coach can actually teach them; flexible types fill the rest.
-  var classTypeRules = loadClassTypeRules_();
-  var masterMap = loadMasterData();
-  var rules = loadRules();
   var placedCounts = placeWeeklyClassTypesWithSupply_(
     unpinned, remaining, availability, masterMap, classTypeRules, rules
   );
@@ -887,6 +1212,7 @@ function distributeClassesIntoSlots_(slots, weeklyCounts, availability) {
     placedByType: placedByType,
     requestedTotal: requestedTotal,
     activeTotal: activeSlots.length,
+    residualSingleOpened: residualSingleOpened,
     capacity: slots.length,
     warnings: warnings
   };

@@ -30,6 +30,15 @@ var SHIFT_TARGET_RULES_CACHE_ = null;
 var SHIFT_TARGET_FORM_CACHE_ = null;
 
 /**
+ * Per-coach effective shift target (integer) after capping by the structural
+ * ceiling that the coach's submitted availability physically supports. Lets
+ * the algorithm avoid chasing targets it can never reach (e.g. coach asked
+ * for 4 but only submitted enough windows for 3). Populated by
+ * setEffectiveShiftTargetCache_ at the start of every entry-point flow.
+ */
+var SHIFT_TARGET_EFFECTIVE_CACHE_ = null;
+
+/**
  * Cache the form-submitted weekly targets for the current run. Called from
  * the optimizer and the refresh-from-sheet paths so getShiftTarget() can
  * prefer the coach's own number over MasterData.WeeklyMax. Pass null to
@@ -37,6 +46,46 @@ var SHIFT_TARGET_FORM_CACHE_ = null;
  */
 function setShiftTargetFormCache_(weeklyTargets) {
   SHIFT_TARGET_FORM_CACHE_ = weeklyTargets || null;
+  // Form targets feed into the effective-target calculation; invalidate the
+  // downstream cache so the next call rebuilds with the new form values.
+  SHIFT_TARGET_EFFECTIVE_CACHE_ = null;
+}
+
+/**
+ * Pre-compute the per-coach EFFECTIVE shift target: the form/MasterData
+ * target capped by the structural availability ceiling. After this runs,
+ * every getShiftTarget(name) call returns min(requested, floor(structuralMax))
+ * for coaches whose submitted availability cannot support their requested
+ * number. Safety floor: never below 1 if the coach submitted any availability
+ * and asked for at least 1 shift.
+ *
+ * Call from every flow that uses getShiftTarget BEFORE any scheduling work:
+ *   - optimizeWeek (full run)
+ *   - refreshScheduleFromSheet_ (after manual edits)
+ *   - logHistoryFromSheet_ (history snapshot)
+ *
+ * @param {Object[]} slots  Full ShiftTemplate list
+ * @param {Object}   availability  loadAvailability().availability
+ * @param {Object}   masterMap     loadMasterData()
+ * @param {Object}   rules         loadRules() — set cap_target_by_structural_max=false to skip
+ */
+function setEffectiveShiftTargetCache_(slots, availability, masterMap, rules) {
+  SHIFT_TARGET_EFFECTIVE_CACHE_ = {};
+  if (!masterMap) return;
+  if (rules && rules.cap_target_by_structural_max === false) return;
+  if (!slots || !slots.length || !availability) return;
+  var names = Object.keys(masterMap);
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    if (!availability[name]) continue;
+    var submittedDays = countCoachSubmittedDays_(name, availability);
+    if (submittedDays === 0) continue;
+    var structuralMax = computeStructuralMaxWeightedShifts_(name, availability, slots, masterMap);
+    if (structuralMax <= 0) continue;
+    // Floor to whole shifts (a 0.5 partial isn't a "real" shift target);
+    // safety floor at 1 so we still try to give submitters at least one.
+    SHIFT_TARGET_EFFECTIVE_CACHE_[name] = Math.max(1, Math.floor(structuralMax));
+  }
 }
 
 /**
@@ -85,7 +134,21 @@ function getShiftTarget(name, masterMap, availability, rules) {
 
   // +1 cap: never more than one day beyond submitted availability.
   var cap = submittedDays + 1;
-  return Math.min(rawTarget, cap);
+  var target = Math.min(rawTarget, cap);
+
+  // Structural cap: if the coach's submitted availability physically can't
+  // support `target` shifts (e.g. requested 4 but only enough windows for 3),
+  // use the structural ceiling instead. This makes the algorithm stop chasing
+  // impossible targets via swaps that create new red cells.
+  if (!rules || rules.cap_target_by_structural_max !== false) {
+    if (SHIFT_TARGET_EFFECTIVE_CACHE_ &&
+        Object.prototype.hasOwnProperty.call(SHIFT_TARGET_EFFECTIVE_CACHE_, name)) {
+      var effective = SHIFT_TARGET_EFFECTIVE_CACHE_[name];
+      if (effective > 0 && effective < target) target = effective;
+    }
+  }
+
+  return target;
 }
 
 /** Count distinct days the coach marked any availability range for. */
@@ -101,6 +164,57 @@ function countCoachSubmittedDays_(name, availability) {
     if (dayRanges && dayRanges.length > 0) count++;
   }
   return count;
+}
+
+/**
+ * Coach-level structural ceiling: maximum weighted shifts that COULD be
+ * delivered given the coach's submitted availability windows alone — before
+ * considering competing coaches, openings, or class types. Returned in the
+ * same weighted scale as `countAssignedShifts_` (3+ trainings = 1.0,
+ * exactly 2 trainings = 0.5).
+ *
+ * Used by the fairness panel to expose targets that are physically out of
+ * reach (e.g. "target 4, but availability only supports 3").
+ */
+function computeStructuralMaxWeightedShifts_(name, availability, slots, masterMap) {
+  if (!availability || !availability[name] || !slots || !slots.length) return 0;
+  var emp = masterMap && masterMap[name];
+  if (!emp) return 0;
+  var groups = buildShiftGroups_(slots);
+  var total = 0;
+  for (var g = 0; g < groups.length; g++) {
+    var group = groups[g];
+    if (group.block === 'מנהל') continue;
+    if (emp.locationRestriction) {
+      var anySlotInLoc = false;
+      for (var si = 0; si < group.slots.length; si++) {
+        if (group.slots[si].location === emp.locationRestriction) {
+          anySlotInLoc = true;
+          break;
+        }
+      }
+      if (!anySlotInLoc) continue;
+    }
+    var dayRanges = availability[name][group.day];
+    if (!dayRanges || !dayRanges.length) continue;
+    if (typeof dayRanges[0] === 'string') {
+      var anyBlockMatch = false;
+      for (var b = 0; b < dayRanges.length; b++) {
+        if (dayRanges[b] === group.block) { anyBlockMatch = true; break; }
+      }
+      if (anyBlockMatch) total += 1;
+      continue;
+    }
+    var bestRun = 0;
+    for (var r = 0; r < dayRanges.length; r++) {
+      if (!rangeBelongsToBlock_(dayRanges[r], group.block)) continue;
+      var keys = timeKeysCoveredByRange_(group, dayRanges[r]);
+      var run = computeLongestContiguousRun_(keys);
+      if (run > bestRun) bestRun = Math.min(run, MENTOR_FULL_SHIFT_TRAININGS_);
+    }
+    total += shiftWeightForTrainingCount_(bestRun);
+  }
+  return total;
 }
 
 /**
@@ -134,16 +248,24 @@ function getFormShiftTarget_(name, masterMap, availability, rules) {
  * @param {Object} rules - From loadRules()
  * @returns {{ assignments: Object, warnings: string[], employeeStats: Object }}
  */
-function optimizeWeek(slots, availability, masterMap, rules) {
+function optimizeWeek(slots, availability, masterMap, rules, allSlots) {
   var optimizationMode = 'fair';
   // Ensure shift target uses the same rules object throughout this run.
   SHIFT_TARGET_RULES_CACHE_ = rules || null;
+  // Pre-compute effective shift targets (capped by what each coach's
+  // submitted availability physically supports). Done ONCE before any
+  // scheduling so every pass / swap / displacement / fairness check uses the
+  // same realistic target, instead of chasing a value the coach can't reach.
+  setEffectiveShiftTargetCache_(slots, availability, masterMap, rules);
   var classTypeRules = loadClassTypeRules_();
   var state = {
     assigned: {},
     employeeShifts: {},
     warnings: [],
+    passLog: [],
+    globalReviewLog: [],
     _slotMap: buildSlotMap_(slots),
+    _allSlots: allSlots || slots,
     _classTypeRules: classTypeRules,
     optimizationMode: optimizationMode
   };
@@ -166,17 +288,24 @@ function optimizeWeek(slots, availability, masterMap, rules) {
     }
   }
 
-  assignContinuousShiftBlocks_(slots, availability, masterMap, rules, state);
+  var optimizerAvailability = cloneAvailabilityForOptimization_(availability);
+
+  assignContinuousShiftBlocks_(slots, optimizerAvailability, masterMap, rules, state);
 
   // Fairness floor: every Rank 3+ coach who submitted availability gets at
   // least one shift, even if it means swapping with a more-shifts coach.
   // Per staff May 23 2026 — see enforceMinimumOneShiftForLowerRanks_.
   if (rules && rules.enforce_min_shift_rank3plus !== false) {
-    enforceMinimumOneShiftForLowerRanks_(slots, availability, masterMap, rules, state);
+    enforceMinimumOneShiftForLowerRanks_(slots, optimizerAvailability, masterMap, rules, state);
+  }
+
+  if (!rules || rules.rank_1_unconditional !== false) {
+    enforceRank1TargetByDisplacement_(slots, optimizerAvailability, masterMap, rules, state);
   }
 
   // Any remaining training slot is genuinely unfilled; suggestion phase may add blue fallback suggestions.
   for (var s = 0; s < slots.length; s++) {
+    if (slots[s].inactive) continue;
     if (!state.assigned[slots[s].slotId]) {
       state.assigned[slots[s].slotId] = {
         name: '', unfilled: true,
@@ -185,9 +314,13 @@ function optimizeWeek(slots, availability, masterMap, rules) {
     }
   }
 
+  if (!rules || rules.global_review_enabled !== false) {
+    globalScheduleReview_(slots, optimizerAvailability, masterMap, rules, state);
+  }
+
   // Phase 3: suggest employees for unfilled slots (blue cells).
   if (rules && rules.suggest_outside_availability !== false) {
-    suggestForUnfilled(slots, availability, masterMap, rules, state, optimizationMode);
+    suggestForUnfilled(slots, optimizerAvailability, masterMap, rules, state, optimizationMode);
   }
 
   return buildResultFromState_(state, masterMap, availability, rules);
@@ -204,6 +337,17 @@ function assignContinuousShiftBlocks_(slots, availability, masterMap, rules, sta
   for (var g = 0; g < groups.length; g++) {
     assignShiftBlock_(groups[g], availability, masterMap, rules, state);
   }
+}
+
+function logOptimizerPass_(state, group, passName, entries) {
+  if (!state) return;
+  if (!state.passLog) state.passLog = [];
+  state.passLog.push({
+    day: group.day,
+    block: group.block,
+    pass: passName,
+    entries: entries || []
+  });
 }
 
 function buildShiftGroups_(slots) {
@@ -232,6 +376,171 @@ function buildShiftGroups_(slots) {
     return blockOrder_(a.block) - blockOrder_(b.block);
   });
   return groups;
+}
+
+function cloneAvailabilityForOptimization_(availability) {
+  var out = {};
+  if (!availability) return out;
+  var names = Object.keys(availability);
+  for (var n = 0; n < names.length; n++) {
+    var name = names[n];
+    out[name] = {};
+    var days = Object.keys(availability[name] || {});
+    for (var d = 0; d < days.length; d++) {
+      var day = days[d];
+      var ranges = availability[name][day];
+      out[name][day] = ranges && ranges.slice ? ranges.slice() : ranges;
+    }
+  }
+  return out;
+}
+
+function routeFlexibleCoachesByScarcity_(slots, availability, masterMap, rules, state) {
+  var routed = cloneAvailabilityForOptimization_(availability);
+  if (!rules || rules.route_flexible_coaches_by_scarcity !== true) {
+    return routed;
+  }
+  var groups = buildShiftGroups_(slots);
+  var groupByDayBlock = {};
+  for (var g = 0; g < groups.length; g++) {
+    groupByDayBlock[groups[g].day + '|' + groups[g].block] = groups[g];
+  }
+
+  var names = Object.keys(masterMap);
+  for (var d = 0; d < CONFIG.days.length; d++) {
+    var day = CONFIG.days[d];
+    var morningGroup = groupByDayBlock[day + '|בוקר'];
+    var eveningGroup = groupByDayBlock[day + '|ערב'];
+    if (!morningGroup || !eveningGroup) continue;
+
+    var flexCoaches = [];
+    for (var n = 0; n < names.length; n++) {
+      var name = names[n];
+      if (!availability || !availability[name]) continue;
+      var ranges = availability[name][day];
+      if (!ranges || !ranges.length || typeof ranges[0] === 'string') continue;
+      if (!coachHasBlockAvailability_(ranges, 'בוקר') ||
+          !coachHasBlockAvailability_(ranges, 'ערב')) continue;
+
+      flexCoaches.push({
+        name: name,
+        rank: normalizeMentorRank_(masterMap[name].rank),
+        ranges: ranges
+      });
+    }
+    if (!flexCoaches.length) continue;
+
+    var morningCount = countSingleBlockFullShiftCoaches_(
+      day, 'בוקר', morningGroup, availability, masterMap, rules, state
+    );
+    var eveningCount = countSingleBlockFullShiftCoaches_(
+      day, 'ערב', eveningGroup, availability, masterMap, rules, state
+    );
+
+    flexCoaches.sort(function(a, b) {
+      if (a.rank !== b.rank) return a.rank - b.rank;
+      return a.name.localeCompare(b.name, 'he');
+    });
+
+    for (var f = 0; f < flexCoaches.length; f++) {
+      var flex = flexCoaches[f];
+      var keepBlock = morningCount < eveningCount ? 'בוקר' : 'ערב';
+      routed[flex.name][day] = filterRangesForBlock_(flex.ranges, keepBlock);
+      if (keepBlock === 'בוקר') {
+        morningCount++;
+      } else {
+        eveningCount++;
+      }
+      state.warnings.push(
+        flex.name + ' — זמינות ' + day + ' נותבה ל' + keepBlock +
+        ' כדי לאזן עומס בין בוקר לערב בלי לשבץ את שניהם.'
+      );
+    }
+  }
+  return routed;
+}
+
+function countSingleBlockFullShiftCoaches_(day, block, group, availability, masterMap, rules, state) {
+  var count = 0;
+  var otherBlock = block === 'בוקר' ? 'ערב' : 'בוקר';
+  var names = Object.keys(masterMap);
+  for (var n = 0; n < names.length; n++) {
+    var name = names[n];
+    if (!availability[name] || !availability[name][day]) continue;
+    var ranges = availability[name][day];
+    if (!ranges || !ranges.length || typeof ranges[0] === 'string') continue;
+    if (!coachHasBlockAvailability_(ranges, block)) continue;
+    if (coachHasBlockAvailability_(ranges, otherBlock)) continue;
+    if (longestBlockRunForCoach_(name, group, ranges, masterMap, rules, state) >= MENTOR_FULL_SHIFT_TRAININGS_) {
+      count++;
+    }
+  }
+  return count;
+}
+
+function longestBlockRunForCoach_(name, group, ranges, masterMap, rules, state) {
+  var bestRun = 0;
+  for (var r = 0; r < ranges.length; r++) {
+    if (!rangeBelongsToBlock_(ranges[r], group.block)) continue;
+    var timeKeys = timeKeysCoveredByRange_(group, ranges[r]);
+    timeKeys = filterTimeKeysByClassEligibility_(group, timeKeys, name, masterMap, state, rules);
+    if (!timeKeys.length) continue;
+    bestRun = Math.max(bestRun, Math.min(
+      computeLongestContiguousRun_(timeKeys),
+      MENTOR_FULL_SHIFT_TRAININGS_
+    ));
+  }
+  return bestRun;
+}
+
+function coachHasBlockAvailability_(ranges, block) {
+  if (!ranges || !ranges.length || typeof ranges[0] === 'string') return false;
+  for (var i = 0; i < ranges.length; i++) {
+    if (rangeBelongsToBlock_(ranges[i], block)) return true;
+  }
+  return false;
+}
+
+function filterRangesForBlock_(ranges, block) {
+  var out = [];
+  for (var i = 0; i < ranges.length; i++) {
+    if (rangeBelongsToBlock_(ranges[i], block)) out.push(ranges[i]);
+  }
+  return out;
+}
+
+function rangeBelongsToBlock_(range, block) {
+  if (!range) return false;
+  if (block === 'בוקר') return range.startHour < 12;
+  if (block === 'ערב') return range.endHour > 12;
+  return false;
+}
+
+function scoreOtherCoachSupplyForBlock_(flexCoachName, group, availability, masterMap, rules, state) {
+  var score = { full: 0, any: 0 };
+  var names = Object.keys(masterMap);
+  for (var n = 0; n < names.length; n++) {
+    var name = names[n];
+    if (name === flexCoachName) continue;
+    if (!availability[name] || !availability[name][group.day]) continue;
+    var ranges = availability[name][group.day];
+    if (!ranges || !ranges.length || typeof ranges[0] === 'string') continue;
+
+    var bestRun = 0;
+    for (var r = 0; r < ranges.length; r++) {
+      if (!rangeBelongsToBlock_(ranges[r], group.block)) continue;
+      var timeKeys = timeKeysCoveredByRange_(group, ranges[r]);
+      timeKeys = filterTimeKeysByClassEligibility_(group, timeKeys, name, masterMap, state, rules);
+      if (!timeKeys.length) continue;
+      bestRun = Math.max(bestRun, Math.min(
+        computeLongestContiguousRun_(timeKeys),
+        MENTOR_FULL_SHIFT_TRAININGS_
+      ));
+    }
+    if (bestRun >= MENTOR_MIN_SHIFT_TRAININGS_) score.any++;
+    if (bestRun >= MENTOR_FULL_SHIFT_TRAININGS_) score.full++;
+  }
+  return score;
 }
 
 function sortSlotsByTimeAndLocation_(a, b) {
@@ -310,6 +619,7 @@ function assignShiftBlock_(group, availability, masterMap, rules, state) {
     var candidates = buildShiftBlockCandidates_(
       group, availability, masterMap, rules, state, passMin
     );
+    var passLogEntries = [];
 
     candidates.sort(function(a, b) {
       var aIsTop = a.rank === CONFIG.ranks.best;
@@ -335,8 +645,34 @@ function assignShiftBlock_(group, availability, masterMap, rules, state) {
 
     for (var i = 0; i < candidates.length; i++) {
       var cand = candidates[i];
-      if (!canAssignMoreClasses_(cand.name, cand.length, rules, state)) continue;
-      if (candidateAlreadyHasAnyTime_(cand, state)) continue;
+      var logEntry = {
+        name: cand.name,
+        rank: cand.rank,
+        length: cand.length,
+        gap: cand.gap,
+        placed: false,
+        reason: ''
+      };
+      passLogEntries.push(logEntry);
+
+      if (cand.gap <= 0) {
+        logEntry.reason = 'at-target';
+        continue; // Form target is a hard cap, including Rank 1.
+      }
+      // Hard "no morning+evening same day" rule — never bypassed (applies
+      // to every rank, including Rank 1).
+      if (hasSameDayOppositeBlockShift_(cand.name, cand.day, cand.block, state)) {
+        logEntry.reason = 'opposite-block-same-day';
+        continue;
+      }
+      if (!canAssignMoreClasses_(cand.name, cand.length, rules, state)) {
+        logEntry.reason = 'class-cap';
+        continue;
+      }
+      if (candidateAlreadyHasAnyTime_(cand, state)) {
+        logEntry.reason = 'already-in-block';
+        continue;
+      }
 
       var assignedSlots = findBestContiguousAssignment_(
         cand, state, masterMap, rules, {
@@ -346,15 +682,160 @@ function assignShiftBlock_(group, availability, masterMap, rules, state) {
           allowSpread: false
         }
       );
-      if (!assignedSlots) continue;
+      if (!assignedSlots) {
+        logEntry.reason = 'no-contiguous-net';
+        continue;
+      }
 
       assignEmployeeToSlots_(cand.name, assignedSlots, masterMap, state);
+      logEntry.placed = true;
+      logEntry.reason = 'placed';
       if (cand.backToBack) {
         state.warnings.push(
           cand.name + ' — שובץ/ה במשמרת צמודה למרות דרגה ' + cand.rank + ' (' +
           cand.day + ' ' + cand.block + ').'
         );
       }
+    }
+
+    // Rank 1 sub-4h windows are reserved after full 4-training shifts land,
+    // so a 7-11 coach is not displaced by an 8-11 prepass assignment.
+    if (p === 0 && rank1Unconditional) {
+      runRank1SubFullShiftPrepass_(group, availability, masterMap, rules, state);
+    }
+    logOptimizerPass_(state, group, 'pass-' + passMin, passLogEntries);
+  }
+}
+
+/**
+ * Pre-pass for Rank 1 coaches whose longest contiguous teachable run on
+ * this (day, block) is SHORTER than a full 4-training shift. Those coaches
+ * are filtered out of the regular 4h pass and would otherwise lose every
+ * active net on the block to Rank 2 4h-capable coaches. To guarantee
+ * "Rank 1 always gets the shifts they submitted", we place each such
+ * under-target Rank 1 coach after the full-shift pass and before 3h/2h
+ * passes get to consider anyone else.
+ *
+ * Rules:
+ *   - Coach must be Rank 1 and submit a range on this (day, block).
+ *   - Coach must NOT already have a shift in this (day, block).
+ *   - Coach must be strictly under their form target.
+ *   - Only sub-4h windows are handled here; 4h+ Rank 1 windows continue
+ *     to land via the normal 4h pass (where they also win first by rank).
+ *   - The assigned run uses the coach's actual longest teachable length
+ *     (≥2), so a 3h window becomes a 3-training shift on a single net.
+ */
+function runRank1SubFullShiftPrepass_(group, availability, masterMap, rules, state) {
+  var names = Object.keys(masterMap);
+  var candidates = [];
+
+  for (var n = 0; n < names.length; n++) {
+    var name = names[n];
+    var emp = masterMap[name];
+    if (normalizeMentorRank_(emp.rank) !== CONFIG.ranks.best) continue;
+    if (!availability[name] || !availability[name][group.day]) continue;
+    var ranges = availability[name][group.day];
+    if (!ranges || !ranges.length || typeof ranges[0] === 'string') continue;
+
+    var target = getShiftTarget(name, masterMap, availability, rules);
+    if (target <= 0) continue;
+    if (countAssignedShifts_(name, state) >= target) continue;
+
+    // Skip if this coach already has any shift in this (day, block).
+    var shifts = state.employeeShifts[name] || [];
+    var alreadyInBlock = false;
+    for (var s = 0; s < shifts.length; s++) {
+      if (shifts[s].day === group.day && shifts[s].block === group.block) {
+        alreadyInBlock = true;
+        break;
+      }
+    }
+    if (alreadyInBlock) continue;
+
+    // Hard-skip if the coach already has the OPPOSITE block (morning vs
+    // evening) on the same day — we never want a coach working both
+    // halves of the same calendar day, regardless of how big the gap is.
+    if (hasSameDayOppositeBlockShift_(name, group.day, group.block, state)) continue;
+
+    // Inspect ALL submitted ranges on this (day, block) before deciding.
+    // If ANY range gives a 4-training run, this coach should not land in
+    // the prepass — the regular pass 1 picks them up with the longer
+    // window. Otherwise pick the longest sub-4h run as the prepass
+    // candidate (so רון 7–11 + 8–12 → 4-cell range, not 3-cell range).
+    var hasFullShiftRange = false;
+    var bestRange = null;
+    for (var r = 0; r < ranges.length; r++) {
+      var timeKeys = timeKeysCoveredByRange_(group, ranges[r]);
+      timeKeys = filterTimeKeysByClassEligibility_(group, timeKeys, name, masterMap, state, rules);
+      if (!timeKeys.length) continue;
+
+      var longestRun = computeLongestContiguousRun_(timeKeys);
+      var clampedRun = Math.min(longestRun, MENTOR_FULL_SHIFT_TRAININGS_);
+      if (clampedRun >= MENTOR_FULL_SHIFT_TRAININGS_) {
+        hasFullShiftRange = true;
+        break;
+      }
+      if (clampedRun < MENTOR_MIN_SHIFT_TRAININGS_) continue;
+      if (!bestRange || clampedRun > bestRange.length) {
+        bestRange = {
+          rangeIndex: r,
+          timeKeys: timeKeys,
+          length: clampedRun,
+          preferredAnchorHour: ranges[r].startHour
+        };
+      }
+    }
+    if (hasFullShiftRange) continue;
+    if (!bestRange) continue;
+
+    candidates.push({
+      name: name,
+      rank: normalizeMentorRank_(emp.rank),
+      day: group.day,
+      block: group.block,
+      rangeIndex: bestRange.rangeIndex,
+      timeKeys: bestRange.timeKeys,
+      length: bestRange.length,
+      preferredAnchorHour: bestRange.preferredAnchorHour,
+      gap: target - countAssignedShifts_(name, state),
+      backToBack: wouldCreateBackToBackShift_(name, group.day, group.block, emp, state),
+        group: group,
+        availability: availability
+    });
+  }
+
+  if (!candidates.length) return;
+
+  // Largest gap first (most under-target), then longest window, then name.
+  candidates.sort(function(a, b) {
+    if (a.gap !== b.gap) return b.gap - a.gap;
+    if (a.length !== b.length) return b.length - a.length;
+    return a.name.localeCompare(b.name, 'he');
+  });
+
+  for (var i = 0; i < candidates.length; i++) {
+    var cand = candidates[i];
+    // Re-check the cap; previous iterations in this pass may have placed
+    // the same coach on a different range earlier (defensive).
+    if (countAssignedShifts_(cand.name, state) >= getShiftTarget(cand.name, masterMap, availability, rules)) continue;
+
+    var assignedSlots = findBestContiguousAssignment_(
+      cand, state, masterMap, rules, {
+        // Use the coach's actual run length, NOT the multi-pass minimum;
+        // this is exactly what unblocks a sub-4h Rank 1 window.
+        minLength: cand.length,
+        allowSpread: false,
+        preferredAnchorHour: cand.preferredAnchorHour
+      }
+    );
+    if (!assignedSlots) continue;
+
+    assignEmployeeToSlots_(cand.name, assignedSlots, masterMap, state);
+    if (cand.backToBack) {
+      state.warnings.push(
+        cand.name + ' — שובץ/ה במשמרת צמודה (' + cand.day + ' ' + cand.block +
+        ') בקדם־מעבר של דרג 1 כדי לעמוד ביעד שהגיש/ה.'
+      );
     }
   }
 }
@@ -397,6 +878,48 @@ function enforceMinimumOneShiftForLowerRanks_(slots, availability, masterMap, ru
   placeRank3PlusFairnessFloor_(slots, availability, masterMap, rules, state, false, true);
 }
 
+function enforceRank1TargetByDisplacement_(slots, availability, masterMap, rules, state) {
+  var names = Object.keys(masterMap);
+  names.sort(function(a, b) {
+    var gapA = getShiftTarget(a, masterMap, availability, rules) - countAssignedShifts_(a, state);
+    var gapB = getShiftTarget(b, masterMap, availability, rules) - countAssignedShifts_(b, state);
+    if (gapA !== gapB) return gapB - gapA;
+    return a.localeCompare(b, 'he');
+  });
+
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var emp = masterMap[name];
+    if (!emp || normalizeMentorRank_(emp.rank) !== CONFIG.ranks.best) continue;
+    if (!hasSubmittedAnyAvailability_(name, availability)) continue;
+
+    var target = getShiftTarget(name, masterMap, availability, rules);
+    var guard = 0;
+    while (countAssignedShifts_(name, state) < target && guard < target + 2) {
+      guard++;
+      var placed = tryPlaceInUnassignedRun_(name, emp, slots, availability, masterMap, rules, state, false);
+      if (!placed) {
+        placed = tryGiveOneShiftBySwap_(
+          name, emp, slots, availability, masterMap, rules, state, false, {
+            warningSuffix: ' — השלמת יעד חובה למאמן/ת דרג 1.',
+            allowRank1Requester: true,
+            allowPartialRehome: true
+          }
+        );
+      }
+      if (!placed) break;
+    }
+
+    if (countAssignedShifts_(name, state) < target) {
+      state.warnings.push(
+        '⚠️ ' + name + ' (דרג 1) עדיין מתחת ליעד: ' +
+        countAssignedShifts_(name, state) + '/' + target +
+        '. לא נמצאה החלפה חוקית לפי זמינות/כשירות/חפיפה.'
+      );
+    }
+  }
+}
+
 /**
  * Rank 3+ fairness floor loop. When `guardUnderTargetR12` is true, skips runs
  * where an under-target Rank 1-2 coach is eligible. Warnings only when
@@ -424,7 +947,9 @@ function placeRank3PlusFairnessFloor_(slots, availability, masterMap, rules, sta
     );
     if (!placed) {
       placed = tryGiveOneShiftBySwap_(
-        name, emp, slots, availability, masterMap, rules, state, guardUnderTargetR12
+        name, emp, slots, availability, masterMap, rules, state, guardUnderTargetR12, {
+          allowPartialRehome: true
+        }
       );
     }
     if (!placed && warnIfStillZero) {
@@ -530,6 +1055,10 @@ function tryPlaceInUnassignedRun_(name, emp, slots, availability, masterMap, rul
     var ranges = availability[name][group.day];
     if (!ranges || !ranges.length || typeof ranges[0] === 'string') continue;
 
+    // Hard: never give a coach both morning and evening on the same day.
+    if (hasSameDayOppositeBlockShift_(name, group.day, group.block, state)) continue;
+    if (employeeAlreadyInBlock_(name, group.day, group.block, state)) continue;
+
     for (var r = 0; r < ranges.length; r++) {
       var timeKeys = timeKeysCoveredByRange_(group, ranges[r]);
       // Keep only time keys with at least one UNASSIGNED slot the coach
@@ -591,7 +1120,8 @@ function tryPlaceInUnassignedRun_(name, emp, slots, availability, masterMap, rul
  * Try to give `name` a single shift by displacing a higher-count coach in
  * one of the coach's submitted (day, block) units. Returns true on success.
  */
-function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules, state, guardUnderTargetR12) {
+function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules, state, guardUnderTargetR12, opts) {
+  opts = opts || {};
   var groups = buildShiftGroups_(slots);
   var rank1Unconditional = !rules || rules.rank_1_unconditional !== false;
 
@@ -601,6 +1131,10 @@ function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules
     var ranges = availability[name][group.day];
     if (!ranges || !ranges.length) continue;
     if (typeof ranges[0] === 'string') continue;
+
+    // Hard: never give a coach both morning and evening on the same day.
+    if (hasSameDayOppositeBlockShift_(name, group.day, group.block, state)) continue;
+    if (employeeAlreadyInBlock_(name, group.day, group.block, state)) continue;
 
     // Build seenKey = time keys this coach can teach in this group. Unlike
     // the main-pass filter, we DO NOT skip already-assigned slots — the
@@ -646,32 +1180,51 @@ function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules
       if (v.coach === name) continue;
       if (isNoSuggestCoach_(v.coach)) continue;
 
-      var vRank = normalizeMentorRank_(masterMap[v.coach].rank);
-      if (rank1Unconditional && vRank === CONFIG.ranks.best) continue;
-
       var vShifts = countAssignedShifts_(v.coach, state);
+      var vRank = normalizeMentorRank_(masterMap[v.coach].rank);
+      var vTarget = getShiftTarget(v.coach, masterMap, availability, rules);
+      if (rank1Unconditional && vRank === CONFIG.ranks.best) {
+        var requesterIsRank1 = opts.allowRank1Requester &&
+          normalizeMentorRank_(emp.rank) === CONFIG.ranks.best;
+        if (!requesterIsRank1 || vShifts <= vTarget + 0.01) continue;
+      }
       if (vShifts < 2) continue;
 
       v.slots.sort(function(a, b) { return a.startTime - b.startTime; });
-      var canCover = true;
+      var coverSlots = [];
+      var uncoveredSlots = [];
       for (var vs = 0; vs < v.slots.length; vs++) {
         var vslot = v.slots[vs];
         // Time-window: coach must have submitted availability covering this slot.
-        if (!seenKey[slotTimeKey_(vslot)]) { canCover = false; break; }
+        var canCoverSlot = !!seenKey[slotTimeKey_(vslot)];
         // Class-type: coach must be eligible for THIS specific slot, not
         // just some other slot at the same time.
-        if (!coachEligibleForClassType_(name, vslot.classType, masterMap, classTypeRules, rules)) {
-          canCover = false;
-          break;
+        if (canCoverSlot &&
+            !coachEligibleForClassType_(name, vslot.classType, masterMap, classTypeRules, rules)) {
+          canCoverSlot = false;
         }
+        if (canCoverSlot) coverSlots.push(vslot);
+        else uncoveredSlots.push(vslot);
       }
-      if (!canCover) continue;
 
-      var vTarget = getShiftTarget(v.coach, masterMap, availability, rules);
+      var partialRehome = null;
+      if (uncoveredSlots.length > 0) {
+        if (!opts.allowPartialRehome) continue;
+        if (coverSlots.length < MENTOR_MIN_SHIFT_TRAININGS_) continue;
+        if (!isBoundaryPartialSwap_(v.slots, coverSlots, uncoveredSlots)) continue;
+        partialRehome = buildRehomePlanForUncoveredSlots_(
+          uncoveredSlots, state, availability, masterMap, rules
+        );
+        if (!partialRehome) continue;
+      }
+
       victims.push({
         coach: v.coach,
         loc: v.loc,
         slots: v.slots,
+        coverSlots: coverSlots,
+        uncoveredSlots: uncoveredSlots,
+        rehomePlan: partialRehome,
         rank: vRank,
         shifts: vShifts,
         over: vShifts - vTarget
@@ -681,6 +1234,9 @@ function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules
     if (victims.length === 0) continue;
 
     victims.sort(function(a, b) {
+      var aPartial = a.uncoveredSlots && a.uncoveredSlots.length ? 1 : 0;
+      var bPartial = b.uncoveredSlots && b.uncoveredSlots.length ? 1 : 0;
+      if (aPartial !== bPartial) return aPartial - bPartial;
       if (a.over !== b.over) return b.over - a.over;
       if (a.shifts !== b.shifts) return b.shifts - a.shifts;
       if (a.rank !== b.rank) return b.rank - a.rank;
@@ -696,19 +1252,156 @@ function tryGiveOneShiftBySwap_(name, emp, slots, availability, masterMap, rules
     for (var us = 0; us < victim.slots.length; us++) {
       unassignSlot_(victim.slots[us].slotId, victim.slots[us], state);
     }
-    for (var as = 0; as < victim.slots.length; as++) {
-      assignEmployee(name, victim.slots[as], masterMap, state);
+    var requesterSlots = victim.coverSlots && victim.coverSlots.length
+      ? victim.coverSlots
+      : victim.slots;
+    for (var as = 0; as < requesterSlots.length; as++) {
+      assignEmployee(name, requesterSlots[as], masterMap, state);
+    }
+    if (victim.rehomePlan) {
+      applyRehomePlan_(victim.rehomePlan, masterMap, state);
     }
 
     state.warnings.push(
       '🔁 ' + name + ' (דרג ' + emp.rank + ') הוחלף עם ' + victim.coach +
       ' (דרג ' + victim.rank + ') ב-' + group.day + ' ' + group.block + ' ' +
       (CONFIG.locationNames[victim.loc] || victim.loc) +
-      ' — הבטחת לפחות משמרת אחת לכל מאמן מדרג 3+ שהגיש זמינות.'
+      (victim.rehomePlan ? ' — תא שלא כוסה נסגר והאימון הועבר לתא זמין אחר.' : '') +
+      (opts.warningSuffix || ' — הבטחת לפחות משמרת אחת לכל מאמן מדרג 3+ שהגיש זמינות.')
     );
     return true;
   }
   return false;
+}
+
+function isBoundaryPartialSwap_(victimSlots, coverSlots, uncoveredSlots) {
+  if (!victimSlots || !coverSlots || !uncoveredSlots) return false;
+  if (uncoveredSlots.length !== 1) return false;
+  if (coverSlots.length < MENTOR_MIN_SHIFT_TRAININGS_) return false;
+
+  victimSlots.sort(function(a, b) { return a.startTime - b.startTime; });
+  coverSlots.sort(function(a, b) { return a.startTime - b.startTime; });
+  var uncovered = uncoveredSlots[0];
+  var isBoundary = uncovered.slotId === victimSlots[0].slotId ||
+    uncovered.slotId === victimSlots[victimSlots.length - 1].slotId;
+  if (!isBoundary) return false;
+
+  for (var i = 1; i < coverSlots.length; i++) {
+    if (!timeKeysAdjacent_(slotTimeKey_(coverSlots[i - 1]), slotTimeKey_(coverSlots[i]))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function buildRehomePlanForUncoveredSlots_(sourceSlots, state, availability, masterMap, rules) {
+  if (!sourceSlots || !sourceSlots.length) return null;
+  var plan = [];
+  var usedDestIds = {};
+  for (var i = 0; i < sourceSlots.length; i++) {
+    var dest = findInactiveExtensionDestination_(
+      sourceSlots[i], state, availability, masterMap, rules, usedDestIds
+    );
+    if (!dest) return null;
+    usedDestIds[dest.slot.slotId] = true;
+    plan.push({
+      source: sourceSlots[i],
+      destination: dest.slot,
+      coach: dest.coach
+    });
+  }
+  return plan;
+}
+
+function findInactiveExtensionDestination_(sourceSlot, state, availability, masterMap, rules, usedDestIds) {
+  var allSlots = state && state._allSlots ? state._allSlots : [];
+  var names = Object.keys(masterMap);
+  var candidates = [];
+
+  for (var s = 0; s < allSlots.length; s++) {
+    var slot = allSlots[s];
+    if (!slot || !slot.inactive || slot.block === 'מנהל') continue;
+    if (state.assigned[slot.slotId] && !state.assigned[slot.slotId].unfilled) continue;
+    if (usedDestIds && usedDestIds[slot.slotId]) continue;
+
+    for (var n = 0; n < names.length; n++) {
+      var name = names[n];
+      var emp = masterMap[name];
+      if (!emp || !meetsLocationRestriction(emp, slot)) continue;
+      if (!isAvailableForSlot(name, slot, availability)) continue;
+      if (!coachEligibleForClassType_(name, sourceSlot.classType, masterMap, state._classTypeRules, rules)) continue;
+      if (!canExtendExistingShiftWithSlot_(name, slot, state)) continue;
+
+      var target = getShiftTarget(name, masterMap, availability, rules);
+      var gap = target - countAssignedShifts_(name, state);
+      candidates.push({
+        slot: slot,
+        coach: name,
+        rank: normalizeMentorRank_(emp.rank),
+        gap: gap,
+        distance: rehomeDistance_(sourceSlot, slot)
+      });
+    }
+  }
+
+  if (!candidates.length) return null;
+  candidates.sort(function(a, b) {
+    if (a.gap !== b.gap) return b.gap - a.gap;
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    if (a.distance !== b.distance) return a.distance - b.distance;
+    return a.coach.localeCompare(b.coach, 'he');
+  });
+  return candidates[0];
+}
+
+function canExtendExistingShiftWithSlot_(name, slot, state) {
+  var shifts = state.employeeShifts[name] || [];
+  var sameBlock = [];
+  for (var i = 0; i < shifts.length; i++) {
+    var sh = shifts[i];
+    if (sh.day === slot.day && sh.block === slot.block && sh.location === slot.location) {
+      sameBlock.push(sh);
+    }
+  }
+  if (!sameBlock.length || sameBlock.length >= MENTOR_FULL_SHIFT_TRAININGS_) return false;
+
+  for (var s = 0; s < sameBlock.length; s++) {
+    if (shiftTimesOverlap_(sameBlock[s].startTime, sameBlock[s].endTime, slot.startTime, slot.endTime)) {
+      return false;
+    }
+    var before = Math.abs(sameBlock[s].endTime - slot.startTime) <= 0.5;
+    var after = Math.abs(slot.endTime - sameBlock[s].startTime) <= 0.5;
+    if (before || after) return true;
+  }
+  return false;
+}
+
+function rehomeDistance_(sourceSlot, destSlot) {
+  var dayDistance = Math.abs(dayOrder_(sourceSlot.day) - dayOrder_(destSlot.day));
+  var blockDistance = sourceSlot.block === destSlot.block ? 0 : 1;
+  return dayDistance * 10 + blockDistance;
+}
+
+function applyRehomePlan_(plan, masterMap, state) {
+  for (var i = 0; i < plan.length; i++) {
+    var source = plan[i].source;
+    var dest = plan[i].destination;
+    var coach = plan[i].coach;
+
+    dest.classType = source.classType;
+    dest.inactive = false;
+    source.inactive = true;
+    source.rehomedToSlotId = dest.slotId;
+    source.rehomedToCoach = coach;
+
+    state.assigned[source.slotId] = {
+      name: '',
+      unfilled: true,
+      inactiveRehomed: true,
+      note: 'האימון הועבר לתא אחר כדי למנוע תא אדום בודד.'
+    };
+    assignEmployee(coach, dest, masterMap, state);
+  }
 }
 
 /** Canonical full-shift length in trainings (4 = 4 hours of footvolley). */
@@ -772,7 +1465,8 @@ function buildShiftBlockCandidates_(group, availability, masterMap, rules, state
         // One full 4-training morning still counts as ONE shift here.
         gap: getShiftTarget(name, masterMap, availability, rules) - countAssignedShifts_(name, state),
         backToBack: wouldCreateBackToBackShift_(name, group.day, group.block, emp, state),
-        group: group
+        group: group,
+        availability: availability
       });
     }
   }
@@ -855,18 +1549,44 @@ function filterTimeKeysByClassEligibility_(group, keys, coachName, masterMap, st
   return kept;
 }
 
-/** Count unique (day, block) pairs the coach is already assigned to. */
+/** 2 trainings = half shift; 3+ trainings = full shift for target/status math. */
+function shiftWeightForTrainingCount_(count) {
+  if (count <= 0) return 0;
+  if (count === MENTOR_MIN_SHIFT_TRAININGS_) return 0.5;
+  return 1;
+}
+
+/**
+ * Count weighted shifts from assigned trainings:
+ * - exactly 2 trainings in a (day, block) = 0.5 shift
+ * - 3+ trainings in a (day, block) = 1 shift
+ */
+function countWeightedShiftsFromTrainings_(trainings) {
+  var byShift = {};
+  for (var i = 0; i < trainings.length; i++) {
+    var t = trainings[i];
+    var key = t.day + '|' + t.block;
+    byShift[key] = byShift[key] || { block: t.block, count: 0 };
+    byShift[key].count++;
+  }
+
+  var out = { total: 0, morning: 0, evening: 0, other: 0 };
+  var keys = Object.keys(byShift);
+  for (var k = 0; k < keys.length; k++) {
+    var item = byShift[keys[k]];
+    var weight = shiftWeightForTrainingCount_(item.count);
+    out.total += weight;
+    if (item.block === 'בוקר') out.morning += weight;
+    else if (item.block === 'ערב') out.evening += weight;
+    else out.other += weight;
+  }
+  return out;
+}
+
+/** Count weighted shifts the coach is already assigned to. */
 function countAssignedShifts_(name, state) {
   var arr = state.employeeShifts[name] || [];
-  var seen = {};
-  var count = 0;
-  for (var i = 0; i < arr.length; i++) {
-    var key = arr[i].day + '|' + arr[i].block;
-    if (seen[key]) continue;
-    seen[key] = true;
-    count++;
-  }
-  return count;
+  return countWeightedShiftsFromTrainings_(arr).total;
 }
 
 function timeKeysCoveredByRange_(group, range) {
@@ -884,9 +1604,9 @@ function timeKeysCoveredByRange_(group, range) {
 
 function canAssignMoreClasses_(name, additionalCount, rules, state) {
   var maxShifts = getEmployeeMaxShifts_(rules);
-  // Count distinct (day, block) shifts, not individual training cells.
+  // Count weighted shifts: 2 trainings = 0.5, 3+ trainings = 1.
   var currentCount = countAssignedShifts_(name, state);
-  return currentCount + 1 <= maxShifts;
+  return currentCount + shiftWeightForTrainingCount_(additionalCount || 0) <= maxShifts;
 }
 
 /**
@@ -944,6 +1664,9 @@ function findBestContiguousAssignment_(candidate, state, masterMap, rules, opts)
 
   var runs = buildContiguousRuns_(keys);
   var netOrder = rankStickyNetsForWindow_(candidate, state, masterMap, rules, capLen);
+  if (opts.preferredAnchorHour != null) {
+    netOrder = biasNetOrderByAnchorHour_(candidate, netOrder, opts.preferredAnchorHour);
+  }
 
   for (var ri = 0; ri < runs.length; ri++) {
     var run = runs[ri];
@@ -972,6 +1695,31 @@ function findBestContiguousAssignment_(candidate, state, masterMap, rules, opts)
     }
   }
   return null;
+}
+
+function biasNetOrderByAnchorHour_(candidate, netOrder, preferredAnchorHour) {
+  var scores = [];
+  for (var i = 0; i < netOrder.length; i++) {
+    var loc = netOrder[i];
+    var anchorHour = null;
+    for (var s = 0; s < candidate.group.slots.length; s++) {
+      var slot = candidate.group.slots[s];
+      if (slot.location !== loc) continue;
+      if (anchorHour == null || slot.startTime < anchorHour) anchorHour = slot.startTime;
+    }
+    scores.push({
+      loc: loc,
+      idx: i,
+      matches: anchorHour != null && Math.abs(anchorHour - preferredAnchorHour) < 0.01
+    });
+  }
+  scores.sort(function(a, b) {
+    if (a.matches !== b.matches) return a.matches ? -1 : 1;
+    return a.idx - b.idx;
+  });
+  var out = [];
+  for (var j = 0; j < scores.length; j++) out.push(scores[j].loc);
+  return out;
 }
 
 /**
@@ -1004,17 +1752,92 @@ function rankStickyNetsForWindow_(candidate, state, masterMap, rules, capLen) {
       if (!coachEligibleForClassType_(candidate.name, slot.classType, masterMap, state._classTypeRules, rules)) continue;
       score++;
     }
-    scores.push({ loc: loc, score: score });
+    scores.push({
+      loc: loc,
+      score: score,
+      blocked: countUnderTargetSubFullCoachesBlockedByNet_(candidate, loc, locs, state, masterMap, rules)
+    });
   }
 
   scores.sort(function(a, b) {
     if (b.score !== a.score) return b.score - a.score;
+    if (a.blocked !== b.blocked) return a.blocked - b.blocked;
     return a.loc.localeCompare(b.loc, 'he');
   });
 
   var out = [];
   for (var s = 0; s < scores.length; s++) out.push(scores[s].loc);
   return out;
+}
+
+/**
+ * Penalize using a net when that net is the only remaining way for an
+ * under-target short-window coach to land a real shift in this same block.
+ * This keeps flexible 4h coaches from taking the 7-anchored bottleneck net
+ * when a 7-10 coach can only fit there.
+ */
+function countUnderTargetSubFullCoachesBlockedByNet_(candidate, loc, locs, state, masterMap, rules) {
+  var availability = candidate.availability;
+  if (!availability || !candidate || !candidate.group) return 0;
+
+  var group = candidate.group;
+  var names = Object.keys(masterMap);
+  var blocked = 0;
+  for (var n = 0; n < names.length; n++) {
+    var name = names[n];
+    if (name === candidate.name) continue;
+    var emp = masterMap[name];
+    if (!emp) continue;
+
+    var target = getShiftTarget(name, masterMap, availability, rules);
+    if (target <= 0 || countAssignedShifts_(name, state) >= target) continue;
+    if (hasSameDayOppositeBlockShift_(name, group.day, group.block, state)) continue;
+    if (employeeAlreadyInBlock_(name, group.day, group.block, state)) continue;
+
+    var ranges = availability[name] && availability[name][group.day];
+    if (!ranges || !ranges.length || typeof ranges[0] === 'string') continue;
+
+    var targetLocLen = bestAssignableRunOnLocation_(name, group, ranges, loc, state, masterMap, rules);
+    if (targetLocLen < MENTOR_MIN_SHIFT_TRAININGS_ || targetLocLen >= MENTOR_FULL_SHIFT_TRAININGS_) continue;
+
+    var hasOtherFit = false;
+    for (var li = 0; li < locs.length; li++) {
+      var otherLoc = locs[li];
+      if (otherLoc === loc) continue;
+      if (bestAssignableRunOnLocation_(name, group, ranges, otherLoc, state, masterMap, rules) >= MENTOR_MIN_SHIFT_TRAININGS_) {
+        hasOtherFit = true;
+        break;
+      }
+    }
+    if (!hasOtherFit) blocked++;
+  }
+  return blocked;
+}
+
+function employeeAlreadyInBlock_(name, day, block, state) {
+  var shifts = state && state.employeeShifts ? (state.employeeShifts[name] || []) : [];
+  for (var i = 0; i < shifts.length; i++) {
+    if (shifts[i].day === day && shifts[i].block === block) return true;
+  }
+  return false;
+}
+
+function bestAssignableRunOnLocation_(name, group, ranges, loc, state, masterMap, rules) {
+  var best = 0;
+  for (var r = 0; r < ranges.length; r++) {
+    var keys = timeKeysCoveredByRange_(group, ranges[r]);
+    var kept = [];
+    for (var k = 0; k < keys.length; k++) {
+      var slot = findSlotForLocationAtTime_(group.slotsByTime[keys[k]] || [], loc);
+      if (!slot || state.assigned[slot.slotId]) continue;
+      if (hasTimeConflict(name, slot, null, state)) continue;
+      if (!coachEligibleForClassType_(name, slot.classType, masterMap, state._classTypeRules, rules)) continue;
+      kept.push(keys[k]);
+    }
+    var run = computeLongestContiguousRun_(kept);
+    if (run > best) best = run;
+  }
+  return Math.min(best, MENTOR_FULL_SHIFT_TRAININGS_);
 }
 
 /** Try to fill candidate.timeKeys[start..start+L-1] on a single net. */
@@ -1058,6 +1881,28 @@ function assignEmployeeToSlots_(name, assignedSlots, masterMap, state) {
   }
 }
 
+/**
+ * Hard guard for the "no morning + evening on the same calendar day" rule.
+ * Returns true when the coach is already assigned to the OPPOSITE block on
+ * the same `day` (i.e. trying to add morning when they already have evening,
+ * or vice-versa). Applies to ALL ranks — including Rank 1 — per the staff
+ * rule "regardless of starting hour or breaks in the middle".
+ *
+ * Used as a hard skip in the main pass / prepass / suggestion logic;
+ * the existing `wouldCreateBackToBackShift_` stays as the soft signal for
+ * the cross-day "evening then next-day morning" case.
+ */
+function hasSameDayOppositeBlockShift_(name, day, block, state) {
+  if (!day || !block) return false;
+  var opposite = (block === 'בוקר') ? 'ערב' : (block === 'ערב') ? 'בוקר' : null;
+  if (!opposite) return false;
+  var shifts = state && state.employeeShifts ? (state.employeeShifts[name] || []) : [];
+  for (var i = 0; i < shifts.length; i++) {
+    if (shifts[i].day === day && shifts[i].block === opposite) return true;
+  }
+  return false;
+}
+
 function wouldCreateBackToBackShift_(name, day, block, emp, state) {
   if (normalizeMentorRank_(emp.rank) <= 1) return false;
   var shifts = state.employeeShifts[name] || [];
@@ -1087,29 +1932,21 @@ function buildResultFromState_(state, masterMap, availability, rules) {
     var emp = masterMap[empNames[e]];
     var trainings = state.employeeShifts[empNames[e]] || [];
 
-    // Unique (day, block) keys = real shifts. Hours sum across all trainings.
-    var seenShifts = {};
-    var morningCount = 0;
-    var eveningCount = 0;
+    // Weighted shifts: 2 trainings = 0.5, 3+ trainings = 1.
+    var weighted = countWeightedShiftsFromTrainings_(trainings);
     var totalHours = 0;
     for (var sh = 0; sh < trainings.length; sh++) {
       var t = trainings[sh];
       totalHours += t.durationHours || 0;
-      var shiftKey = t.day + '|' + t.block;
-      if (seenShifts[shiftKey]) continue;
-      seenShifts[shiftKey] = true;
-      if (t.block === 'בוקר') morningCount++;
-      else if (t.block === 'ערב') eveningCount++;
     }
-    var shiftsCount = morningCount + eveningCount;
 
     employeeStats[empNames[e]] = {
       name: empNames[e],
       rank: emp.rank,
-      shiftsCount: shiftsCount,
+      shiftsCount: weighted.total,
       shiftTarget: getShiftTarget(empNames[e], masterMap, availability, rules),
-      morningCount: morningCount,
-      eveningCount: eveningCount,
+      morningCount: weighted.morning,
+      eveningCount: weighted.evening,
       trainingsCount: trainings.length,
       totalHours: totalHours
     };
@@ -1117,7 +1954,9 @@ function buildResultFromState_(state, masterMap, availability, rules) {
   return {
     assignments: state.assigned,
     warnings: state.warnings || [],
-    employeeStats: employeeStats
+    employeeStats: employeeStats,
+    passLog: state.passLog || [],
+    globalReviewLog: state.globalReviewLog || []
   };
 }
 
@@ -1138,10 +1977,820 @@ function computeFairnessDeficit_(state, masterMap, availability, rules) {
   for (var i = 0; i < names.length; i++) {
     var target = getShiftTarget(names[i], masterMap, availability, rules);
     if (target <= 0) continue;
-    var count = (state.employeeShifts[names[i]] || []).length;
+    var count = countAssignedShifts_(names[i], state);
     if (count < target) total += (target - count);
   }
   return total;
+}
+
+function getGlobalReviewWeight_(rules, key, fallback) {
+  var v = rules && rules[key] != null ? parseFloat(rules[key]) : fallback;
+  return isNaN(v) ? fallback : v;
+}
+
+function scoreWeek_(slots, state, masterMap, availability, rules) {
+  var redCells = 0;
+  for (var s = 0; s < slots.length; s++) {
+    if (slots[s].inactive) continue;
+    var asgn = state.assigned[slots[s].slotId];
+    if (asgn && asgn.unfilled) redCells++;
+  }
+
+  var rank1Under = 0;
+  var rank2Under = 0;
+  var rank3PlusZero = 0;
+  var sumGap = 0;
+  var names = Object.keys(masterMap);
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    if (!hasSubmittedAnyAvailability_(name, availability)) continue;
+    var emp = masterMap[name];
+    var rank = normalizeMentorRank_(emp.rank);
+    var target = getShiftTarget(name, masterMap, availability, rules);
+    if (target <= 0) continue;
+    var assigned = countAssignedShifts_(name, state);
+    var gap = target - assigned;
+    if (gap > 0.01) {
+      sumGap += gap;
+      if (rank === CONFIG.ranks.best) rank1Under += gap;
+      else if (rank === 2) rank2Under += gap;
+    }
+    if (rank >= 3 && assigned <= 0) rank3PlusZero++;
+  }
+
+  // Partial clusters = (day, block, net) blocks where a coach is taking some
+  // cells but others stay red. Staff strongly prefer clean clusters: either
+  // a full-coverage assignment or a fully-red cluster waiting for manual
+  // intervention. Penalize each partial cluster heavily so the cleanup
+  // operator (opCleanPartialClusters_) wins the score comparison.
+  var partialClusterCount = buildPartialClusters_(slots, state).length;
+
+  var total =
+    getGlobalReviewWeight_(rules, 'global_review_rank1_weight', 10000) * rank1Under +
+    getGlobalReviewWeight_(rules, 'global_review_rank2_weight', 1000) * rank2Under +
+    getGlobalReviewWeight_(rules, 'global_review_rank3_zero_weight', 500) * rank3PlusZero +
+    getGlobalReviewWeight_(rules, 'global_review_partial_cluster_weight', 250) * partialClusterCount +
+    getGlobalReviewWeight_(rules, 'global_review_red_weight', 100) * redCells +
+    getGlobalReviewWeight_(rules, 'global_review_gap_weight', 10) * sumGap;
+
+  return {
+    total: total,
+    redCells: redCells,
+    rank1Under: rank1Under,
+    rank2Under: rank2Under,
+    rank3PlusZero: rank3PlusZero,
+    sumGap: sumGap,
+    partialClusterCount: partialClusterCount
+  };
+}
+
+function snapshotOptimizerState_(state) {
+  return {
+    assigned: JSON.parse(JSON.stringify(state.assigned || {})),
+    employeeShifts: JSON.parse(JSON.stringify(state.employeeShifts || {})),
+    warningsLength: state.warnings ? state.warnings.length : 0
+  };
+}
+
+function restoreOptimizerState_(state, snapshot) {
+  state.assigned = snapshot.assigned || {};
+  state.employeeShifts = snapshot.employeeShifts || {};
+  if (state.warnings && state.warnings.length > snapshot.warningsLength) {
+    state.warnings.length = snapshot.warningsLength;
+  }
+}
+
+function globalScheduleReview_(slots, availability, masterMap, rules, state) {
+  var maxIter = parseInt((rules && rules.global_review_max_iterations) || 50, 10);
+  if (isNaN(maxIter) || maxIter < 1) maxIter = 50;
+  var score = scoreWeek_(slots, state, masterMap, availability, rules);
+  state.globalReviewLog = [{ iter: 0, op: 'init', score: score }];
+
+  var ops = [
+    opFillRedWithUnderTargetCoach_,
+    opSwapUnderTargetCoach_,
+    opMoveDeadClusterToHungrySlots_,
+    opCleanPartialClusters_
+  ];
+
+  for (var iter = 1; iter <= maxIter; iter++) {
+    var improved = false;
+    for (var oi = 0; oi < ops.length; oi++) {
+      var snap = snapshotOptimizerState_(state);
+      var before = score.total;
+      var changed = ops[oi](slots, availability, masterMap, rules, state);
+      if (!changed) {
+        restoreOptimizerState_(state, snap);
+        continue;
+      }
+      var after = scoreWeek_(slots, state, masterMap, availability, rules);
+      if (after.total < before - 0.01) {
+        score = after;
+        state.globalReviewLog.push({ iter: iter, op: ops[oi].name, score: after });
+        improved = true;
+        break;
+      }
+      restoreOptimizerState_(state, snap);
+    }
+    if (!improved) {
+      state.globalReviewLog.push({ iter: iter, op: 'no-op', score: score });
+      break;
+    }
+  }
+}
+
+function opFillRedWithUnderTargetCoach_(slots, availability, masterMap, rules, state) {
+  var clusters = buildUnfilledClusters_(slots, state);
+  clusters.sort(function(a, b) {
+    if (b.slots.length !== a.slots.length) return b.slots.length - a.slots.length;
+    return dayOrder_(a.day) - dayOrder_(b.day);
+  });
+
+  for (var c = 0; c < clusters.length; c++) {
+    var cluster = clusters[c];
+    var clusterSlots = cluster.slots.slice(0, MENTOR_FULL_SHIFT_TRAININGS_);
+    var candidates = rankActualClusterCandidates_(clusterSlots, availability, masterMap, rules, state);
+    if (candidates.length) {
+      var name = candidates[0].name;
+      for (var s = 0; s < clusterSlots.length; s++) {
+        assignEmployee(name, clusterSlots[s], masterMap, state);
+      }
+      state.warnings.push(
+        '🔎 שיפור גלובלי: ' + name + ' שובץ/ה ב-' + cluster.day + ' ' +
+        cluster.block + ' ' + (CONFIG.locationNames[cluster.location] || cluster.location) +
+        ' במקום תאים אדומים.'
+      );
+      return true;
+    }
+
+    if (clusterSlots.length >= MENTOR_MIN_SHIFT_TRAININGS_ + 1) {
+      var partialApplied = tryPartialFillRedClusterWithRehome_(
+        clusterSlots, cluster, availability, masterMap, rules, state
+      );
+      if (partialApplied) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Fallback for `opFillRedWithUnderTargetCoach_`: when no coach can cover
+ * EVERY slot in a red cluster, try a partial cover — N-1 of N slots — and
+ * re-home the single uncovered boundary slot to an inactive cell elsewhere
+ * (extending an existing shift). The unmatched boundary cell becomes
+ * "אין אימון", trading 1 red cell for N-1 fills + 1 extension. Returns
+ * true iff a partial cover was applied.
+ */
+function tryPartialFillRedClusterWithRehome_(clusterSlots, cluster, availability, masterMap, rules, state) {
+  if (!clusterSlots || clusterSlots.length < MENTOR_MIN_SHIFT_TRAININGS_ + 1) return false;
+
+  var names = Object.keys(masterMap);
+  var ranked = [];
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var emp = masterMap[name];
+    if (!emp) continue;
+    var target = getShiftTarget(name, masterMap, availability, rules);
+    var current = countAssignedShifts_(name, state);
+    if (target <= 0 || current >= target) continue;
+    if (!hasSubmittedAnyAvailability_(name, availability)) continue;
+    if (hasSameDayOppositeBlockShift_(name, clusterSlots[0].day, clusterSlots[0].block, state)) continue;
+
+    var cover = [];
+    var uncovered = [];
+    for (var s = 0; s < clusterSlots.length; s++) {
+      var slot = clusterSlots[s];
+      if (!meetsLocationRestriction(emp, slot)) { cover = null; break; }
+      if (hasTimeConflict(name, slot, null, state)) { cover = null; break; }
+      if (isAvailableForSlot(name, slot, availability) &&
+          coachEligibleForClassType_(name, slot.classType, masterMap, state._classTypeRules, rules)) {
+        cover.push(slot);
+      } else {
+        uncovered.push(slot);
+      }
+    }
+    if (!cover || !cover.length) continue;
+    if (cover.length < MENTOR_MIN_SHIFT_TRAININGS_) continue;
+    if (uncovered.length !== 1) continue;
+    if (!isBoundaryPartialSwap_(clusterSlots.slice(), cover, uncovered)) continue;
+    if (!canTakeClusterRespectingExistingBlock_(name, cover, state)) continue;
+
+    var plan = buildRehomePlanForUncoveredSlots_(uncovered, state, availability, masterMap, rules);
+    if (!plan) continue;
+
+    ranked.push({
+      name: name,
+      rank: normalizeMentorRank_(emp.rank),
+      gap: target - current,
+      cover: cover,
+      uncovered: uncovered,
+      plan: plan
+    });
+  }
+
+  if (!ranked.length) return false;
+  ranked.sort(function(a, b) {
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    if (a.gap !== b.gap) return b.gap - a.gap;
+    return a.name.localeCompare(b.name, 'he');
+  });
+
+  var pick = ranked[0];
+  applyRehomePlan_(pick.plan, masterMap, state);
+  for (var k = 0; k < pick.cover.length; k++) {
+    assignEmployee(pick.name, pick.cover[k], masterMap, state);
+  }
+  state.warnings.push(
+    '🔎 שיפור גלובלי: ' + pick.name + ' שובץ/ה ב-' + cluster.day + ' ' +
+    cluster.block + ' ' + (CONFIG.locationNames[cluster.location] || cluster.location) +
+    ' (כיסוי חלקי) — תא הקצה הומר ל"אין אימון" והאימון הועבר למקום אחר.'
+  );
+  return true;
+}
+
+function opSwapUnderTargetCoach_(slots, availability, masterMap, rules, state) {
+  var names = Object.keys(masterMap);
+  names.sort(function(a, b) {
+    var rA = normalizeMentorRank_(masterMap[a].rank);
+    var rB = normalizeMentorRank_(masterMap[b].rank);
+    if (rA !== rB) return rA - rB;
+    var gapA = getShiftTarget(a, masterMap, availability, rules) - countAssignedShifts_(a, state);
+    var gapB = getShiftTarget(b, masterMap, availability, rules) - countAssignedShifts_(b, state);
+    if (gapA !== gapB) return gapB - gapA;
+    return a.localeCompare(b, 'he');
+  });
+
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var target = getShiftTarget(name, masterMap, availability, rules);
+    if (target <= 0 || countAssignedShifts_(name, state) >= target) continue;
+    if (!hasSubmittedAnyAvailability_(name, availability)) continue;
+    if (tryGiveOneShiftBySwap_(
+      name, masterMap[name], slots, availability, masterMap, rules, state, false, {
+        warningSuffix: ' — שיפור גלובלי של איזון השבוע.',
+        allowRank1Requester: normalizeMentorRank_(masterMap[name].rank) === CONFIG.ranks.best,
+        allowPartialRehome: true
+      }
+    )) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Zero-sum operator: when a red cluster is structurally unfillable (no
+ * coach can cover it, and no boundary-partial-cover with rehome works
+ * either), close those cells back to "אין אימון" and open the same number
+ * of inactive cells elsewhere where at least one under-target coach can
+ * actually be assigned. Preserves the weekly total class count requested
+ * by the user.
+ *
+ * Drives the user's "you decide אין אימון but you still must hit the
+ * 101 classes" rule. Disabled if `global_review_close_dead_clusters` is
+ * FALSE in Rules.
+ */
+function opMoveDeadClusterToHungrySlots_(slots, availability, masterMap, rules, state) {
+  if (rules && rules.global_review_close_dead_clusters === false) return false;
+  var allSlots = state && state._allSlots ? state._allSlots : slots;
+
+  var deadClusters = buildUnfilledClusters_(slots, state);
+  deadClusters.sort(function(a, b) {
+    if (b.slots.length !== a.slots.length) return b.slots.length - a.slots.length;
+    return dayOrder_(a.day) - dayOrder_(b.day);
+  });
+
+  for (var c = 0; c < deadClusters.length; c++) {
+    var cluster = deadClusters[c];
+    var deadSlots = cluster.slots.slice();
+    if (deadSlots.length < MENTOR_MIN_SHIFT_TRAININGS_) continue;
+
+    // Skip if any coach (full or partial) can take this cluster — let the
+    // other operators handle those cases. We're only interested in the
+    // genuinely unfillable remainder.
+    var fullCands = rankActualClusterCandidates_(
+      deadSlots.slice(0, MENTOR_FULL_SHIFT_TRAININGS_),
+      availability, masterMap, rules, state
+    );
+    if (fullCands.length) continue;
+    if (hasPartialFillCandidate_(deadSlots, availability, masterMap, rules, state)) continue;
+
+    var move = findHungryInactiveDestination_(
+      deadSlots.length, allSlots, availability, masterMap, rules, state
+    );
+    if (!move) continue;
+
+    applyDeadToHungryMove_(deadSlots, move, slots, masterMap, state, cluster);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Cheap check: would `tryPartialFillRedClusterWithRehome_` accept any
+ * coach for `clusterSlots`? Avoids running the operator's actual mutation
+ * path — just probes whether a valid (coach, plan) pair exists.
+ */
+function hasPartialFillCandidate_(clusterSlots, availability, masterMap, rules, state) {
+  if (!clusterSlots || clusterSlots.length < MENTOR_MIN_SHIFT_TRAININGS_ + 1) return false;
+  var names = Object.keys(masterMap);
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var emp = masterMap[name];
+    if (!emp) continue;
+    var target = getShiftTarget(name, masterMap, availability, rules);
+    var current = countAssignedShifts_(name, state);
+    if (target <= 0 || current >= target) continue;
+    if (!hasSubmittedAnyAvailability_(name, availability)) continue;
+    if (hasSameDayOppositeBlockShift_(name, clusterSlots[0].day, clusterSlots[0].block, state)) continue;
+
+    var cover = [];
+    var uncovered = [];
+    var hardBlock = false;
+    for (var s = 0; s < clusterSlots.length; s++) {
+      var slot = clusterSlots[s];
+      if (!meetsLocationRestriction(emp, slot) || hasTimeConflict(name, slot, null, state)) {
+        hardBlock = true;
+        break;
+      }
+      if (isAvailableForSlot(name, slot, availability) &&
+          coachEligibleForClassType_(name, slot.classType, masterMap, state._classTypeRules, rules)) {
+        cover.push(slot);
+      } else {
+        uncovered.push(slot);
+      }
+    }
+    if (hardBlock) continue;
+    if (cover.length < MENTOR_MIN_SHIFT_TRAININGS_ || uncovered.length !== 1) continue;
+    if (!isBoundaryPartialSwap_(clusterSlots.slice(), cover, uncovered)) continue;
+    if (!canTakeClusterRespectingExistingBlock_(name, cover, state)) continue;
+    var plan = buildRehomePlanForUncoveredSlots_(uncovered, state, availability, masterMap, rules);
+    if (plan) return true;
+  }
+  return false;
+}
+
+/**
+ * Find a contiguous run of inactive slots large enough to absorb `needed`
+ * cells, where at least one under-target coach can be fully assigned to
+ * the (newly active) destination cluster. Returns `{destSlots, coach}` or
+ * null if no such hungry cluster exists.
+ *
+ * "Hungry" = inactive cells in a (day, block, location) where the
+ * activated cluster would yield a coach who currently has gap > 0.
+ */
+function findHungryInactiveDestination_(needed, allSlots, availability, masterMap, rules, state) {
+  if (!needed || needed < MENTOR_MIN_SHIFT_TRAININGS_) return null;
+  var inactiveClusters = buildInactiveClusters_(allSlots, state);
+
+  var bestMove = null;
+  var bestKey = null;
+
+  for (var i = 0; i < inactiveClusters.length; i++) {
+    var ic = inactiveClusters[i];
+    if (ic.slots.length < needed) continue;
+    var dest = ic.slots.slice(0, needed);
+    var cands = rankActualClusterCandidates_(dest, availability, masterMap, rules, state);
+    if (!cands.length) continue;
+    var top = cands[0];
+    // Prefer destinations whose top candidate has bigger gap and lower (better) rank.
+    var key = [-top.gap, top.rank, dayOrder_(ic.day)];
+    if (!bestKey || compareKey_(key, bestKey) < 0) {
+      bestKey = key;
+      bestMove = { destSlots: dest, coach: top.name };
+    }
+  }
+  return bestMove;
+}
+
+function compareKey_(a, b) {
+  for (var i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
+/**
+ * Build clusters of contiguous INACTIVE slots, grouped by (day, block,
+ * location). Mirror of `buildUnfilledClusters_` but on inactive cells.
+ */
+function buildInactiveClusters_(allSlots, state) {
+  var groups = {};
+  for (var i = 0; i < allSlots.length; i++) {
+    var slot = allSlots[i];
+    if (!slot || !slot.inactive || slot.block === 'מנהל') continue;
+    var asgn = state.assigned[slot.slotId];
+    if (asgn && !asgn.unfilled && !asgn.inactiveRehomed) continue;
+    var key = slot.day + '|' + slot.block + '|' + slot.location;
+    (groups[key] = groups[key] || []).push(slot);
+  }
+  var clusters = [];
+  for (var k in groups) {
+    if (!groups.hasOwnProperty(k)) continue;
+    var arr = groups[k];
+    arr.sort(function(a, b) { return a.startTime - b.startTime; });
+    var current = [arr[0]];
+    for (var j = 1; j < arr.length; j++) {
+      var gap = arr[j].startTime - arr[j - 1].endTime;
+      if (gap >= -0.01 && gap <= 0.5) {
+        current.push(arr[j]);
+      } else {
+        clusters.push({
+          day: current[0].day, block: current[0].block,
+          location: current[0].location, slots: current
+        });
+        current = [arr[j]];
+      }
+    }
+    clusters.push({
+      day: current[0].day, block: current[0].block,
+      location: current[0].location, slots: current
+    });
+  }
+  return clusters;
+}
+
+function applyDeadToHungryMove_(deadSlots, move, slots, masterMap, state, cluster) {
+  // Close every dead slot and activate the matched destination slots,
+  // copying class types over so the new slot inherits the moved class.
+  for (var i = 0; i < deadSlots.length; i++) {
+    var src = deadSlots[i];
+    var dst = move.destSlots[i];
+
+    dst.classType = src.classType || dst.classType || '';
+    dst.inactive = false;
+    src.inactive = true;
+    src.rehomedToSlotId = dst.slotId;
+    src.rehomedToCoach = move.coach;
+
+    state.assigned[src.slotId] = {
+      name: '',
+      unfilled: true,
+      inactiveRehomed: true,
+      note: 'הקלאסטר נסגר אוטומטית — האימון הועבר ל-' + dst.day + ' ' + dst.block + '.'
+    };
+    delete state.assigned[dst.slotId];
+    // Make the new active slot visible to subsequent global-review ops.
+    if (slots.indexOf(dst) < 0) slots.push(dst);
+    assignEmployee(move.coach, dst, masterMap, state);
+  }
+  var srcLabel = (CONFIG.locationNames[cluster.location] || cluster.location);
+  var dstLabel = (CONFIG.locationNames[move.destSlots[0].location] || move.destSlots[0].location);
+  state.warnings.push(
+    '🔎 שיפור גלובלי: ' + deadSlots.length + ' אימונים הועברו מ-' +
+    cluster.day + ' ' + cluster.block + ' ' + srcLabel +
+    ' (קלאסטר אדום לא בר-שיבוץ) ל-' + move.destSlots[0].day + ' ' + move.destSlots[0].block +
+    ' ' + dstLabel + ' — ' + move.coach + ' שובץ/ה שם.'
+  );
+}
+
+/**
+ * Cleanup operator: any (day, block, net) opening where a coach took
+ * SOME cells but others are red is a "partial cluster". Staff strongly
+ * prefer either a full green block or a fully red block — never mixed.
+ *
+ * For each partial cluster this op tries, in order:
+ *   1. **Upgrade**: find a coach who can cover the WHOLE cluster (under
+ *      target, not already in a same-day-opposite-block shift, etc.). If
+ *      found, displace the current partial coach(es), assign the new coach
+ *      to every cell.
+ *   2. **Rehome reds**: move the red cells out to inactive slots elsewhere
+ *      that extend an existing shift, turning the source cells into
+ *      "אין אימון" and growing some other coach's shift by the same count.
+ *      The cluster shrinks to a clean green block.
+ *   3. **Revert**: un-assign the partial coach(es). The cluster becomes
+ *      fully red — manual override needed. Guarded so we never strip a
+ *      Rank 1 coach or drop someone to 0 shifts.
+ *
+ * The partial-cluster term in `scoreWeek_` ensures each successful run
+ * lowers the global score, so the standard global-review loop accepts it.
+ */
+function opCleanPartialClusters_(slots, availability, masterMap, rules, state) {
+  if (rules && rules.clean_partial_clusters === false) return false;
+
+  var partials = buildPartialClusters_(slots, state);
+  // Process larger reds first — they have higher visual impact.
+  partials.sort(function(a, b) { return b.redSlots.length - a.redSlots.length; });
+
+  for (var p = 0; p < partials.length; p++) {
+    var partial = partials[p];
+
+    // 1) Try upgrade: full-coverage candidate to displace partial coach(es).
+    if (tryUpgradePartialCluster_(partial, availability, masterMap, rules, state)) {
+      return true;
+    }
+
+    // 2) Try rehome the red cells.
+    var rehomePlan = buildRehomePlanForUncoveredSlots_(
+      partial.redSlots, state, availability, masterMap, rules
+    );
+    if (rehomePlan) {
+      applyRehomePlan_(rehomePlan, masterMap, state);
+      state.warnings.push(
+        '🔎 שיפור גלובלי: ' + partial.day + ' ' + partial.block + ' ' +
+        (CONFIG.locationNames[partial.location] || partial.location) +
+        ': ' + partial.redSlots.length + ' תאים אדומים הומרו ל"אין אימון", ' +
+        'האימון הועבר למשמרת קיימת אחרת. הקלאסטר נשאר ירוק נקי.'
+      );
+      return true;
+    }
+
+    // 3) Revert: clear the partial coach(es), leave full cluster red.
+    if (rules && rules.revert_partial_when_no_rehome === false) continue;
+    var revertResult = tryRevertPartialAssignment_(
+      partial, state, masterMap, availability, rules
+    );
+    if (revertResult.reverted) {
+      state.warnings.push(
+        '🔎 שיפור גלובלי: ' + partial.day + ' ' + partial.block + ' ' +
+        (CONFIG.locationNames[partial.location] || partial.location) +
+        ': משמרת חלקית של ' + revertResult.coaches.join(', ') +
+        ' בוטלה — אין מאמן לכיסוי מלא ולא נמצא יעד להעברת התאים האדומים. ' +
+        'נדרש שיבוץ ידני לקלאסטר.'
+      );
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Build clusters of contiguous ACTIVE slots grouped by (day, block,
+ * location), each with a green/red split per slot. Returns only the
+ * clusters with at least one green AND at least one red (i.e. true
+ * partial clusters). Manager and inactive cells are skipped.
+ */
+function buildPartialClusters_(slots, state) {
+  var groups = {};
+  for (var i = 0; i < slots.length; i++) {
+    var slot = slots[i];
+    if (!slot || slot.inactive) continue;
+    if (slot.block === 'מנהל') continue;
+    var key = slot.day + '|' + slot.block + '|' + slot.location;
+    (groups[key] = groups[key] || []).push(slot);
+  }
+
+  var clusters = [];
+  var keys = Object.keys(groups);
+  for (var k = 0; k < keys.length; k++) {
+    var arr = groups[keys[k]];
+    arr.sort(function(a, b) { return a.startTime - b.startTime; });
+
+    var current = [arr[0]];
+    for (var j = 1; j < arr.length; j++) {
+      var gap = arr[j].startTime - arr[j - 1].endTime;
+      if (gap >= -0.01 && gap <= 0.5) {
+        current.push(arr[j]);
+      } else {
+        finalizePartialCluster_(current, state, clusters);
+        current = [arr[j]];
+      }
+    }
+    finalizePartialCluster_(current, state, clusters);
+  }
+
+  var out = [];
+  for (var c = 0; c < clusters.length; c++) {
+    if (clusters[c].greenSlots.length > 0 && clusters[c].redSlots.length > 0) {
+      out.push(clusters[c]);
+    }
+  }
+  return out;
+}
+
+function finalizePartialCluster_(slotsArr, state, outArr) {
+  if (!slotsArr || !slotsArr.length) return;
+  var green = [];
+  var red = [];
+  for (var i = 0; i < slotsArr.length; i++) {
+    var asgn = state.assigned[slotsArr[i].slotId];
+    if (!asgn || asgn.unfilled) {
+      red.push(slotsArr[i]);
+    } else if (asgn.managerSlot) {
+      return; // Manager cluster — never touch.
+    } else {
+      green.push(slotsArr[i]);
+    }
+  }
+  outArr.push({
+    day: slotsArr[0].day,
+    block: slotsArr[0].block,
+    location: slotsArr[0].location,
+    slots: slotsArr.slice(),
+    greenSlots: green,
+    redSlots: red
+  });
+}
+
+/**
+ * Step 1 of `opCleanPartialClusters_`: try to find a single under-target
+ * coach who can cover the ENTIRE partial cluster (every cell). If found,
+ * unassign the current partial coach(es) and assign the new coach.
+ * Returns true if applied.
+ */
+function tryUpgradePartialCluster_(partial, availability, masterMap, rules, state) {
+  var clusterSlots = partial.slots;
+  if (!clusterSlots || clusterSlots.length < MENTOR_MIN_SHIFT_TRAININGS_) return false;
+
+  // Collect the coaches currently in the cluster so we can exclude them
+  // (they're already taking part of it — not a real upgrade).
+  var currentCoaches = {};
+  for (var g = 0; g < partial.greenSlots.length; g++) {
+    var asgn = state.assigned[partial.greenSlots[g].slotId];
+    if (asgn && asgn.name) currentCoaches[asgn.name] = true;
+  }
+
+  var names = Object.keys(masterMap);
+  var ranked = [];
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    if (currentCoaches[name]) continue;
+    var emp = masterMap[name];
+    if (!emp) continue;
+    var target = getShiftTarget(name, masterMap, availability, rules);
+    var current = countAssignedShifts_(name, state);
+    if (target <= 0 || current >= target) continue;
+    if (!hasSubmittedAnyAvailability_(name, availability)) continue;
+    if (hasSameDayOppositeBlockShift_(name, clusterSlots[0].day, clusterSlots[0].block, state)) continue;
+
+    var canCoverAll = true;
+    for (var s = 0; s < clusterSlots.length; s++) {
+      var slot = clusterSlots[s];
+      if (!meetsLocationRestriction(emp, slot)) { canCoverAll = false; break; }
+      if (!isAvailableForSlot(name, slot, availability)) { canCoverAll = false; break; }
+      // `hasTimeConflict` looks at the candidate's OWN shifts only — the
+      // current partial coach(es) live in their own employeeShifts list,
+      // so they don't block us. We just need to avoid the candidate's
+      // existing shifts on the same day/block elsewhere.
+      if (hasTimeConflict(name, slot, null, state)) { canCoverAll = false; break; }
+      if (!coachEligibleForClassType_(name, slot.classType, masterMap, state._classTypeRules, rules)) {
+        canCoverAll = false; break;
+      }
+    }
+    if (!canCoverAll) continue;
+    if (!canTakeClusterRespectingExistingBlock_(name, clusterSlots, state)) continue;
+
+    ranked.push({
+      name: name,
+      rank: normalizeMentorRank_(emp.rank),
+      gap: target - current
+    });
+  }
+  if (!ranked.length) return false;
+
+  ranked.sort(function(a, b) {
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    if (a.gap !== b.gap) return b.gap - a.gap;
+    return a.name.localeCompare(b.name, 'he');
+  });
+
+  var winner = ranked[0].name;
+  // Evict current coaches from the green cells.
+  for (var g2 = 0; g2 < partial.greenSlots.length; g2++) {
+    unassignSlotFromCoach_(partial.greenSlots[g2], state);
+  }
+  // Assign the new coach to every cell.
+  for (var s2 = 0; s2 < clusterSlots.length; s2++) {
+    assignEmployee(winner, clusterSlots[s2], masterMap, state);
+  }
+  state.warnings.push(
+    '🔎 שיפור גלובלי: ' + partial.day + ' ' + partial.block + ' ' +
+    (CONFIG.locationNames[partial.location] || partial.location) +
+    ': קלאסטר חלקי שודרג — ' + winner + ' תופס את כל ' + clusterSlots.length +
+    ' התאים במקום משמרת חלקית.'
+  );
+  return true;
+}
+
+/**
+ * Step 3 of `opCleanPartialClusters_`: clear out the partial coach(es) on
+ * `partial.greenSlots`, marking every cell of the cluster as red so it
+ * waits for manual intervention. Refuses to revert when:
+ *   - Any partial coach is Rank 1 (must hit target, never strip).
+ *   - The revert would leave a Rank 3+ coach with zero shifts (violates
+ *     `enforce_min_shift_rank3plus`).
+ * Returns `{reverted, coaches}` — `reverted=false` if any guard fired.
+ */
+function tryRevertPartialAssignment_(partial, state, masterMap, availability, rules) {
+  var byCoach = {};
+  for (var i = 0; i < partial.greenSlots.length; i++) {
+    var slot = partial.greenSlots[i];
+    var asgn = state.assigned[slot.slotId];
+    if (!asgn || !asgn.name) continue;
+    (byCoach[asgn.name] = byCoach[asgn.name] || []).push(slot);
+  }
+  var coachNames = Object.keys(byCoach);
+  if (!coachNames.length) return { reverted: false };
+
+  var enforceMin = !rules || rules.enforce_min_shift_rank3plus !== false;
+  for (var cn = 0; cn < coachNames.length; cn++) {
+    var name = coachNames[cn];
+    var emp = masterMap[name];
+    if (!emp) return { reverted: false };
+    var rank = normalizeMentorRank_(emp.rank);
+    if (rank === CONFIG.ranks.best) return { reverted: false };
+    var totalShifts = countAssignedShifts_(name, state);
+    var removed = shiftWeightForTrainingCount_(byCoach[name].length);
+    if (enforceMin && rank >= 3 && totalShifts - removed < 0.99) {
+      return { reverted: false };
+    }
+  }
+
+  for (var cn2 = 0; cn2 < coachNames.length; cn2++) {
+    var n = coachNames[cn2];
+    var slotList = byCoach[n];
+    var slotIdSet = {};
+    for (var s = 0; s < slotList.length; s++) {
+      slotIdSet[slotList[s].slotId] = true;
+      state.assigned[slotList[s].slotId] = { name: '', unfilled: true };
+    }
+    if (state.employeeShifts[n]) {
+      state.employeeShifts[n] = state.employeeShifts[n].filter(function(sh) {
+        return !slotIdSet[sh.slotId];
+      });
+    }
+  }
+  return { reverted: true, coaches: coachNames };
+}
+
+/**
+ * Drop the slot's current assignment from the state. Used by the partial-
+ * cluster upgrade path to evict the current coach before assigning the
+ * full-coverage replacement.
+ */
+function unassignSlotFromCoach_(slot, state) {
+  var asgn = state.assigned[slot.slotId];
+  if (!asgn || !asgn.name) return;
+  var name = asgn.name;
+  if (state.employeeShifts[name]) {
+    state.employeeShifts[name] = state.employeeShifts[name].filter(function(sh) {
+      return sh.slotId !== slot.slotId;
+    });
+  }
+  state.assigned[slot.slotId] = { name: '', unfilled: true };
+}
+
+function rankActualClusterCandidates_(clusterSlots, availability, masterMap, rules, state) {
+  var out = [];
+  if (!clusterSlots || !clusterSlots.length) return out;
+  var names = Object.keys(masterMap);
+  var day = clusterSlots[0].day;
+  var block = clusterSlots[0].block;
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    var emp = masterMap[name];
+    var target = getShiftTarget(name, masterMap, availability, rules);
+    var current = countAssignedShifts_(name, state);
+    if (target <= 0 || current >= target) continue;
+    if (hasSameDayOppositeBlockShift_(name, day, block, state)) continue;
+    if (!canTakeClusterRespectingExistingBlock_(name, clusterSlots, state)) continue;
+
+    var ok = true;
+    for (var s = 0; s < clusterSlots.length; s++) {
+      var slot = clusterSlots[s];
+      if (!isAvailableForSlot(name, slot, availability)) { ok = false; break; }
+      if (!meetsLocationRestriction(emp, slot)) { ok = false; break; }
+      if (hasTimeConflict(name, slot, null, state)) { ok = false; break; }
+      if (!coachEligibleForClassType_(name, slot.classType, masterMap, state._classTypeRules, rules)) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+    out.push({
+      name: name,
+      rank: normalizeMentorRank_(emp.rank),
+      gap: target - current
+    });
+  }
+
+  out.sort(function(a, b) {
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    if (a.gap !== b.gap) return b.gap - a.gap;
+    return a.name.localeCompare(b.name, 'he');
+  });
+  return out;
+}
+
+function canTakeClusterRespectingExistingBlock_(name, clusterSlots, state) {
+  var existing = state.employeeShifts[name] || [];
+  var sameBlock = [];
+  var first = clusterSlots[0];
+  for (var i = 0; i < existing.length; i++) {
+    if (existing[i].day === first.day && existing[i].block === first.block) sameBlock.push(existing[i]);
+  }
+  if (!sameBlock.length) return clusterSlots.length >= MENTOR_MIN_SHIFT_TRAININGS_;
+
+  sameBlock.sort(function(a, b) { return a.startTime - b.startTime; });
+  for (var s = 0; s < sameBlock.length; s++) {
+    if (sameBlock[s].location !== first.location) return false;
+  }
+  var existingStart = sameBlock[0].startTime;
+  var existingEnd = sameBlock[sameBlock.length - 1].endTime;
+  var clusterStart = clusterSlots[0].startTime;
+  var clusterEnd = clusterSlots[clusterSlots.length - 1].endTime;
+  return Math.abs(existingEnd - clusterStart) <= 0.5 ||
+    Math.abs(clusterEnd - existingStart) <= 0.5;
 }
 
 function rebuildStateFromAssignments_(assignments, slots, masterMap) {
@@ -1368,7 +3017,7 @@ function getEligibleCandidates(slot, availability, masterMap, rules, state) {
     if (hasTimeConflict(name, slot, null, state)) continue;
     if (!coachEligibleForClassType_(name, slot.classType, masterMap, classTypeRules, rules)) continue;
 
-    var currentCount = (state.employeeShifts[name] || []).length;
+    var currentCount = countAssignedShifts_(name, state);
     var maxShifts = getEmployeeMaxShifts_(rules);
     if (currentCount >= maxShifts) continue;
 
@@ -1581,17 +3230,112 @@ function suggestForUnfilled(slots, availability, masterMap, rules, state, optimi
     );
   }
 
+  absorbSingletonUnfilledSlots_(slots, availability, masterMap, rules, state);
+
   // Anything still unfilled after the cluster pass: emit a per-slot warning
   // so the staff sees exactly which cells need a manual call.
   for (var s = 0; s < slots.length; s++) {
     var slot = slots[s];
     var asgn = state.assigned[slot.slotId];
     if (!asgn || !asgn.unfilled) continue;
+    if (asgn.singletonWarning) continue;
     state.warnings.push(
       formatSlotHebrew(slot.slotId) + ' — לא נמצא עובד זמין למשמרת הזו.\n' +
       '   💡 כל העובדים כבר תפוסים, הגיעו למכסה, או לא סימנו זמינות.'
     );
   }
+}
+
+function absorbSingletonUnfilledSlots_(slots, availability, masterMap, rules, state) {
+  var clusters = buildUnfilledClusters_(slots, state);
+  for (var c = 0; c < clusters.length; c++) {
+    var cluster = clusters[c];
+    if (!cluster || cluster.slots.length !== 1) continue;
+    var slot = cluster.slots[0];
+    var extension = findAdjacentExtensionCandidate_(slot, slots, availability, masterMap, rules, state);
+    if (extension) {
+      assignSingletonExtensionSuggestion_(slot, extension.name, masterMap, state);
+    } else {
+      var asgn = state.assigned[slot.slotId];
+      if (asgn) {
+        asgn.singletonWarning = true;
+        asgn.note = 'תא בודד אדום: אין מאמן סמוך זמין להאריך משמרת. צריך פנייה ידנית.';
+      }
+      state.warnings.push(
+        formatSlotHebrew(slot.slotId) +
+        ' — תא בודד אדום: אין מאמן סמוך זמין להאריך משמרת. צריך פנייה ידנית.'
+      );
+    }
+  }
+}
+
+function findAdjacentExtensionCandidate_(slot, slots, availability, masterMap, rules, state) {
+  var neighbors = [];
+  for (var i = 0; i < slots.length; i++) {
+    var other = slots[i];
+    if (other.slotId === slot.slotId) continue;
+    if (other.day !== slot.day || other.block !== slot.block || other.location !== slot.location) continue;
+    var adjacentBefore = Math.abs(other.endTime - slot.startTime) <= 0.5;
+    var adjacentAfter = Math.abs(slot.endTime - other.startTime) <= 0.5;
+    if (!adjacentBefore && !adjacentAfter) continue;
+    var asgn = state.assigned[other.slotId];
+    if (!asgn || !asgn.name || asgn.unfilled || asgn.managerSlot) continue;
+    neighbors.push({
+      name: asgn.name,
+      distance: Math.min(Math.abs(other.endTime - slot.startTime), Math.abs(slot.endTime - other.startTime))
+    });
+  }
+
+  neighbors.sort(function(a, b) {
+    if (a.distance !== b.distance) return a.distance - b.distance;
+    var aGap = getShiftTarget(a.name, masterMap, availability, rules) - countAssignedShifts_(a.name, state);
+    var bGap = getShiftTarget(b.name, masterMap, availability, rules) - countAssignedShifts_(b.name, state);
+    if (aGap !== bGap) return bGap - aGap;
+    return a.name.localeCompare(b.name, 'he');
+  });
+
+  var classTypeRules = state && state._classTypeRules;
+  for (var n = 0; n < neighbors.length; n++) {
+    var name = neighbors[n].name;
+    var emp = masterMap[name];
+    if (!emp) continue;
+    var dayRanges = availability && availability[name] ? availability[name][slot.day] : null;
+    if (!dayRanges || !coachHasBlockAvailability_(dayRanges, slot.block)) continue;
+    if (!isAvailableForSlot(name, slot, availability)) continue;
+    if (!meetsLocationRestriction(emp, slot)) continue;
+    if (!coachEligibleForClassType_(name, slot.classType, masterMap, classTypeRules, rules)) continue;
+    return neighbors[n];
+  }
+  return null;
+}
+
+function assignSingletonExtensionSuggestion_(slot, name, masterMap, state) {
+  var emp = masterMap[name];
+  var note = '💙 הצעת המערכת להארכת משמרת קיימת\n\n' +
+    name + ' כבר משובץ/ת באותה רשת ובאותו חצי יום, והזמינות שלו/ה מכסה גם את ' +
+    formatHourLabelHe_(slot.startTime) + '–' + formatHourLabelHe_(slot.endTime) + '.\n' +
+    'צריך לאשר מול המאמן/ת.';
+
+  state.assigned[slot.slotId] = {
+    name: name,
+    rank: emp ? emp.rank : 0,
+    unfilled: false,
+    suggested: true,
+    note: note
+  };
+  if (!state.employeeShifts[name]) state.employeeShifts[name] = [];
+  state.employeeShifts[name].push({
+    slotId: slot.slotId,
+    location: slot.location,
+    day: slot.day,
+    block: slot.block,
+    startTime: slot.startTime,
+    endTime: slot.endTime,
+    durationHours: slot.durationHours
+  });
+  state.warnings.push(
+    formatSlotHebrew(slot.slotId) + ' — 💙 הצעה להאריך את המשמרת של ' + name + '.'
+  );
 }
 
 /**
@@ -1603,6 +3347,7 @@ function buildUnfilledClusters_(slots, state) {
   var groups = {};
   for (var i = 0; i < slots.length; i++) {
     var slot = slots[i];
+    if (slot.inactive) continue;
     var asgn = state.assigned[slot.slotId];
     if (!asgn || !asgn.unfilled) continue;
     var key = slot.day + '|' + slot.block + '|' + slot.location;
@@ -1680,6 +3425,16 @@ function rankClusterSuggestionCandidates_(cluster, empNames, masterMap, rules, s
     if (normalizeMentorRank_(emp.rank) >= CONFIG.ranks.max &&
         !hasSubmittedAnyAvailability_(name, availability)) continue;
 
+    // Respect "לא זמין": never suggest a coach for a day they explicitly
+    // marked as not available. Suggestions are still allowed on days they
+    // submitted *some* range, even outside that range (e.g. fill 11:00–12:00
+    // for a coach who submitted 7:00–11:00 on the same day).
+    var dayRanges = availability && availability[name]
+      ? availability[name][cluster.day]
+      : null;
+    if (!dayRanges || dayRanges.length === 0) continue;
+    if (!coachHasBlockAvailability_(dayRanges, cluster.block)) continue;
+
     var existing = state.employeeShifts[name] || [];
     var alreadyInBlock = false;
     for (var s = 0; s < existing.length; s++) {
@@ -1690,12 +3445,16 @@ function rankClusterSuggestionCandidates_(cluster, empNames, masterMap, rules, s
     }
     if (alreadyInBlock) continue;
 
-    var currentCount = existing.length;
+    // Hard: never suggest morning+evening on the same calendar day.
+    if (hasSameDayOppositeBlockShift_(name, cluster.day, cluster.block, state)) continue;
+
+    var currentCount = countAssignedShifts_(name, state);
     var maxShifts = getEmployeeMaxShifts_(rules);
-    if (currentCount + cluster.slots.length > maxShifts) continue;
 
     var target = getShiftTarget(name, masterMap, availability, rules);
     if (target <= 0) continue;
+    if (currentCount >= target) continue; // Do not suggest coaches beyond their target.
+    if (currentCount + 1 > maxShifts) continue;
 
     var eligibleAll = true;
     var conflict = false;

@@ -53,14 +53,15 @@ var CONFIG = {
   weekendDays: ['שישי', 'שבת'],
 
   colors: {
-    headerBg:    '#2E7D6B',
-    headerFont:  '#FFFFFF',
-    ok:          '#C6EFCE',
-    unfilled:    '#FFC7CE',
-    suggested:   '#BDD7EE',
-    overlap:     '#FFB74D',
-    summaryRow:  '#E8E8E8',
-    normal:      '#FFFFFF'
+    headerBg:           '#2E7D6B',
+    headerFont:         '#FFFFFF',
+    ok:                 '#C6EFCE',
+    unfilled:           '#FFC7CE',
+    suggested:          '#BDD7EE',
+    overlap:            '#FFB74D',
+    outOfAvailability:  '#E6B800',
+    summaryRow:         '#E8E8E8',
+    normal:             '#FFFFFF'
   },
 
   availabilityMarker: 'V',

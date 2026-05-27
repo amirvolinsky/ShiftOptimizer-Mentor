@@ -155,6 +155,70 @@ function writeSchedule(result, slots, masterMap, availability, notes, distributi
   sheet.setRightToLeft(true);
   applyUnifiedScheduleLayout_(sheet, 1, lastDataRow, buildOrderedTimeGrid_(slots));
   centerAllScheduleCells_(sheet);
+  writeOptimizerLog_(ss, result);
+}
+
+function writeOptimizerLog_(ss, result) {
+  if (!ss || !result) return;
+  var sheet = ss.getSheetByName('OptimizerLog');
+  if (!sheet) sheet = ss.insertSheet('OptimizerLog');
+  sheet.clear();
+
+  var rows = [['Section', 'Day', 'Block', 'Pass/Iter', 'Name/Op', 'Rank', 'Length', 'Gap', 'Placed', 'Reason/Score']];
+  var passLog = result.passLog || [];
+  for (var p = 0; p < passLog.length; p++) {
+    var pass = passLog[p];
+    var entries = pass.entries || [];
+    if (!entries.length) {
+      rows.push(['pass', pass.day, pass.block, pass.pass, '', '', '', '', '', '']);
+      continue;
+    }
+    for (var e = 0; e < entries.length; e++) {
+      var item = entries[e];
+      rows.push([
+        'pass',
+        pass.day,
+        pass.block,
+        pass.pass,
+        item.name,
+        item.rank,
+        item.length,
+        item.gap,
+        item.placed ? 'TRUE' : 'FALSE',
+        item.reason || ''
+      ]);
+    }
+  }
+
+  var reviewLog = result.globalReviewLog || [];
+  for (var r = 0; r < reviewLog.length; r++) {
+    var review = reviewLog[r];
+    var score = review.score || {};
+    rows.push([
+      'global',
+      '',
+      '',
+      review.iter,
+      review.op,
+      '',
+      '',
+      '',
+      '',
+      'total=' + score.total +
+        ', red=' + score.redCells +
+        ', r1=' + score.rank1Under +
+        ', r2=' + score.rank2Under +
+        ', r3zero=' + score.rank3PlusZero +
+        ', gap=' + score.sumGap
+    ]);
+  }
+
+  if (rows.length > 1) {
+    sheet.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
+    sheet.setFrozenRows(1);
+    sheet.autoResizeColumns(1, rows[0].length);
+  }
+  sheet.hideSheet();
 }
 
 /** Center-align horizontally + vertically across every used cell on the schedule sheet. */
@@ -337,16 +401,32 @@ function writeScheduleAssignmentCell_(cell, slot, asgn, masterMap, availability,
   cell.setValue(asgn.name);
 
   var consecutiveNote = consecutiveShifts && consecutiveShifts[slot.slotId];
+  // Detect "coach is here but didn't submit availability for this slot".
+  // True for:
+  //   - Phase 3 system suggestions (blue right after optimize, asgn.suggested)
+  //   - Manual edits placing a coach outside their availability (after refresh
+  //     we no longer have asgn.suggested, so detect via availability directly)
+  var outOfAvailability = false;
+  if (asgn.name && availability && !asgn.managerSlot) {
+    outOfAvailability = !isAvailableForSlot(asgn.name, slot, availability);
+  }
+
   var bgColor = CONFIG.colors.ok;
   if (consecutiveNote) {
     bgColor = CONFIG.colors.overlap;
   } else if (asgn.suggested) {
     bgColor = CONFIG.colors.suggested;
+  } else if (outOfAvailability) {
+    bgColor = CONFIG.colors.outOfAvailability;
   }
   cell.setBackground(bgColor);
 
   var noteText = buildOverrideNote_(slot, asgn, masterMap, availability, assignments);
   if (consecutiveNote) noteText = '🟠 ' + consecutiveNote + '\n\n' + noteText;
+  if (outOfAvailability && !asgn.suggested) {
+    noteText = '🟡 שיבוץ ידני מחוץ לזמינות: ' + asgn.name +
+      ' לא סימן/ה זמינות למשמרת הזו בטופס. כדאי לתאם איתו/ה לפני שמפרסמים.\n\n' + noteText;
+  }
   cell.setNote(noteText);
 
   setOverrideDropdown_(cell, slot, masterMap);
@@ -609,9 +689,18 @@ function summarizeBlockSlotIds_(slotIds, slotById) {
 //  Fairness table
 // ============================================================
 
+function nearlyEqualShiftCount_(a, b) {
+  return Math.abs((a || 0) - (b || 0)) < 0.001;
+}
+
+function formatShiftCountDisplay_(count) {
+  var n = Number(count || 0);
+  return nearlyEqualShiftCount_(n, Math.round(n)) ? Math.round(n) : n.toFixed(1);
+}
+
 function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slots, startRow, notes) {
   notes = notes || {};
-  var headers = ['שם', 'דרגה', 'יעד', 'ימים זמין', 'זמין השבוע', 'קיבל', 'בוקר/ערב', 'הערות', 'סטטוס'];
+  var headers = ['שם', 'דרגה', 'יעד', 'תקרה לפי זמינות', 'ימים זמין', 'זמין השבוע', 'קיבל', 'בוקר/ערב', 'הערות', 'סטטוס'];
   for (var h = 0; h < headers.length; h++) {
     sheet.getRange(startRow, h + 1).setValue(headers[h]);
   }
@@ -634,19 +723,34 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
     var received = stat.shiftsCount || 0;
     var availableCount = countAvailableSlots_(names[i], availability, slots, emp);
     var availableDays = countAvailableDays_(names[i], availability);
+    var structuralMax = computeStructuralMaxWeightedShifts_(names[i], availability, slots, masterMap);
+    var targetUnreachable = formTarget > 0 &&
+      structuralMax + 0.0001 < formTarget &&
+      availableDays > 0;
+    // Effective target = what the algorithm actually chases. When the form
+    // target exceeds the structural ceiling, the cap kicks in (= floor of the
+    // ceiling, minimum 1). All status phrases compare `received` against THIS
+    // number so capped coaches still get the normal "ביעד / כמעט ביעד / מתחת
+    // ליעד" semantics instead of always landing in "מתחת לתקרה".
+    var effectiveTarget = targetUnreachable
+      ? Math.max(1, Math.floor(structuralMax))
+      : formTarget;
 
     var satisfaction = '';
     if (availableDays === 0) {
       satisfaction = 'לא הגיש זמינות';
-    } else if (formTarget > 0 && received > formTarget) {
+    } else if (effectiveTarget > 0 && received > effectiveTarget &&
+               !nearlyEqualShiftCount_(received, effectiveTarget)) {
       satisfaction = 'מעל היעד';
-    } else if (formTarget > 0 && received === formTarget) {
-      satisfaction = 'ביעד =)';
-    } else if (formTarget > 0 && received === formTarget - 1) {
+    } else if (effectiveTarget > 0 && nearlyEqualShiftCount_(received, effectiveTarget)) {
+      // Reaching a capped target is "at availability ceiling" (celebratory
+      // variant of ביעד); reaching a normal target is just "ביעד".
+      satisfaction = targetUnreachable ? 'תקרת זמינות' : 'ביעד =)';
+    } else if (effectiveTarget > 0 && received >= effectiveTarget - 1) {
       satisfaction = 'כמעט ביעד';
-    } else if (formTarget > 0 && received < formTarget - 1) {
+    } else if (effectiveTarget > 0 && received < effectiveTarget - 1) {
       satisfaction = 'מתחת ליעד';
-    } else if (formTarget === 0 && availableDays > 0) {
+    } else if (effectiveTarget === 0 && availableDays > 0) {
       satisfaction = '';
     } else {
       satisfaction = 'קיבל פחות =(';
@@ -654,20 +758,46 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
 
     var dist = getBlockDistribution_(names[i], employeeStats);
     var targetDisplay = formTarget > 0 ? String(formTarget) : '';
+    var maxDisplay = availableDays > 0 ? formatShiftCountDisplay_(structuralMax) : '';
 
     sheet.getRange(row, 1).setValue(stat.name);
     sheet.getRange(row, 2).setValue(rankToHebrew(stat.rank));
     sheet.getRange(row, 3).setValue(targetDisplay);
-    sheet.getRange(row, 4).setValue(availableDays);
-    sheet.getRange(row, 5).setValue(availableCount);
-    sheet.getRange(row, 6).setValue(received);
-    sheet.getRange(row, 7).setValue(dist);
-    sheet.getRange(row, 8).setValue(notes[stat.name] || '');
-    sheet.getRange(row, 9).setValue(satisfaction);
+    sheet.getRange(row, 4).setValue(maxDisplay);
+    sheet.getRange(row, 5).setValue(availableDays);
+    sheet.getRange(row, 6).setValue(availableCount);
+    sheet.getRange(row, 7).setValue(formatShiftCountDisplay_(received));
+    sheet.getRange(row, 8).setValue(dist);
+    sheet.getRange(row, 9).setValue(notes[stat.name] || '');
+    sheet.getRange(row, 10).setValue(satisfaction);
 
-    var satCell = sheet.getRange(row, 9);
+    if (targetUnreachable) {
+      var effectiveCapped = Math.max(1, Math.floor(structuralMax));
+      sheet.getRange(row, 4)
+        .setBackground('#FFE2E2')
+        .setFontColor('#9C0006')
+        .setFontWeight('bold');
+      sheet.getRange(row, 4).setNote(
+        'יעד שהגיש (' + formTarget + ') גדול מהמקסימום שאפשר להגיע אליו לפי הזמינות שמילא (' +
+        formatShiftCountDisplay_(structuralMax) + '). ' +
+        'האלגוריתם משתמש ביעד אפקטיבי = ' + effectiveCapped + ' ' +
+        '(לא רודף אחרי המספר המקורי כדי לא ליצור החלפות שמייצרות תאים אדומים).'
+      );
+      sheet.getRange(row, 3)
+        .setBackground('#FFF4E5')
+        .setFontColor('#7A4F00');
+      sheet.getRange(row, 3).setNote(
+        'ביקש בטופס: ' + formTarget + '.\n' +
+        'יעד אפקטיבי שהאלגוריתם רודף אחריו: ' + effectiveCapped + ' (= תקרת הזמינות).'
+      );
+    }
+
+    var satCell = sheet.getRange(row, 10);
     if (satisfaction === 'ביעד =)') {
       satCell.setBackground('#C6EFCE').setFontColor('#006100');
+    } else if (satisfaction === 'תקרת זמינות') {
+      satCell.setBackground('#D5E8D4').setFontColor('#2E7D6B');
+      satCell.setNote('המאמן הגיע למקסימום שאפשר לפי הזמינות שמילא. היעד שהגיש גבוה מהתקרה.');
     } else if (satisfaction === 'מעל היעד' || satisfaction === 'כמעט ביעד') {
       satCell.setBackground('#FFEB9C').setFontColor('#9C6500');
     } else if (satisfaction === 'מתחת ליעד') {
@@ -695,6 +825,10 @@ function writeFairnessTable_(sheet, employeeStats, masterMap, availability, slot
   sheet.getRange(row, 1).setValue('🔵');
   sheet.getRange(row, 2).setValue('הצעת המערכת — שובץ מחוץ לחלון הזמינות שהגיש. דורש תיאום מולו. הסיבה לבחירה מופיעה בהערה.');
   sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.suggested);
+  row++;
+  sheet.getRange(row, 1).setValue('🟡');
+  sheet.getRange(row, 2).setValue('שיבוץ ידני מחוץ לזמינות — מאמן ששובץ ידנית למשמרת שלא סימן עליה זמינות בטופס. כדאי לתאם איתו לפני הפרסום.');
+  sheet.getRange(row, 1, 1, 2).setBackground(CONFIG.colors.outOfAvailability);
   row++;
   sheet.getRange(row, 1).setValue('🟠');
   sheet.getRange(row, 2).setValue(
@@ -906,9 +1040,9 @@ function getBlockDistribution_(name, employeeStats) {
   var e = stat.eveningCount || 0;
   var other = stat.shiftsCount - m - e;
   var parts = [];
-  if (m > 0) parts.push(m + ' בוקר');
-  if (e > 0) parts.push(e + ' ערב');
-  if (other > 0) parts.push(other + ' אמצע');
+  if (m > 0) parts.push(formatShiftCountDisplay_(m) + ' בוקר');
+  if (e > 0) parts.push(formatShiftCountDisplay_(e) + ' ערב');
+  if (other > 0) parts.push(formatShiftCountDisplay_(other) + ' אמצע');
   return parts.join(' / ') || '0';
 }
 
@@ -1237,6 +1371,9 @@ function logHistoryFromSheet_() {
   // computing the snapshot.
   setShiftTargetFormCache_(responseData.weeklyTargets || {});
   var slots = loadShiftTemplates();
+  // Match optimizeWeek's effective-target cap so the history snapshot
+  // records the same numbers the algorithm worked against.
+  setEffectiveShiftTargetCache_(slots, availability, masterMap, loadRules());
   var sheetData = sheet.getDataRange().getValues();
 
   var empStats = {};
@@ -2027,7 +2164,15 @@ function readUnifiedScheduleAssignments_(sheet, timeGrid, slotIndex, masterMap, 
         if (!slot) continue;
 
         var cellValue = String(sheet.getRange(row, col).getDisplayValue()).trim();
-        if (!cellValue) continue;
+        // Empty active cell during refresh = the staff cleared a name. Treat
+        // it as unfilled so it re-renders as a red ⚠ (with the override
+        // dropdown), instead of being left blank and unactionable.
+        if (!cellValue) {
+          if (!slot.inactive) {
+            assignments[slot.slotId] = { unfilled: true };
+          }
+          continue;
+        }
 
         if (cellValue === SCHEDULE_INACTIVE_LABEL_HE_) {
           // Capacity slot marked "no class this week" — mark inactive and
@@ -2115,6 +2260,9 @@ function refreshScheduleFromSheet_() {
   var notes = responseData.notes || {};
   // Refresh path also needs the form-target cache for getShiftTarget.
   setShiftTargetFormCache_(responseData.weeklyTargets || {});
+  // Apply the same structural cap on getShiftTarget that optimizeWeek uses,
+  // so manual-edit recompute and fairness numbers match the original run.
+  setEffectiveShiftTargetCache_(slots, availability, masterMap, loadRules());
   var data = sheet.getDataRange().getValues();
   var slotMap = buildSlotMap_(slots);
   var warnings = [];
@@ -2159,15 +2307,30 @@ function refreshScheduleFromSheet_() {
       shiftTarget: getShiftTarget(allNames[i], masterMap, availability)
     };
   }
+  var slotById = {};
+  for (var ss = 0; ss < slots.length; ss++) slotById[slots[ss].slotId] = slots[ss];
+  var trainingsByCoachShift = {};
   var asgnKeys = Object.keys(currentAssignments);
   for (var i = 0; i < asgnKeys.length; i++) {
     var a = currentAssignments[asgnKeys[i]];
     if (!a || !a.name || !empStats[a.name]) continue;
-    empStats[a.name].shiftsCount++;
-    var parts = asgnKeys[i].split('_');
-    var block = parts[2] || '';
-    if (block === 'בוקר') empStats[a.name].morningCount++;
-    else if (block === 'ערב') empStats[a.name].eveningCount++;
+    var slot = slotById[asgnKeys[i]];
+    if (!slot) continue;
+    var shiftKey = a.name + '|' + slot.day + '|' + slot.block;
+    trainingsByCoachShift[shiftKey] = trainingsByCoachShift[shiftKey] || {
+      name: a.name,
+      block: slot.block,
+      count: 0
+    };
+    trainingsByCoachShift[shiftKey].count++;
+  }
+  var shiftKeys = Object.keys(trainingsByCoachShift);
+  for (var sk = 0; sk < shiftKeys.length; sk++) {
+    var item = trainingsByCoachShift[shiftKeys[sk]];
+    var weight = shiftWeightForTrainingCount_(item.count);
+    empStats[item.name].shiftsCount += weight;
+    if (item.block === 'בוקר') empStats[item.name].morningCount += weight;
+    else if (item.block === 'ערב') empStats[item.name].eveningCount += weight;
   }
 
   var fairnessHeaderRow = -1;
