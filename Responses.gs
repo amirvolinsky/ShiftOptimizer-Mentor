@@ -735,6 +735,81 @@ var AVAIL_SUMMARY_SHIFTS_HEADER_ = 'משמרות זמינות';
 var AVAIL_SUMMARY_TOTAL_LABEL_ = 'סה"כ';
 
 /**
+ * Recompute the hours/shifts summary columns on the LIVE Form Responses
+ * sheet, regardless of CONFIG.useDemoResponses. Used by the onFormSubmit
+ * trigger and the menu refresh action so the staff sees totals without
+ * having to wait for the next optimizer run.
+ */
+function refreshLiveResponsesSummary_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var live = ss.getSheetByName(getLiveResponsesSheetName_());
+  if (!live || live.getLastRow() < 2) return false;
+  var parsed = loadAvailability(live);
+  updateAvailabilitySummary_(live, parsed.availability);
+  return true;
+}
+
+/**
+ * Installable onFormSubmit trigger handler. Re-runs the live summary
+ * computation each time a coach submits the Google Form so the totals
+ * stay in sync with the latest row.
+ */
+function onMentorFormSubmit_(_e) {
+  try {
+    refreshLiveResponsesSummary_();
+  } catch (err) {
+    Logger.log('onMentorFormSubmit_ failed: ' + err + (err && err.stack ? '\n' + err.stack : ''));
+  }
+}
+
+/**
+ * Idempotent — creates a single spreadsheet-scoped onFormSubmit trigger
+ * pointing at onMentorFormSubmit_ if one doesn't already exist. Safe to
+ * call repeatedly from onOpen / menu actions.
+ */
+function ensureMentorFormSubmitTrigger_() {
+  var handler = 'onMentorFormSubmit_';
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    var tr = triggers[i];
+    if (tr.getHandlerFunction() === handler && tr.getEventType() === ScriptApp.EventType.ON_FORM_SUBMIT) {
+      return;
+    }
+  }
+  ScriptApp.newTrigger(handler)
+    .forSpreadsheet(SpreadsheetApp.getActive())
+    .onFormSubmit()
+    .create();
+}
+
+/**
+ * Public menu entry (no confirm dialog — this is read-only / additive).
+ * Name must NOT end with "_" so the Sheets menu can call it directly.
+ */
+function refreshLiveResponsesSummary() {
+  return refreshLiveResponsesSummaryRun_();
+}
+
+/** Menu entry: install the trigger (if missing) and recompute now. */
+function refreshLiveResponsesSummaryRun_() {
+  try {
+    ensureMentorFormSubmitTrigger_();
+  } catch (ignore) {}
+  var changed = refreshLiveResponsesSummary_();
+  if (!changed) {
+    return menuActionSuccess_(
+      'ℹ️ אין תשובות לסיכום',
+      'גיליון "' + getLiveResponsesSheetName_() + '" עדיין ריק — שלחו לפחות תשובה אחת בטופס.'
+    );
+  }
+  return menuActionSuccess_(
+    '✅ סיכום זמינות עודכן',
+    'עמודות "' + AVAIL_SUMMARY_HOURS_HEADER_ + '" / "' + AVAIL_SUMMARY_SHIFTS_HEADER_ +
+      '" + שורת סה"כ עודכנו ב-"' + getLiveResponsesSheetName_() + '".'
+  );
+}
+
+/**
  * Append/refresh two summary columns at the right edge of a responses sheet:
  *   • "שעות זמינות"   — total submitted availability hours per coach
  *   • "משמרות זמינות" — distinct (day, morning/evening) shifts the coach
@@ -841,11 +916,36 @@ function computeAvailabilityStats_(coachAvail) {
         hours += 5;
       }
     } else {
-      for (var rr = 0; rr < ranges.length; rr++) {
-        var span = ranges[rr].endHour - ranges[rr].startHour;
-        if (span > 0) hours += span;
-        var blockKey = ranges[rr].startHour < 12 ? 'בוקר' : 'ערב';
+      // Ranges can overlap heavily when coaches tick multiple checkbox options.
+      // For summary hours we need the union (merge overlaps/touches) rather than
+      // summing each span independently.
+      var sorted = ranges.slice().sort(function(a, b) {
+        if (a.startHour !== b.startHour) return a.startHour - b.startHour;
+        return a.endHour - b.endHour;
+      });
+      var curStart = null;
+      var curEnd = null;
+      for (var rr = 0; rr < sorted.length; rr++) {
+        var r = sorted[rr];
+        if (!r) continue;
+        if (!(r.endHour > r.startHour)) continue;
+
+        if (curStart === null) {
+          curStart = r.startHour;
+          curEnd = r.endHour;
+        } else if (r.startHour <= curEnd) {
+          if (r.endHour > curEnd) curEnd = r.endHour;
+        } else {
+          hours += curEnd - curStart;
+          curStart = r.startHour;
+          curEnd = r.endHour;
+        }
+
+        var blockKey = r.startHour < 12 ? 'בוקר' : 'ערב';
         seenShifts[day + '|' + blockKey] = true;
+      }
+      if (curStart !== null) {
+        hours += curEnd - curStart;
       }
     }
   }

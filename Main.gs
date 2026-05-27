@@ -158,6 +158,8 @@ function runMenuConfirmed(actionId) {
       return updateWeeklyClassesRun_();
     case 'syncMentorGoogleForm':
       return syncMentorGoogleFormRun_();
+    case 'refreshLiveResponsesSummary':
+      return refreshLiveResponsesSummaryRun_();
     default:
       throw new Error('פעולה לא ידועה');
   }
@@ -179,6 +181,7 @@ function onOpen() {
         .addItem('📅 עדכן תבנית אימונים', 'updateTrainingTemplate')
         .addItem('📊 כמויות אימונים שבועיות', 'updateWeeklyClasses')
         .addItem('📝 בנה מחדש טופס Google', 'syncMentorGoogleForm')
+        .addItem('🔢 רענן סיכום זמינות בטופס', 'refreshLiveResponsesSummary')
         .addItem('🔧 הכן טאב תשובות דמו', 'setupDemoResponsesTab')
         .addItem('🧪 טען זמינות דמו לבדיקה', 'loadFakeMentorResponses')
     )
@@ -188,6 +191,12 @@ function onOpen() {
     ensureSpreadsheetOpenGuideTrigger_();
   } catch (ignore) {
     // Simple onOpen may lack permission to create triggers; showGuide / setupTables will retry.
+  }
+
+  try {
+    ensureMentorFormSubmitTrigger_();
+  } catch (ignore) {
+    // Same auth caveat as guide trigger; menu refresh action installs it later if needed.
   }
 }
 

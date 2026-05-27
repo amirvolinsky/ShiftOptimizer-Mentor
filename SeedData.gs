@@ -435,12 +435,13 @@ var FAKE_MENTOR_ROSTER_ = [
  * Form: one section per day; one question (checkbox) with all time-range options.
  */
 function buildDefaultMentorFormHeaders_() {
-  var headers = ['Timestamp', 'שם מאמן', MENTOR_WEEKLY_TARGET_HEADER_];
+  var headers = ['Timestamp', 'שם מאמן'];
   for (var d = 0; d < MENTOR_WEEKDAYS_HE_.length; d++) {
     var day = MENTOR_WEEKDAYS_HE_[d];
     headers.push(mentorDayBilingualLabel_(day));
     headers.push(mentorDayNoteHeader_(day));
   }
+  headers.push(MENTOR_WEEKLY_TARGET_HEADER_);
   return headers;
 }
 
@@ -526,16 +527,28 @@ var MENTOR_MORNING_LABELS_ = [
   '9:00 עד 12:00',
   '10:00 עד 12:00'
 ];
+/**
+ * Evening availability options. Mirrors the morning structure (every
+ * start×end pair with at least a 2-training span) over the evening
+ * breakpoints 16, 17, 18, 19, 20:15, 21:15.
+ *
+ * Note on 19:00 vs 19:15: the 4th evening training actually runs
+ * 19:15–20:15 with a 15-minute break before it, but for *availability*
+ * coaches treat 19:00 and 19:15 as the same breakpoint — so we only
+ * expose 19:00 here. Submitting "19:00 עד 21:15" therefore covers the
+ * 19:15–20:15 and 20:15–21:15 trainings.
+ */
 var MENTOR_EVENING_LABELS_ = [
   '16:00 עד 18:00',
+  '16:00 עד 19:00',
   '16:00 עד 20:15',
   '16:00 עד 21:15',
   '17:00 עד 19:00',
+  '17:00 עד 20:15',
   '17:00 עד 21:15',
   '18:00 עד 20:15',
   '18:00 עד 21:15',
-  '19:00 עד 21:15',
-  '19:15 עד 21:15'
+  '19:00 עד 21:15'
 ];
 
 /**

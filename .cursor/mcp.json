@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "google-sheets": {
+      "command": "/Users/amir/.local/bin/uvx",
+      "args": ["mcp-google-sheets@latest"],
+      "env": {
+        "CREDENTIALS_PATH": "/Users/amir/Downloads/ShiftOptimizer-Mentor/.cursor/secrets/credentials.json",
+        "TOKEN_PATH": "/Users/amir/Downloads/ShiftOptimizer-Mentor/.cursor/secrets/token.json"
+      }
+    }
+  }
+}

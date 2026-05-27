@@ -17,7 +17,7 @@ Based on the [Chachos Shift Optimizer](https://github.com/amirvolinsky/ShiftOpti
 | `MasterData` | Coaches: Rank 1–4 (1 = best, 4 = reserve), optional location lock |
 | `ShiftTemplate` | Training slots per net / day / block |
 | `Rules` | Key/value business rules |
-| `Form Responses 1` | Linked form (rename in `Config.gs` if different) |
+| `Form Responses 2` | Linked form (rename in `Config.gs` if different) |
 | `Schedule` | Generated schedule |
 | `ShiftHistory` | Weekly satisfaction log |
 | `Share_Export` | Clean view for sharing |

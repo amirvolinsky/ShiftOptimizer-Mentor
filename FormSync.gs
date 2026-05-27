@@ -17,6 +17,13 @@ function syncMentorGoogleForm() {
   );
 }
 
+/** Editor / clasp: rebuild form without HtmlService confirm dialog. */
+function syncMentorGoogleFormFromEditor() {
+  var form = openMentorGoogleForm_();
+  rebuildMentorGoogleForm_(form);
+  Logger.log('syncMentorGoogleFormFromEditor: rebuilt "' + form.getTitle() + '"');
+}
+
 function syncMentorGoogleFormRun_() {
   var form = openMentorGoogleForm_();
   rebuildMentorGoogleForm_(form);
@@ -64,44 +71,56 @@ function rebuildMentorGoogleForm_(form) {
   }
   nameItem.setChoices(nameChoices);
 
-  // Weekly shift-target question (1–6). The optimizer prefers this value over
-  // MasterData.WeeklyMax when present, and caps the effective target at
-  // submitted_days + 1 so coaches who pick the high option but submit few days
-  // are still bounded.
+  for (var d = 0; d < MENTOR_WEEKDAYS_HE_.length; d++) {
+    var dayHe = MENTOR_WEEKDAYS_HE_[d];
+    var dayLabel = mentorDayBilingualLabel_(dayHe);
+    form.addPageBreakItem().setTitle(dayLabel);
+
+    // Retry the per-day checkbox up to 3 times. The Forms API occasionally
+    // accepts createChoice/setChoices silently without persisting them, which
+    // used to leave the form half-built. On miss we delete the bad checkbox
+    // and rebuild it so subsequent days don't inherit a corrupted state.
+    var dayItem = null;
+    var expected = 0;
+    var actualCount = -1;
+    for (var attempt = 1; attempt <= 3 && actualCount !== expected; attempt++) {
+      if (dayItem) {
+        try { form.deleteItem(dayItem); } catch (ignore) {}
+      }
+      dayItem = form.addCheckboxItem();
+      dayItem.setTitle(dayLabel).setRequired(true);
+      expected = setMentorDayCheckboxChoices_(dayItem, mentorFormDayIncludesEvening_(dayHe));
+      Utilities.sleep(120 * attempt);
+      actualCount = dayItem.getChoices().length;
+    }
+    if (actualCount !== expected) {
+      throw new Error(
+        'בניית הטופס נכשלה ביום "' + dayLabel + '": נכתבו ' + actualCount +
+        ' אפשרויות במקום ' + expected + ' לאחר 3 ניסיונות. נסה להריץ שוב "📝 בנה מחדש טופס Google".'
+      );
+    }
+
+    var noteItem = form.addParagraphTextItem();
+    noteItem.setTitle(mentorDayNoteHeader_(dayHe)).setRequired(false);
+    Utilities.sleep(60);
+  }
+
+  // Weekly shift-target question (1–6) — placed last, on its own page, so
+  // coaches first map out their availability per day and only then state
+  // how many shifts they actually want this week. The optimizer prefers this
+  // value over MasterData.WeeklyMax when present, and caps the effective
+  // target at submitted_days + 1.
+  form.addPageBreakItem().setTitle(MENTOR_WEEKLY_TARGET_HEADER_);
   var targetItem = form.addMultipleChoiceItem();
   targetItem
     .setTitle(MENTOR_WEEKLY_TARGET_HEADER_)
-    .setHelpText('כמה משמרות (בוקר/ערב) תרצה לקבל בשבוע הקרוב? המערכת תיקח עד +1 מעבר למספר הימים שסימנת.')
+    .setHelpText('כמה משמרות רוצה לקבל השבוע?')
     .setRequired(true);
   var targetChoices = [];
   for (var tVal = MENTOR_WEEKLY_TARGET_MIN_; tVal <= MENTOR_WEEKLY_TARGET_MAX_; tVal++) {
     targetChoices.push(targetItem.createChoice(String(tVal)));
   }
   targetItem.setChoices(targetChoices);
-
-  for (var d = 0; d < MENTOR_WEEKDAYS_HE_.length; d++) {
-    var dayHe = MENTOR_WEEKDAYS_HE_[d];
-    var dayLabel = mentorDayBilingualLabel_(dayHe);
-    form.addPageBreakItem().setTitle(dayLabel);
-    var dayItem = form.addCheckboxItem();
-    dayItem.setTitle(dayLabel).setRequired(true);
-    var expected = setMentorDayCheckboxChoices_(dayItem, mentorFormDayIncludesEvening_(dayHe));
-    // Defensive: a previous live form had Monday with zero choices despite the
-    // code path being symmetric for every day. Re-fetch the checkbox and throw
-    // a clear error naming the day if Forms didn't persist the choices.
-    var refetched = dayItem.asCheckboxItem();
-    var actualCount = refetched.getChoices().length;
-    if (actualCount !== expected) {
-      throw new Error(
-        'בניית הטופס נכשלה ביום "' + dayLabel + '": נכתבו ' + actualCount +
-        ' אפשרויות במקום ' + expected + '. נסה להריץ שוב "📝 בנה מחדש טופס Google".'
-      );
-    }
-    var noteItem = form.addParagraphTextItem();
-    noteItem.setTitle(mentorDayNoteHeader_(dayHe)).setRequired(false);
-    // Tiny pause to avoid sporadic Forms API rate-limit hiccups between days.
-    Utilities.sleep(60);
-  }
 
   form.setConfirmationMessage('תודה! הזמינות נשמרה.');
   form.setAllowResponseEdits(true);

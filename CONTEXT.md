@@ -52,13 +52,13 @@ Parser: each checkbox range maps to `{ startHour, endHour }`. Optimizer assigns 
 
 Legacy layouts (`ראשון בוקר`/`ערב`, start/end columns, "בוקר"/"ערב" text) still supported.
 
-Link to sheet → tab name must match `CONFIG.sheets.responses` (default: `Form Responses 1`).
+Link to sheet → tab name must match `CONFIG.sheets.responses` (default: `Form Responses 2`).
 
 ### Demo / test responses (separate tab)
 
 | Setting | Default |
 |---------|---------|
-| Live form tab | `Form Responses 1` — never overwritten by test seeders |
+| Live form tab | `Form Responses 2` — never overwritten by test seeders |
 | Demo tab | `Form Responses Demo` — copy of headers + fake rows |
 | `CONFIG.useDemoResponses` | `true` during testing; set `false` before go-live |
 
@@ -69,7 +69,7 @@ Demo realism rules (see `pickFakeMentorWeek_` + `FAKE_MENTOR_FULL_WINDOW_PROB_` 
 - A coach never gives morning **and** evening availability on the same day. The seeder picks distinct weekdays first, then chooses one block per day (~60% morning / 40% evening). Friday is morning-only and lands on its own day index.
 - Full half-day windows (`7:00 עד 12:00` / `16:00 עד 21:15`) appear ~40% of the time; the remaining ~60% are partial 2–4h ranges (`8:00 עד 10:00`, `17:00 עד 19:00`, …). All form labels are 2h minimum — 1-hour availabilities never appear.
 
-**Purple columns / Form icon on live tab:** Google links the real responses tab to a **Table**; if the form had more questions before, empty purple columns (`Column 13`…) remain. Shrink the table to columns A–L or delete extra columns on `Form Responses 1` only — not on the demo tab.
+**Purple columns / Form icon on live tab:** Google links the real responses tab to a **Table**; if the form had more questions before, empty purple columns (`Column 13`…) remain. Shrink the table to columns A–L or delete extra columns on `Form Responses 2` only — not on the demo tab.
 
 Legacy radio/checkbox form (בוקר / ערב / לא זמין per day) still supported on the demo tab.
 
